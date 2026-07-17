@@ -1,0 +1,545 @@
+//! Command-line parsing and resolution into engine configuration.
+
+#[cfg(feature = "web")]
+use std::net::SocketAddr;
+use std::{collections::BTreeMap, fmt, num::NonZeroU32, path::PathBuf};
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+use crate::{
+    config::{
+        AdapterCommand, HumanDuration, LoadConfig, OperationSelection, PhaseConfig, Preset,
+        RunConfig, Strategy, WeightedOperation, WorkloadConfig,
+    },
+    engine::{EngineCommand, EngineError, EngineHandle},
+    protocol::ArgumentValue,
+};
+
+use super::Frontend;
+#[cfg(feature = "web")]
+use super::web::{WebFrontend, WebFrontendError};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "kneefinder",
+    version,
+    about = "Find throughput and latency knees in arbitrary systems",
+    propagate_version = true
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Run an experiment using a user-provided adapter process.
+    Run(RunArgs),
+    /// Serve the browser GUI and versioned control API.
+    #[cfg(feature = "web")]
+    Serve(ServeArgs),
+}
+
+#[cfg(feature = "web")]
+#[derive(Debug, Args)]
+pub struct ServeArgs {
+    /// Address on which the web server listens.
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    bind: SocketAddr,
+
+    /// Permit unauthenticated control API access from non-loopback interfaces.
+    #[arg(long)]
+    allow_remote: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    /// Apply a useful group of defaults. Explicit options override the preset.
+    #[arg(long, value_enum, default_value_t = PresetArg::Quick)]
+    preset: PresetArg,
+
+    /// Choose how load levels are visited.
+    #[arg(long, value_enum)]
+    strategy: Option<StrategyArg>,
+
+    /// Traffic duration excluded after each load-level transition.
+    #[arg(long, value_name = "DURATION")]
+    warmup: Option<HumanDuration>,
+
+    /// Traffic duration included in each measurement.
+    #[arg(long, value_name = "DURATION")]
+    measurement: Option<HumanDuration>,
+
+    /// Idle duration used where the strategy requests recovery.
+    #[arg(long, value_name = "DURATION")]
+    recovery: Option<HumanDuration>,
+
+    /// Number of measurements collected at each selected load.
+    #[arg(long)]
+    repetitions: Option<NonZeroU32>,
+
+    /// First offered load in operations per second.
+    #[arg(long, value_name = "OPS_PER_SECOND")]
+    initial_rate: Option<f64>,
+
+    /// Highest offered load kneefinder may attempt.
+    #[arg(long, value_name = "OPS_PER_SECOND")]
+    maximum_rate: Option<f64>,
+
+    /// Multiplicative step used to discover or generate load levels.
+    #[arg(long, value_name = "FACTOR")]
+    growth_factor: Option<f64>,
+
+    /// Explicit comma-delimited load levels for sweep or up-down strategies.
+    #[arg(long, value_delimiter = ',', value_name = "RATE,...")]
+    levels: Vec<f64>,
+
+    /// Number of complete traversals, primarily for up-down experiments.
+    #[arg(long)]
+    cycles: Option<NonZeroU32>,
+
+    /// Add a weighted operation variant as NAME[:ARG=VALUE,...][@WEIGHT].
+    #[arg(long = "operation", value_name = "VARIANT")]
+    operations: Vec<String>,
+
+    /// Explicitly include every operation advertised by the adapter.
+    #[arg(long, conflicts_with = "operations")]
+    all_operations: bool,
+
+    /// Directory in which run artifacts will be written.
+    #[arg(long, default_value = "results")]
+    output: PathBuf,
+
+    /// Print the fully resolved JSON configuration without starting a run.
+    #[arg(long)]
+    pub print_config: bool,
+
+    /// Adapter executable followed by its arguments. Must appear after `--`.
+    #[arg(last = true, value_name = "ADAPTER [ARG]...")]
+    adapter: Vec<String>,
+}
+
+impl RunArgs {
+    pub fn resolve(&self) -> Result<RunConfig, String> {
+        let defaults = PresetDefaults::for_preset(self.preset);
+        let strategy = self.strategy.unwrap_or(defaults.strategy);
+        let warmup_ms = self.warmup.unwrap_or(defaults.warmup).as_millis();
+        let measurement_ms = self.measurement.unwrap_or(defaults.measurement).as_millis();
+        let recovery_ms = self.recovery.unwrap_or(defaults.recovery).as_millis();
+        let repetitions = self
+            .repetitions
+            .map_or(defaults.repetitions, NonZeroU32::get);
+        let cycles = self.cycles.map_or(defaults.cycles, NonZeroU32::get);
+        let initial_rate = self.initial_rate.unwrap_or(100.0);
+        let maximum_rate = self.maximum_rate.unwrap_or(10_000.0);
+        let growth_factor = self.growth_factor.unwrap_or(1.5);
+
+        if measurement_ms == 0 {
+            return Err("measurement duration must be greater than zero".into());
+        }
+        if !initial_rate.is_finite() || initial_rate <= 0.0 {
+            return Err("initial rate must be a positive finite number".into());
+        }
+        if !maximum_rate.is_finite() || maximum_rate < initial_rate {
+            return Err("maximum rate must be finite and at least the initial rate".into());
+        }
+        if !growth_factor.is_finite() || growth_factor <= 1.0 {
+            return Err("growth factor must be finite and greater than one".into());
+        }
+        if self
+            .levels
+            .iter()
+            .any(|level| !level.is_finite() || *level <= 0.0)
+        {
+            return Err("every explicit load level must be positive and finite".into());
+        }
+        if strategy == StrategyArg::Adaptive && !self.levels.is_empty() {
+            return Err("--levels cannot be used with the adaptive strategy".into());
+        }
+
+        let adapter = match self.adapter.split_first() {
+            Some((program, arguments)) => Some(AdapterCommand {
+                program: program.clone(),
+                arguments: arguments.to_vec(),
+            }),
+            None if self.print_config => None,
+            None => return Err("an adapter command is required after `--`".into()),
+        };
+        let operations = if self.all_operations {
+            OperationSelection::All
+        } else if self.operations.is_empty() {
+            OperationSelection::AdapterDefaults
+        } else {
+            OperationSelection::Selected {
+                operations: self
+                    .operations
+                    .iter()
+                    .map(|operation| parse_operation(operation))
+                    .collect::<Result<_, _>>()?,
+            }
+        };
+        Ok(RunConfig {
+            preset: self.preset.into(),
+            strategy: strategy.into(),
+            phases: PhaseConfig {
+                warmup_ms,
+                measurement_ms,
+                recovery_ms,
+                repetitions,
+            },
+            load: LoadConfig {
+                initial_rate,
+                maximum_rate,
+                growth_factor,
+                explicit_levels: self.levels.clone(),
+                cycles,
+            },
+            workload: WorkloadConfig { operations },
+            output_directory: self.output.clone(),
+            adapter,
+        })
+    }
+}
+
+fn parse_operation(value: &str) -> Result<WeightedOperation, String> {
+    let (variant, weight) = if let Some((variant, weight)) = value.rsplit_once('@') {
+        let weight = weight
+            .parse::<f64>()
+            .map_err(|_| format!("invalid weight in operation variant {value:?}"))?;
+        (variant, weight)
+    } else if !value.contains(':') {
+        match value.split_once('=') {
+            Some((name, weight)) => {
+                let weight = weight
+                    .parse::<f64>()
+                    .map_err(|_| format!("invalid weight in operation {value:?}"))?;
+                (name, weight)
+            }
+            None => (value, 1.0),
+        }
+    } else {
+        (value, 1.0)
+    };
+    let (name, arguments) = match variant.split_once(':') {
+        Some((name, arguments)) => {
+            let mut parsed = BTreeMap::new();
+            for assignment in arguments.split(',') {
+                let (argument, value) = assignment.split_once('=').ok_or_else(|| {
+                    format!("argument {assignment:?} in operation {name:?} must contain '='")
+                })?;
+                if argument.is_empty() {
+                    return Err(format!("operation {name:?} has an empty argument name"));
+                }
+                if parsed
+                    .insert(argument.into(), parse_argument_value(value))
+                    .is_some()
+                {
+                    return Err(format!(
+                        "operation {name:?} provides argument {argument:?} more than once"
+                    ));
+                }
+            }
+            (name, parsed)
+        }
+        None => (variant, BTreeMap::new()),
+    };
+    if name.is_empty() {
+        return Err("operation name must not be empty".into());
+    }
+    if !weight.is_finite() || weight <= 0.0 {
+        return Err(format!(
+            "operation {name:?} must have a positive finite weight"
+        ));
+    }
+    Ok(WeightedOperation {
+        name: name.into(),
+        weight,
+        arguments,
+    })
+}
+
+fn parse_argument_value(value: &str) -> ArgumentValue {
+    if let Some(value) = value.strip_prefix("str:") {
+        ArgumentValue::String(value.into())
+    } else if let Ok(value) = value.parse::<i64>() {
+        ArgumentValue::Integer(value)
+    } else {
+        ArgumentValue::String(value.into())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PresetArg {
+    Quick,
+    Careful,
+    Hysteresis,
+}
+
+impl From<PresetArg> for Preset {
+    fn from(value: PresetArg) -> Self {
+        match value {
+            PresetArg::Quick => Self::Quick,
+            PresetArg::Careful => Self::Careful,
+            PresetArg::Hysteresis => Self::Hysteresis,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum StrategyArg {
+    Adaptive,
+    Sweep,
+    UpDown,
+}
+
+impl From<StrategyArg> for Strategy {
+    fn from(value: StrategyArg) -> Self {
+        match value {
+            StrategyArg::Adaptive => Self::Adaptive,
+            StrategyArg::Sweep => Self::Sweep,
+            StrategyArg::UpDown => Self::UpDown,
+        }
+    }
+}
+
+struct PresetDefaults {
+    strategy: StrategyArg,
+    warmup: HumanDuration,
+    measurement: HumanDuration,
+    recovery: HumanDuration,
+    repetitions: u32,
+    cycles: u32,
+}
+
+impl PresetDefaults {
+    fn for_preset(preset: PresetArg) -> Self {
+        let duration = |value: &str| -> HumanDuration {
+            value.parse().expect("static preset duration must be valid")
+        };
+        match preset {
+            PresetArg::Quick => Self {
+                strategy: StrategyArg::Adaptive,
+                warmup: duration("2s"),
+                measurement: duration("10s"),
+                recovery: duration("2s"),
+                repetitions: 1,
+                cycles: 1,
+            },
+            PresetArg::Careful => Self {
+                strategy: StrategyArg::Adaptive,
+                warmup: duration("10s"),
+                measurement: duration("30s"),
+                recovery: duration("10s"),
+                repetitions: 3,
+                cycles: 1,
+            },
+            PresetArg::Hysteresis => Self {
+                strategy: StrategyArg::UpDown,
+                warmup: duration("10s"),
+                measurement: duration("20s"),
+                recovery: duration("15s"),
+                repetitions: 1,
+                cycles: 3,
+            },
+        }
+    }
+}
+
+pub struct CliFrontend {
+    cli: Cli,
+}
+
+impl CliFrontend {
+    pub fn new(cli: Cli) -> Self {
+        Self { cli }
+    }
+}
+
+impl Frontend for CliFrontend {
+    type Error = CliFrontendError;
+
+    fn run(self, engine: EngineHandle) -> Result<(), Self::Error> {
+        match self.cli.command {
+            Command::Run(arguments) => {
+                let config = arguments.resolve().map_err(CliFrontendError::Config)?;
+                let snapshot = engine.execute(EngineCommand::Configure {
+                    config: Box::new(config),
+                })?;
+
+                if arguments.print_config {
+                    println!("{}", serde_json::to_string_pretty(&snapshot.config)?);
+                    return Ok(());
+                }
+
+                engine.execute(EngineCommand::Start {
+                    run_id: snapshot.run_id,
+                })?;
+                Err(CliFrontendError::ExecutionUnavailable)
+            }
+            #[cfg(feature = "web")]
+            Command::Serve(arguments) => {
+                WebFrontend::new(arguments.bind, arguments.allow_remote).run(engine)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum CliFrontendError {
+    Config(String),
+    Engine(EngineError),
+    Serialization(serde_json::Error),
+    #[cfg(feature = "web")]
+    Web(WebFrontendError),
+    ExecutionUnavailable,
+}
+
+impl fmt::Display for CliFrontendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Config(message) => formatter.write_str(message),
+            Self::Engine(error) => error.fmt(formatter),
+            Self::Serialization(error) => error.fmt(formatter),
+            #[cfg(feature = "web")]
+            Self::Web(error) => error.fmt(formatter),
+            Self::ExecutionUnavailable => formatter.write_str(
+                "the run executor is not implemented yet; use --print-config to inspect the resolved plan",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CliFrontendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Engine(error) => Some(error),
+            Self::Serialization(error) => Some(error),
+            #[cfg(feature = "web")]
+            Self::Web(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<EngineError> for CliFrontendError {
+    fn from(value: EngineError) -> Self {
+        Self::Engine(value)
+    }
+}
+
+impl From<serde_json::Error> for CliFrontendError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Serialization(value)
+    }
+}
+
+#[cfg(feature = "web")]
+impl From<WebFrontendError> for CliFrontendError {
+    fn from(value: WebFrontendError) -> Self {
+        Self::Web(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> RunArgs {
+        match Cli::try_parse_from(arguments).unwrap().command {
+            Command::Run(arguments) => arguments,
+            #[cfg(feature = "web")]
+            Command::Serve(_) => panic!("test helper expected the run command"),
+        }
+    }
+
+    #[test]
+    fn quick_preset_resolves_with_an_adapter() {
+        let arguments = parse(&["kneefinder", "run", "--", "./adapter", "--verbose"]);
+        let config = arguments.resolve().unwrap();
+
+        assert_eq!(config.strategy, Strategy::Adaptive);
+        assert_eq!(config.phases.warmup_ms, 2_000);
+        assert_eq!(config.phases.measurement_ms, 10_000);
+        assert_eq!(config.adapter.unwrap().program, "./adapter");
+    }
+
+    #[test]
+    fn explicit_options_override_hysteresis_preset() {
+        let arguments = parse(&[
+            "kneefinder",
+            "run",
+            "--preset",
+            "hysteresis",
+            "--warmup",
+            "3s",
+            "--levels",
+            "100,200,400",
+            "--cycles",
+            "2",
+            "--",
+            "./adapter",
+        ]);
+        let config = arguments.resolve().unwrap();
+
+        assert_eq!(config.strategy, Strategy::UpDown);
+        assert_eq!(config.phases.warmup_ms, 3_000);
+        assert_eq!(config.load.explicit_levels, vec![100.0, 200.0, 400.0]);
+        assert_eq!(config.load.cycles, 2);
+    }
+
+    #[test]
+    fn print_config_does_not_require_an_adapter() {
+        let arguments = parse(&["kneefinder", "run", "--print-config"]);
+        assert!(arguments.resolve().unwrap().adapter.is_none());
+    }
+
+    #[test]
+    fn invalid_strategy_combination_is_rejected() {
+        let arguments = parse(&[
+            "kneefinder",
+            "run",
+            "--strategy",
+            "adaptive",
+            "--levels",
+            "100,200",
+            "--print-config",
+        ]);
+        assert!(arguments.resolve().is_err());
+    }
+
+    #[test]
+    fn operation_mix_is_resolved_for_every_frontend() {
+        let arguments = parse(&[
+            "kneefinder",
+            "run",
+            "--operation",
+            "read:key=42@9",
+            "--operation",
+            "write:value=str:123@1",
+            "--print-config",
+        ]);
+        let config = arguments.resolve().unwrap();
+
+        assert_eq!(
+            config.workload.operations,
+            OperationSelection::Selected {
+                operations: vec![
+                    WeightedOperation {
+                        name: "read".into(),
+                        weight: 9.0,
+                        arguments: BTreeMap::from([("key".into(), ArgumentValue::Integer(42),)]),
+                    },
+                    WeightedOperation {
+                        name: "write".into(),
+                        weight: 1.0,
+                        arguments: BTreeMap::from([(
+                            "value".into(),
+                            ArgumentValue::String("123".into()),
+                        )]),
+                    },
+                ]
+            }
+        );
+    }
+}

@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Kneefinder</title>
+    <link rel="stylesheet" href="/app.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">SATURATION LAB</p>
+        <h1>Kneefinder</h1>
+      </div>
+      <div class="connection"><span id="connection-dot"></span><span id="connection-text">Connecting</span></div>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <section class="panel controls">
+          <div class="panel-heading">
+            <div><p class="eyebrow">CONTROL</p><h2>Workload</h2></div>
+            <span id="selected-run" class="run-chip">New run</span>
+          </div>
+
+          <form id="config-form">
+            <div class="field-pair">
+              <label>Preset<select id="preset"><option value="quick">Quick</option><option value="careful">Careful</option><option value="hysteresis">Hysteresis</option></select></label>
+              <label>Strategy<select id="strategy"><option value="adaptive">Adaptive</option><option value="sweep">Sweep</option><option value="up-down">Up/down</option></select></label>
+            </div>
+            <div class="field-pair">
+              <label>Initial rate<input id="initial-rate" type="number" min="0.001" step="any" value="100"></label>
+              <label>Maximum rate<input id="maximum-rate" type="number" min="0.001" step="any" value="10000"></label>
+            </div>
+            <div class="field-pair">
+              <label>Growth factor<input id="growth-factor" type="number" min="1.001" step="any" value="1.5"></label>
+              <label>Cycles<input id="cycles" type="number" min="1" step="1" value="1"></label>
+            </div>
+            <label>Explicit levels <span class="hint">comma-separated, optional</span><input id="levels" placeholder="100, 200, 300"></label>
+            <div class="field-triple">
+              <label>Warm-up ms<input id="warmup" type="number" min="0" value="2000"></label>
+              <label>Measure ms<input id="measurement" type="number" min="1" value="10000"></label>
+              <label>Recover ms<input id="recovery" type="number" min="0" value="2000"></label>
+            </div>
+            <label>Operation variants <span class="hint">one per line</span><textarea id="operations" rows="4" placeholder="read:key=0@27&#10;read:key=1@9&#10;write:value=small@3&#10;write:value=large@1"></textarea></label>
+            <label>Adapter executable<input id="adapter-program" placeholder="./my-adapter"></label>
+            <label>Adapter arguments <span class="hint">one per line</span><textarea id="adapter-args" rows="2" placeholder="--endpoint&#10;localhost:9000"></textarea></label>
+            <label>Output directory<input id="output-directory" value="results"></label>
+          </form>
+
+          <div class="actions">
+            <button id="apply" class="primary">Apply configuration</button>
+            <button id="start">Start</button>
+            <button id="stop" class="danger">Stop</button>
+          </div>
+          <p id="form-message" class="message" aria-live="polite"></p>
+        </section>
+
+        <section class="panel run-panel">
+          <div class="panel-heading"><div><p class="eyebrow">HISTORY</p><h2>Runs</h2></div></div>
+          <div id="runs" class="run-list"><p class="empty">No runs configured.</p></div>
+        </section>
+      </aside>
+
+      <section class="dashboard">
+        <div class="metrics">
+          <article class="metric"><p>Run state</p><strong id="metric-state">—</strong><span id="metric-stage">Waiting for a run</span></article>
+          <article class="metric accent"><p>Knee</p><strong id="metric-knee">—</strong><span>offered operations / sec</span></article>
+          <article class="metric"><p>Recommended</p><strong id="metric-recommended">—</strong><span>operating rate</span></article>
+          <article id="metric-errors" class="metric"><p>Unsuccessful</p><strong id="metric-error-rate">—</strong><span id="metric-error-detail">errors + timeouts</span></article>
+          <article class="metric"><p>Measurements</p><strong id="metric-phases">0</strong><span>completed phases</span></article>
+        </div>
+
+        <section class="panel chart-panel">
+          <div class="panel-heading"><div><p class="eyebrow">CURVE</p><h2>Throughput</h2></div><div class="legend"><span class="goodput">Goodput</span><span class="offered">Ideal</span><span class="knee">Knee</span></div></div>
+          <div id="throughput-chart" class="chart empty-chart">Measurements will stream here.</div>
+        </section>
+
+        <section class="panel chart-panel">
+          <div class="panel-heading"><div><p class="eyebrow">QUEUEING</p><h2>Latency</h2></div><div class="legend"><span class="p50">p50</span><span class="p95">p95</span><span class="p99">p99</span></div></div>
+          <div id="latency-chart" class="chart empty-chart">Measurements will stream here.</div>
+        </section>
+
+        <section class="panel chart-panel reliability-panel">
+          <div class="panel-heading"><div><p class="eyebrow">VALIDITY</p><h2>Reliability</h2></div><div class="legend"><span class="errors">Errors</span><span class="timeouts">Timeouts</span></div></div>
+          <div id="reliability-chart" class="chart empty-chart">Measurements will stream here.</div>
+          <div id="error-codes" class="error-codes"><span class="healthy">No reported errors</span></div>
+        </section>
+
+        <section class="panel table-panel">
+          <div class="panel-heading"><div><p class="eyebrow">DETAIL</p><h2>Operation variants</h2></div><span id="variant-phase" class="run-chip">Latest phase</span></div>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th>Variant</th><th>Attempts</th><th>Good</th><th>Errors</th><th>Timeouts</th><th>p50</th><th>p95</th><th>p99</th></tr></thead>
+              <tbody id="variants"><tr><td colspan="8" class="empty">No measurements yet.</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </main>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
