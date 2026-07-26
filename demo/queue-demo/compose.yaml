@@ -1,0 +1,46 @@
+name: kneefinder-queue-demo
+
+x-queue-demo: &queue-demo
+  image: kneefinder-queue-demo:local
+  init: true
+
+services:
+  agent-a:
+    <<: *queue-demo
+    command: ["adapter-tcp", "0.0.0.0:9000"]
+    environment:
+      KNEEFINDER_QUEUE_DEMO_WORKERS: "2"
+    healthcheck:
+      test: ["CMD", "kneefinder-queue-demo", "healthcheck", "127.0.0.1:9000"]
+      interval: 1s
+      timeout: 2s
+      retries: 10
+
+  agent-b:
+    <<: *queue-demo
+    command: ["adapter-tcp", "0.0.0.0:9000"]
+    environment:
+      KNEEFINDER_QUEUE_DEMO_WORKERS: "2"
+    healthcheck:
+      test: ["CMD", "kneefinder-queue-demo", "healthcheck", "127.0.0.1:9000"]
+      interval: 1s
+      timeout: 2s
+      retries: 10
+
+  web:
+    <<: *queue-demo
+    build:
+      context: ../..
+      dockerfile: demo/queue-demo/Dockerfile
+    command:
+      - e2e-tcp-web-external
+      - 0.0.0.0:8080
+      - agent-a=tcp://agent-a:9000
+      - agent-b=tcp://agent-b:9000
+    depends_on:
+      agent-a:
+        condition: service_healthy
+      agent-b:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"

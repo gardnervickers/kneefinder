@@ -46,10 +46,16 @@ fn default_queue_capacity() -> usize {
     4_096
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionExit {
+    EndOfStream,
+    Shutdown,
+}
+
 pub fn run() -> Result<(), Box<dyn Error>> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    run_session(stdin.lock(), BufWriter::new(stdout.lock()))
+    run_session(stdin.lock(), BufWriter::new(stdout.lock())).map(|_| ())
 }
 
 pub fn run_tcp(address: &str) -> Result<(), Box<dyn Error>> {
@@ -58,15 +64,22 @@ pub fn run_tcp(address: &str) -> Result<(), Box<dyn Error>> {
     println!("tcp://{address}");
     io::stdout().flush()?;
 
-    let (stream, peer) = listener.accept()?;
-    stream.set_nodelay(true)?;
-    eprintln!("demo TCP agent accepted coordinator connection from {peer}");
-    let input = BufReader::new(stream.try_clone()?);
-    let output = BufWriter::new(stream);
-    run_session(input, output)
+    loop {
+        let (stream, peer) = listener.accept()?;
+        stream.set_nodelay(true)?;
+        eprintln!("demo TCP agent accepted coordinator connection from {peer}");
+        let input = BufReader::new(stream.try_clone()?);
+        let output = BufWriter::new(stream);
+        match run_session(input, output)? {
+            SessionExit::EndOfStream => {
+                eprintln!("demo TCP agent connection closed; waiting for a coordinator");
+            }
+            SessionExit::Shutdown => return Ok(()),
+        }
+    }
 }
 
-fn run_session(input: impl BufRead, mut output: impl Write) -> Result<(), Box<dyn Error>> {
+fn run_session(input: impl BufRead, mut output: impl Write) -> Result<SessionExit, Box<dyn Error>> {
     let mut service: Option<QueueService> = None;
 
     for line in input.lines() {
@@ -199,7 +212,7 @@ fn run_session(input: impl BufRead, mut output: impl Write) -> Result<(), Box<dy
                 )?;
             }
             ControllerMessage::CancelPhase { .. } => {}
-            ControllerMessage::Shutdown => break,
+            ControllerMessage::Shutdown => return Ok(SessionExit::Shutdown),
             ControllerMessage::RunPhase { phase_id, .. } => {
                 write_message(
                     &mut output,
@@ -214,7 +227,7 @@ fn run_session(input: impl BufRead, mut output: impl Write) -> Result<(), Box<dy
         }
     }
 
-    Ok(())
+    Ok(SessionExit::EndOfStream)
 }
 
 fn execute_operation(
@@ -244,11 +257,14 @@ fn execute_operation(
     }
 }
 
-fn validate_arguments(
-    operation: &ScheduledOperation,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+fn validate_arguments(operation: &ScheduledOperation) -> Result<(), Box<dyn Error + Send + Sync>> {
     match operation.operation.as_str() {
-        "read" if matches!(operation.arguments.get("key"), Some(ArgumentValue::Integer(_))) => {
+        "read"
+            if matches!(
+                operation.arguments.get("key"),
+                Some(ArgumentValue::Integer(_))
+            ) =>
+        {
             Ok(())
         }
         "write"
@@ -321,25 +337,19 @@ impl QueueService {
         arguments: &std::collections::BTreeMap<String, ArgumentValue>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let service_time = match (operation, arguments) {
-            ("read", arguments)
-                if arguments.get("key") == Some(&ArgumentValue::Integer(0)) =>
-            {
+            ("read", arguments) if arguments.get("key") == Some(&ArgumentValue::Integer(0)) => {
                 self.read_service_time
             }
-            ("read", arguments)
-                if arguments.get("key") == Some(&ArgumentValue::Integer(1)) =>
-            {
+            ("read", arguments) if arguments.get("key") == Some(&ArgumentValue::Integer(1)) => {
                 self.read_service_time * 2
             }
             ("write", arguments)
-                if arguments.get("value")
-                    == Some(&ArgumentValue::String("small".into())) =>
+                if arguments.get("value") == Some(&ArgumentValue::String("small".into())) =>
             {
                 self.write_service_time
             }
             ("write", arguments)
-                if arguments.get("value")
-                    == Some(&ArgumentValue::String("large".into())) =>
+                if arguments.get("value") == Some(&ArgumentValue::String("large".into())) =>
             {
                 self.write_service_time * 2
             }

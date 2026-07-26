@@ -19,9 +19,7 @@ use kneefinder::{
     adapter_session::SessionOptions,
     agent::{AgentCohort, AgentPlacement},
     config::{AdapterCommand, AgentEndpointConfig, AgentTransportConfig},
-    protocol::{
-        ArgumentValue, OperationId, OperationStatus, PhaseId, RunId, ScheduledOperation,
-    },
+    protocol::{ArgumentValue, OperationId, OperationStatus, PhaseId, RunId, ScheduledOperation},
     stats::{OperationVariant, StatsReport, summarize_results},
 };
 
@@ -160,13 +158,15 @@ pub fn run_tcp_multi_client() -> Result<(), Box<dyn Error>> {
         || stats.overall.failed != 0
         || stats.overall.timed_out != 0
     {
-        return Err(format!("unexpected aggregate multi-client stats: {:?}", stats.overall).into());
+        return Err(format!(
+            "unexpected aggregate multi-client stats: {:?}",
+            stats.overall
+        )
+        .into());
     }
 
     cohort.shutdown()?;
-    println!(
-        "multi-client TCP E2E passed: 2 clients, 40 operations each, 80 successful total"
-    );
+    println!("multi-client TCP E2E passed: 2 clients, 40 operations each, 80 successful total");
     Ok(())
 }
 
@@ -180,10 +180,7 @@ fn connect_tcp_cohort() -> Result<TcpDemoCohort, Box<dyn Error>> {
         ..SessionOptions::default()
     };
     let agents = AgentCohort::from_endpoints(&endpoints, options)?;
-    Ok(TcpDemoCohort {
-        agents,
-        processes,
-    })
+    Ok(TcpDemoCohort { agents, processes })
 }
 
 type SpawnedTcpAgents = (Vec<TcpAdapterProcess>, Vec<AgentEndpointConfig>);
@@ -249,19 +246,37 @@ impl TcpDemoCohort {
 
 #[cfg(feature = "web")]
 pub fn run_tcp_multi_client_web(bind: SocketAddr) -> Result<(), Box<dyn Error>> {
+    let (processes, endpoints) = spawn_tcp_agents()?;
+    run_tcp_multi_client_dashboard(bind, false, endpoints, processes)
+}
+
+#[cfg(feature = "web")]
+pub fn run_tcp_multi_client_web_external(
+    bind: SocketAddr,
+    endpoints: Vec<AgentEndpointConfig>,
+) -> Result<(), Box<dyn Error>> {
+    run_tcp_multi_client_dashboard(bind, true, endpoints, Vec::new())
+}
+
+#[cfg(feature = "web")]
+fn run_tcp_multi_client_dashboard(
+    bind: SocketAddr,
+    allow_remote: bool,
+    endpoints: Vec<AgentEndpointConfig>,
+    mut processes: Vec<TcpAdapterProcess>,
+) -> Result<(), Box<dyn Error>> {
     let engine = Engine::new();
     let handle = engine.handle();
     let web_handle = handle.clone();
     thread::Builder::new()
         .name("kneefinder-queue-demo-web".into())
         .spawn(move || {
-            if let Err(error) = WebFrontend::new(bind, false).run(web_handle) {
+            if let Err(error) = WebFrontend::new(bind, allow_remote).run(web_handle) {
                 eprintln!("queue demo web server failed: {error}");
             }
         })?;
     wait_for_web(bind)?;
 
-    let (mut processes, endpoints) = spawn_tcp_agents()?;
     let rates = [100.0, 200.0, 250.0, 290.0, 325.0, 425.0, 550.0];
     let configured = handle.execute(EngineCommand::Configure {
         config: Box::new(dashboard_config(endpoints, &rates)),
@@ -278,7 +293,11 @@ pub fn run_tcp_multi_client_web(bind: SocketAddr) -> Result<(), Box<dyn Error>> 
             .iter()
             .any(|agent| agent.placement != AgentPlacement::Remote)
     {
-        return Err(format!("unexpected prepared agent descriptors: {:?}", catalog.agents).into());
+        return Err(format!(
+            "unexpected prepared agent descriptors: {:?}",
+            catalog.agents
+        )
+        .into());
     }
     handle.execute(EngineCommand::Start {
         run_id: configured.run_id,
@@ -406,8 +425,13 @@ fn weighted_operation(
 
 #[cfg(feature = "web")]
 fn wait_for_web(bind: SocketAddr) -> Result<(), Box<dyn Error>> {
+    let probe = if bind.ip().is_unspecified() {
+        SocketAddr::from(([127, 0, 0, 1], bind.port()))
+    } else {
+        bind
+    };
     for _ in 0..50 {
-        if TcpStream::connect_timeout(&bind, Duration::from_millis(100)).is_ok() {
+        if TcpStream::connect_timeout(&probe, Duration::from_millis(100)).is_ok() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
@@ -430,7 +454,10 @@ impl TcpAdapterProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()?;
-        let stdout = child.stdout.take().ok_or("TCP adapter stdout unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("TCP adapter stdout unavailable")?;
         let mut stdout = BufReader::new(stdout);
         let mut endpoint = String::new();
         if stdout.read_line(&mut endpoint)? == 0 {
@@ -580,15 +607,7 @@ fn print_variant_stats(rows: &[DemoRow]) {
     println!("\nper operation variant:");
     println!(
         "{:<8} {:<24} {:<8} {:<8} {:<8} {:<9} {:<9} {:<9} {:<9}",
-        "offered",
-        "variant",
-        "attempts",
-        "ok",
-        "errors",
-        "timeouts",
-        "p50 ms",
-        "p95 ms",
-        "p99 ms"
+        "offered", "variant", "attempts", "ok", "errors", "timeouts", "p50 ms", "p95 ms", "p99 ms"
     );
     for row in rows {
         for variant in &row.stats.variants {

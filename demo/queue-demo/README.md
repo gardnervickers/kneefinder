@@ -1,18 +1,42 @@
 # Kneefinder queue demo
 
-This is a separate program for exercising kneefinder end to end:
+This is a separate program for exercising kneefinder end to end. The primary
+demo uses Docker Compose to run a web coordinator and two workload agents:
 
 ```text
-demo coordinator -> colocated agent -> external adapter -> fixed-worker queue
+browser -> web coordinator -> TCP agent A -> fixed-worker queue
+                           \-> TCP agent B -> fixed-worker queue
 ```
 
-It also has a distributed E2E topology:
+From the repository root, start the complete demo:
 
-```text
-                         +-> TCP agent A -> fixed-worker queue
-demo coordinator -> TCP |
-                         +-> TCP agent B -> fixed-worker queue
+```console
+docker compose -f demo/queue-demo/compose.yaml up --build
 ```
+
+Open <http://127.0.0.1:8080>. The coordinator waits for both agent containers,
+opens both TCP sessions, discovers and validates their shared operation schema,
+and retains the initialized cohort. It runs a seven-level aggregate sweep and
+streams the real phase results to the dashboard. The browser workload editor
+shows the typed four-variant catalog discovered from the agents.
+
+Both agents are isolated services on the private Compose network. The
+coordinator is always the side that connects, and the dashboard is published
+to host loopback only. The containers use the same queue-demo binary with
+different commands, so this is also an executable example of independently
+deploying the coordinator and workload agents.
+
+After stopping the foreground process with `Ctrl+C`, remove the containers and
+network:
+
+```console
+docker compose -f demo/queue-demo/compose.yaml down
+```
+
+The first image build compiles the release binary with the web feature and can
+take a few minutes. Later starts reuse the local image layers.
+
+## Workload
 
 The service has four workers and exposes two operations:
 
@@ -28,7 +52,9 @@ All four variants share the same bounded worker queue. Combining the 90/10
 operation ratio and 3:1 argument ratios gives an average service time of 13.75
 ms and a theoretical knee of about 291 requests per second.
 
-Run the complete demonstration:
+## Local modes
+
+The colocated mode remains available as a quick smoke test without Docker:
 
 ```console
 cargo run --manifest-path demo/queue-demo/Cargo.toml --release -- e2e
@@ -39,7 +65,7 @@ adapter/service as its supervised child, drives a range of offered loads, and
 prints the overall curve followed by counts and p50/p95/p99 latency for every
 fully bound variant. It cleans up the child when finished.
 
-Run the multi-client E2E:
+Run the process-local multi-client transport E2E:
 
 ```console
 cargo run --manifest-path demo/queue-demo/Cargo.toml -- e2e-tcp
@@ -50,7 +76,7 @@ ports. The coordinator connects to both, validates their schemas, splits an
 80-operation schedule round-robin, and verifies 40 successful operations per
 agent plus 80 successful aggregate operations.
 
-Run a full multi-client sweep and leave its results open in the browser UI:
+Run the same full multi-client sweep and web UI without Docker:
 
 ```console
 cargo run --manifest-path demo/queue-demo/Cargo.toml --features web -- e2e-tcp-web

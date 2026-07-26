@@ -30,29 +30,45 @@ statistics.
 The reliability view above uses fault-injected high-load phases to demonstrate
 error-code grouping and explicit timeout reporting.
 
-## Try the queue demo
+## Try the Docker multi-agent demo
 
 The included demo combines an adapter with a four-worker FIFO service. Its
 weighted service time gives it a theoretical knee near 291 requests per second.
+The default demo runs the real distributed topology:
+
+```text
+browser -> web coordinator -> TCP agent A -> queue workers
+                           \-> TCP agent B -> queue workers
+```
+
+Start all three containers with Docker Compose:
+
+```console
+docker compose -f demo/queue-demo/compose.yaml up --build
+```
+
+Open <http://127.0.0.1:8080>. The coordinator waits for both agents, initiates
+both TCP sessions, queries their operation catalogs, validates that their
+schemas match, and exposes the discovered workload in the browser. It then
+schedules seven aggregate offered-load levels across the two agents while the
+dashboard updates with throughput, latency, reliability, and per-variant
+results. Around the knee, goodput flattens while latency rises sharply.
+
+The agents only listen on the private Compose network; they never dial or
+register with the coordinator. The dashboard is published on loopback only.
+When finished, stop the foreground process with `Ctrl+C` and remove the demo
+containers:
+
+```console
+docker compose -f demo/queue-demo/compose.yaml down
+```
+
+For a quick local smoke test without Docker, the colocated mode remains
+available:
 
 ```console
 cargo run --release --manifest-path demo/queue-demo/Cargo.toml -- e2e
 ```
-
-The demonstration starts the adapter as a child process, performs the protocol
-handshake, schedules seven offered-load levels, and prints the throughput,
-latency, and per-variant results. Around the knee, goodput flattens while latency
-rises sharply.
-
-Run the multi-client transport E2E with two independent TCP agent processes:
-
-```console
-cargo run --manifest-path demo/queue-demo/Cargo.toml -- e2e-tcp
-```
-
-The coordinator opens both connections, validates both discovery responses,
-splits one global schedule deterministically, and verifies the per-agent and
-aggregate results.
 
 ## Browser UI and API
 
@@ -199,9 +215,10 @@ demonstration, CLI configuration, HTTP/WebSocket control plane, and browser UI
 are implemented. The engine and browser also implement coordinator-owned agent
 preparation, retained initialized cohorts, discovery events, and a typed
 workload editor. The queue demo exercises both the colocated path and a
-two-process TCP cohort, including the preparation flow in its live dashboard.
-The generic executor that turns a prepared cohort and `RunConfig` into an
-arbitrary measured run is the next major piece; until then, use the queue demo
-for the complete measured flows.
+two-agent TCP cohort, including a Docker Compose deployment with the web
+coordinator in a third container and the preparation flow in its live
+dashboard. The generic executor that turns a prepared cohort and `RunConfig`
+into an arbitrary measured run is the next major piece; until then, use the
+queue demo for the complete measured flows.
 
 See [docs/design.md](docs/design.md) for the measurement and knee-finding design.
