@@ -713,10 +713,14 @@ function updateButtons() {
   const run = selectedRun();
   const state = run?.state?.state;
   const prepared = run?.preparation?.status === "ready";
+  const activeRun = [...runs.values()].find((candidate) =>
+    ["starting", "measuring", "stopping"].includes(candidate.state?.state)
+  );
+  const anotherRunActive = Boolean(activeRun && activeRun.run_id !== run?.run_id);
   $("apply").disabled = !connected;
-  $("query-agents").disabled = !connected || queryInFlight || (run && state !== "configured");
+  $("query-agents").disabled = !connected || queryInFlight || anotherRunActive || (run && state !== "configured");
   $("query-agents").textContent = prepared ? "Refresh catalog" : "Query agents";
-  $("start").disabled = !connected || state !== "configured" || !prepared || formDirty || queryInFlight;
+  $("start").disabled = !connected || anotherRunActive || state !== "configured" || !prepared || formDirty || queryInFlight;
   $("stop").disabled = !connected || !["starting", "measuring"].includes(state);
 }
 

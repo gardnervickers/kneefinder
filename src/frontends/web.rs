@@ -454,6 +454,7 @@ fn engine_error_response(request_id: Option<String>, error: EngineError) -> Resp
         }
         EngineError::ConfigurationLocked(_)
         | EngineError::AgentsNotPrepared(_)
+        | EngineError::RunAlreadyActive { .. }
         | EngineError::PreparedCohortUnavailable(_)
         | EngineError::InvalidTransition { .. } => StatusCode::CONFLICT,
         EngineError::AgentPreparationFailed { .. } => StatusCode::BAD_GATEWAY,
@@ -475,6 +476,7 @@ fn engine_error_code(error: &EngineError) -> &'static str {
         EngineError::ConfigurationLocked(_) => "configuration_locked",
         EngineError::NoAgentsConfigured(_) => "no_agents_configured",
         EngineError::AgentsNotPrepared(_) => "agents_not_prepared",
+        EngineError::RunAlreadyActive { .. } => "run_already_active",
         EngineError::PreparedCohortUnavailable(_) => "prepared_cohort_unavailable",
         EngineError::AgentPreparationFailed { .. } => "agent_preparation_failed",
         EngineError::InvalidWorkload { .. } => "invalid_workload",
@@ -596,12 +598,19 @@ mod tests {
     }
 
     #[test]
-    fn probe_failures_have_a_stable_api_error_code() {
+    fn coordinator_conflicts_have_stable_api_error_codes() {
         let error = EngineError::AgentPreparationFailed {
             run_id: RunId(3),
             message: "agent disconnected".into(),
         };
         assert_eq!(engine_error_code(&error), "agent_preparation_failed");
+        assert_eq!(
+            engine_error_code(&EngineError::RunAlreadyActive {
+                requested: RunId(4),
+                active: RunId(3),
+            }),
+            "run_already_active"
+        );
     }
 
     #[test]

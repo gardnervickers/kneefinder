@@ -276,6 +276,14 @@ impl EngineInner {
                 .registry
                 .lock()
                 .expect("engine registry mutex poisoned");
+            if matches!(&event, RunEvent::StartRequested)
+                && let Some(active) = active_run_id(&registry, run_id)
+            {
+                return Err(EngineError::RunAlreadyActive {
+                    requested: run_id,
+                    active,
+                });
+            }
             let run = registry
                 .runs
                 .get_mut(&run_id)
@@ -366,6 +374,12 @@ impl EngineInner {
                 .registry
                 .lock()
                 .expect("engine registry mutex poisoned");
+            if let Some(active) = active_run_id(&registry, run_id) {
+                return Err(EngineError::RunAlreadyActive {
+                    requested: run_id,
+                    active,
+                });
+            }
             let run = registry
                 .runs
                 .get_mut(&run_id)
@@ -538,6 +552,17 @@ impl Default for Registry {
     }
 }
 
+fn active_run_id(registry: &Registry, excluding: RunId) -> Option<RunId> {
+    registry.runs.iter().find_map(|(run_id, snapshot)| {
+        (*run_id != excluding
+            && matches!(
+                &snapshot.state,
+                RunState::Starting | RunState::Measuring { .. } | RunState::Stopping { .. }
+            ))
+        .then_some(*run_id)
+    })
+}
+
 #[derive(Debug)]
 pub enum EngineError {
     RunNotFound(RunId),
@@ -546,6 +571,10 @@ pub enum EngineError {
     ConfigurationLocked(RunId),
     NoAgentsConfigured(RunId),
     AgentsNotPrepared(RunId),
+    RunAlreadyActive {
+        requested: RunId,
+        active: RunId,
+    },
     PreparedCohortUnavailable(RunId),
     AgentPreparationFailed {
         run_id: RunId,
@@ -581,6 +610,11 @@ impl fmt::Display for EngineError {
                 formatter,
                 "run {} agents must be queried before the run starts",
                 run_id.0
+            ),
+            Self::RunAlreadyActive { requested, active } => write!(
+                formatter,
+                "run {} cannot use workload agents while run {} is active",
+                requested.0, active.0
             ),
             Self::PreparedCohortUnavailable(run_id) => write!(
                 formatter,
@@ -785,6 +819,46 @@ mod tests {
             }
         );
         assert_eq!(handle.snapshot(run.run_id).unwrap(), baseline);
+    }
+
+    #[test]
+    fn only_one_run_can_own_workload_agents_at_a_time() {
+        let engine = Engine::new();
+        let handle = engine.handle();
+        let first = handle
+            .execute(EngineCommand::Configure {
+                config: Box::new(config()),
+            })
+            .unwrap();
+        let second = handle
+            .execute(EngineCommand::Configure {
+                config: Box::new(config()),
+            })
+            .unwrap();
+        handle
+            .execute(EngineCommand::Start {
+                run_id: first.run_id,
+            })
+            .unwrap();
+
+        assert!(matches!(
+            handle.execute(EngineCommand::Start {
+                run_id: second.run_id,
+            }),
+            Err(EngineError::RunAlreadyActive {
+                requested,
+                active,
+            }) if requested == second.run_id && active == first.run_id
+        ));
+        assert!(matches!(
+            handle.execute(EngineCommand::PrepareAgents {
+                run_id: second.run_id,
+            }),
+            Err(EngineError::RunAlreadyActive {
+                requested,
+                active,
+            }) if requested == second.run_id && active == first.run_id
+        ));
     }
 
     #[test]

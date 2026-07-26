@@ -1,7 +1,8 @@
 # Kneefinder queue demo
 
 This is a separate program for exercising kneefinder end to end. The primary
-demo uses Docker Compose to run a web coordinator and two workload agents:
+demo uses a Compose-compatible container runtime to run a web coordinator and
+two workload agents:
 
 ```text
 browser -> web coordinator -> TCP agent A -> fixed-worker queue
@@ -14,11 +15,20 @@ From the repository root, start the complete demo:
 docker compose -f demo/queue-demo/compose.yaml up --build
 ```
 
+With Podman, use:
+
+```console
+podman-compose -f demo/queue-demo/compose.yaml up --build
+```
+
 Open <http://127.0.0.1:8080>. The coordinator waits for both agent containers,
 opens both TCP sessions, discovers and validates their shared operation schema,
 and retains the initialized cohort. It runs a seven-level aggregate sweep and
 streams the real phase results to the dashboard. The browser workload editor
-shows the typed four-variant catalog discovered from the agents.
+shows the typed four-variant catalog discovered from the agents. When it
+finishes, change the settings, query the agents, and press Start to execute a
+new run. Stop completes the active run as stopped and leaves the agents ready
+to be queried again.
 
 Both agents are isolated services on the private Compose network. The
 coordinator is always the side that connects, and the dashboard is published
@@ -34,6 +44,8 @@ network:
 ```console
 docker compose -f demo/queue-demo/compose.yaml down
 ```
+
+Use `podman-compose` instead when the demo was started with Podman.
 
 The first image build compiles the release binary with the web feature and can
 take a few minutes. Later starts reuse the local image layers.
@@ -85,10 +97,12 @@ cargo run --manifest-path demo/queue-demo/Cargo.toml --features web -- e2e-tcp-w
 ```
 
 Open <http://127.0.0.1:8080>. The dashboard receives the real phase reports from
-both TCP agents through the shared engine and remains available after the sweep
-completes. Before the sweep, the engine itself connects to both agents, queries
-their shared operation catalog, retains the initialized cohort, and exposes the
-typed four-variant workload in the browser editor.
+both TCP agents through the shared engine and remains available after each
+sweep completes. Before every run, the engine itself connects to both agents,
+queries their shared operation catalog, retains the initialized cohort, and
+exposes the typed workload in the browser editor. Browser-edited load levels,
+phase timings, traversal strategy, cycles, and bound operation weights drive
+the next run.
 
 The adapter/service can also be run directly:
 

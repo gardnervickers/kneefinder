@@ -13,6 +13,7 @@ use std::{
     net::{SocketAddr, TcpStream},
     path::PathBuf,
     thread,
+    time::Instant,
 };
 
 use kneefinder::{
@@ -29,9 +30,11 @@ use kneefinder::{
         LoadConfig, OperationSelection, PhaseConfig, Preset, RunConfig, Strategy,
         WeightedOperation, WorkloadConfig,
     },
-    engine::{Engine, EngineCommand, EngineError, EngineHandle},
+    engine::{Engine, EngineCommand, EngineError, EngineEvent, EngineHandle, RunSnapshot},
     frontends::{Frontend, web::WebFrontend},
-    measurement::{KneeEstimate, RunClassification, RunEvent, RunOutcome, RunState},
+    measurement::{
+        KneeEstimate, MeasurementStage, RunClassification, RunEvent, RunOutcome, RunState,
+    },
     stats::PhaseReport,
 };
 
@@ -39,6 +42,10 @@ const WORKERS: usize = 4;
 const READ_SERVICE_MS: u64 = 10;
 const WRITE_SERVICE_MS: u64 = 20;
 const PHASE_DURATION_NS: u64 = 1_000_000_000;
+#[cfg(feature = "web")]
+const DEMO_CHUNK_MS: u64 = 1_000;
+#[cfg(feature = "web")]
+const MAX_DEMO_PHASES: usize = 512;
 
 fn theoretical_knee(workers: usize) -> f64 {
     let average_read_ms = READ_SERVICE_MS as f64 * 1.25;
@@ -263,10 +270,11 @@ fn run_tcp_multi_client_dashboard(
     bind: SocketAddr,
     allow_remote: bool,
     endpoints: Vec<AgentEndpointConfig>,
-    mut processes: Vec<TcpAdapterProcess>,
+    processes: Vec<TcpAdapterProcess>,
 ) -> Result<(), Box<dyn Error>> {
     let engine = Engine::new();
     let handle = engine.handle();
+    let events = handle.subscribe();
     let web_handle = handle.clone();
     thread::Builder::new()
         .name("kneefinder-queue-demo-web".into())
@@ -302,105 +310,155 @@ fn run_tcp_multi_client_dashboard(
     handle.execute(EngineCommand::Start {
         run_id: configured.run_id,
     })?;
-    let mut agents = engine.take_prepared_cohort(configured.run_id)?;
-    let mut stop_requested = matches!(
-        advance_or_stop(&engine, configured.run_id, RunEvent::AdapterReady)?,
-        DemoProgress::StopRequested
-    );
 
-    let mut rows = Vec::new();
-    for (index, rate) in rates.into_iter().enumerate() {
-        if stop_requested || run_is_stopping(&handle, configured.run_id)? {
-            stop_requested = true;
-            break;
-        }
-
-        eprint!("measuring {rate:.0} req/s across two TCP agents... ");
-        io_flush_stderr()?;
-        let phase_id = PhaseId(index as u64 + 1);
-        let row = run_phase(&mut agents, phase_id, rate)?;
-        eprintln!("p95 {:.1}ms", row.p95_ms);
-        engine.record_phase_stats(
-            configured.run_id,
-            phase_id,
-            PhaseReport {
-                offered_rate: row.offered_per_second,
-                goodput_rate: row.goodput_per_second,
-                elapsed_ns: PHASE_DURATION_NS,
-                stats: row.stats.clone(),
-            },
-        )?;
-        rows.push(row);
-
-        if run_is_stopping(&handle, configured.run_id)? {
-            stop_requested = true;
-            break;
-        }
-
-        let progress = match index {
-            0 => Some(RunEvent::BaselineEstablished),
-            4 => Some(RunEvent::SaturationBracketed),
-            5 => Some(RunEvent::BracketRefined),
-            _ => None,
-        };
-        if let Some(progress) = progress
-            && matches!(
-                advance_or_stop(&engine, configured.run_id, progress)?,
-                DemoProgress::StopRequested
-            )
-        {
-            stop_requested = true;
-            break;
-        }
-    }
-
-    if processes.is_empty() {
-        agents.disconnect()?;
-    } else {
-        agents.shutdown()?;
-        for process in &mut processes {
-            process.wait()?;
-        }
-    }
-    let expected_knee = theoretical_knee(WORKERS);
-    let completed = if stop_requested {
-        false
-    } else {
-        matches!(
-            advance_or_stop(
-                &engine,
-                configured.run_id,
-                RunEvent::CandidateValidated {
-                    outcome: RunOutcome {
-                        classification: RunClassification::TargetSaturated,
-                        knee: Some(KneeEstimate {
-                            offered_rate: expected_knee,
-                            lower_bound: 275.0,
-                            upper_bound: 310.0,
-                            recommended_operating_rate: expected_knee * 0.8,
-                        }),
-                        slo_maximum_rate: None,
-                        warnings: vec![
-                            "queue demo uses two independent TCP workload agents".into(),
-                        ],
-                    },
-                },
-            )?,
-            DemoProgress::Advanced
-        )
-    };
-    if !completed {
-        engine.record_run_event(configured.run_id, RunEvent::AdapterStopped)?;
-    }
-    print_rows(&rows, expected_knee);
-    if completed {
-        println!("\nmulti-client dashboard ready: http://{bind}");
-    } else {
-        println!("\nmulti-client run stopped; dashboard remains available at http://{bind}");
-    }
+    println!("multi-client dashboard ready: http://{bind}");
+    let _processes = processes;
     loop {
-        thread::park();
+        let event = events.recv()?;
+        let EngineEvent::RunStateChanged { snapshot, .. } = event else {
+            continue;
+        };
+        if snapshot.state != RunState::Starting {
+            continue;
+        }
+        if let Err(error) = execute_dashboard_run(&engine, &handle, snapshot.clone()) {
+            eprintln!("run {} failed: {error}", snapshot.run_id.0);
+            finish_failed_dashboard_run(&engine, &handle, snapshot.run_id, error.to_string())?;
+        }
     }
+}
+
+#[cfg(feature = "web")]
+fn execute_dashboard_run(
+    engine: &Engine,
+    handle: &EngineHandle,
+    snapshot: RunSnapshot,
+) -> Result<(), Box<dyn Error>> {
+    let run_id = snapshot.run_id;
+    let mut agents = engine.take_prepared_cohort(run_id)?;
+    let rates = configured_rates(&snapshot.config)?;
+    let operations = match &snapshot.config.workload.operations {
+        OperationSelection::Selected { operations } if !operations.is_empty() => operations,
+        _ => return Err("prepared run has no concrete workload variants".into()),
+    };
+    let mut next_wire_phase_id = 1_u64;
+    let mut rows = Vec::new();
+
+    if matches!(
+        advance_or_stop(engine, run_id, RunEvent::AdapterReady)?,
+        DemoProgress::StopRequested
+    ) {
+        agents.disconnect()?;
+        engine.record_run_event(run_id, RunEvent::AdapterStopped)?;
+        return Ok(());
+    }
+
+    for (index, rate) in rates.iter().copied().enumerate() {
+        if run_is_stopping(handle, run_id)? {
+            break;
+        }
+        if snapshot.config.phases.warmup_ms > 0
+            && run_configured_interval(
+                &mut agents,
+                handle,
+                run_id,
+                &mut next_wire_phase_id,
+                rate,
+                snapshot.config.phases.warmup_ms,
+                operations,
+                false,
+            )?
+            .stopped
+        {
+            break;
+        }
+
+        eprint!(
+            "run {} measuring {rate:.0} req/s across {} TCP agents... ",
+            run_id.0,
+            snapshot.config.agents.len()
+        );
+        io_flush_stderr()?;
+        let measured = run_configured_interval(
+            &mut agents,
+            handle,
+            run_id,
+            &mut next_wire_phase_id,
+            rate,
+            snapshot.config.phases.measurement_ms,
+            operations,
+            true,
+        )?;
+        if let Some(row) = measured.row {
+            let phase_id = PhaseId(index as u64 + 1);
+            eprintln!("p95 {:.1}ms", row.p95_ms);
+            engine.record_phase_stats(
+                run_id,
+                phase_id,
+                PhaseReport {
+                    offered_rate: row.offered_per_second,
+                    goodput_rate: row.goodput_per_second,
+                    elapsed_ns: measured.elapsed_ns,
+                    stats: row.stats.clone(),
+                },
+            )?;
+            rows.push(row);
+            advance_dashboard_stages(engine, handle, run_id, rows.len(), rates.len())?;
+        }
+        if measured.stopped {
+            break;
+        }
+        if snapshot.config.phases.recovery_ms > 0
+            && sleep_until_or_stop(
+                handle,
+                run_id,
+                Duration::from_millis(snapshot.config.phases.recovery_ms),
+            )?
+        {
+            break;
+        }
+    }
+
+    agents.disconnect()?;
+    if run_is_stopping(handle, run_id)? {
+        engine.record_run_event(run_id, RunEvent::AdapterStopped)?;
+        println!("run {} stopped; agents remain available", run_id.0);
+        return Ok(());
+    }
+
+    advance_dashboard_stages(engine, handle, run_id, rows.len(), rates.len())?;
+    let outcome = dashboard_outcome(&rates);
+    match advance_or_stop(
+        engine,
+        run_id,
+        RunEvent::CandidateValidated { outcome },
+    )? {
+        DemoProgress::Advanced => {
+            print_rows(&rows, theoretical_knee(WORKERS));
+            println!("run {} completed; agents remain available", run_id.0);
+        }
+        DemoProgress::StopRequested => {
+            engine.record_run_event(run_id, RunEvent::AdapterStopped)?;
+            println!("run {} stopped; agents remain available", run_id.0);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "web")]
+fn finish_failed_dashboard_run(
+    engine: &Engine,
+    handle: &EngineHandle,
+    run_id: RunId,
+    message: String,
+) -> Result<(), EngineError> {
+    let state = handle.snapshot(run_id)?.state;
+    if matches!(state, RunState::Stopping { .. }) {
+        engine.record_run_event(run_id, RunEvent::AdapterStopped)?;
+    } else if !state.is_terminal() {
+        engine.record_run_event(run_id, RunEvent::Failed { message })?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "web")]
@@ -433,6 +491,298 @@ fn run_is_stopping(handle: &EngineHandle, run_id: RunId) -> Result<bool, EngineE
         handle.snapshot(run_id)?.state,
         RunState::Stopping { .. }
     ))
+}
+
+#[cfg(feature = "web")]
+fn configured_rates(config: &RunConfig) -> Result<Vec<f64>, Box<dyn Error>> {
+    if config.phases.measurement_ms == 0 {
+        return Err("measurement duration must be greater than zero".into());
+    }
+    if config.phases.repetitions == 0 {
+        return Err("phase repetitions must be greater than zero".into());
+    }
+    if config.load.cycles == 0 {
+        return Err("load cycles must be greater than zero".into());
+    }
+
+    let ascending = if config.load.explicit_levels.is_empty() {
+        if !config.load.initial_rate.is_finite() || config.load.initial_rate <= 0.0 {
+            return Err("initial rate must be a positive finite number".into());
+        }
+        if !config.load.maximum_rate.is_finite()
+            || config.load.maximum_rate < config.load.initial_rate
+        {
+            return Err("maximum rate must be finite and at least the initial rate".into());
+        }
+        if !config.load.growth_factor.is_finite() || config.load.growth_factor <= 1.0 {
+            return Err("growth factor must be a finite number greater than one".into());
+        }
+        let mut levels = Vec::new();
+        let mut rate = config.load.initial_rate;
+        while rate < config.load.maximum_rate {
+            levels.push(rate);
+            if levels.len() >= MAX_DEMO_PHASES {
+                return Err("configured load plan exceeds the demo phase limit".into());
+            }
+            rate *= config.load.growth_factor;
+        }
+        levels.push(config.load.maximum_rate);
+        levels
+    } else {
+        if config
+            .load
+            .explicit_levels
+            .iter()
+            .any(|rate| !rate.is_finite() || *rate <= 0.0)
+        {
+            return Err("explicit load levels must be positive finite numbers".into());
+        }
+        config.load.explicit_levels.clone()
+    };
+
+    let mut cycle = ascending.clone();
+    if config.strategy == Strategy::UpDown && ascending.len() > 1 {
+        cycle.extend(ascending.iter().rev().skip(1).copied());
+    }
+    let mut rates = Vec::new();
+    for _ in 0..config.load.cycles {
+        for rate in &cycle {
+            for _ in 0..config.phases.repetitions {
+                rates.push(*rate);
+                if rates.len() > MAX_DEMO_PHASES {
+                    return Err("configured load plan exceeds the demo phase limit".into());
+                }
+            }
+        }
+    }
+    Ok(rates)
+}
+
+#[cfg(feature = "web")]
+struct ConfiguredInterval {
+    row: Option<DemoRow>,
+    elapsed_ns: u64,
+    stopped: bool,
+}
+
+#[cfg(feature = "web")]
+#[allow(clippy::too_many_arguments)]
+fn run_configured_interval(
+    agents: &mut AgentCohort,
+    handle: &EngineHandle,
+    run_id: RunId,
+    next_wire_phase_id: &mut u64,
+    offered_per_second: f64,
+    duration_ms: u64,
+    variants: &[WeightedOperation],
+    retain_results: bool,
+) -> Result<ConfiguredInterval, Box<dyn Error>> {
+    let mut remaining_ms = duration_ms;
+    let mut elapsed_ns = 0_u64;
+    let mut completed_in_window = 0_usize;
+    let mut results = Vec::new();
+    let mut operation_budget = 0.0_f64;
+    let total_weight: f64 = variants.iter().map(|variant| variant.weight).sum();
+    if !total_weight.is_finite()
+        || total_weight <= 0.0
+        || variants
+            .iter()
+            .any(|variant| !variant.weight.is_finite() || variant.weight <= 0.0)
+    {
+        return Err("workload variant weights must be positive finite numbers".into());
+    }
+    let mut scheduler = SmoothWeightedScheduler::new(variants, total_weight);
+
+    while remaining_ms > 0 {
+        if run_is_stopping(handle, run_id)? {
+            break;
+        }
+        let chunk_ms = remaining_ms.min(DEMO_CHUNK_MS);
+        let chunk_ns = chunk_ms.saturating_mul(1_000_000);
+        operation_budget += offered_per_second * chunk_ns as f64 / 1e9;
+        let operation_count = operation_budget.floor() as u64;
+        operation_budget -= operation_count as f64;
+        if operation_count == 0 {
+            if sleep_until_or_stop(handle, run_id, Duration::from_millis(chunk_ms))? {
+                break;
+            }
+        } else {
+            let operations = (0..operation_count)
+                .map(|index| {
+                    let variant = scheduler.next();
+                    ScheduledOperation {
+                        id: OperationId(index),
+                        operation: variant.name.clone(),
+                        start_offset_ns: (index as f64 * 1e9 / offered_per_second).round() as u64,
+                        arguments: variant.arguments.clone(),
+                    }
+                })
+                .collect();
+            let phase_id = PhaseId(*next_wire_phase_id);
+            *next_wire_phase_id = next_wire_phase_id
+                .checked_add(1)
+                .ok_or("wire phase identifier space exhausted")?;
+            let chunk_results = agents
+                .execute_schedule(
+                    phase_id,
+                    unix_now_ns().saturating_add(50_000_000),
+                    operations,
+                )?
+                .into_operations();
+            if retain_results {
+                completed_in_window += chunk_results
+                    .iter()
+                    .filter(|result| {
+                        matches!(result.status, OperationStatus::Ok)
+                            && result
+                                .actual_start_offset_ns
+                                .saturating_add(result.client_latency_ns)
+                                <= chunk_ns
+                    })
+                    .count();
+                results.extend(chunk_results);
+            }
+        }
+        elapsed_ns = elapsed_ns.saturating_add(chunk_ns);
+        remaining_ms -= chunk_ms;
+    }
+
+    let stopped = run_is_stopping(handle, run_id)?;
+    let row = if retain_results && elapsed_ns > 0 {
+        let stats = summarize_results(&results)?;
+        Some(DemoRow {
+            offered_per_second,
+            goodput_per_second: completed_in_window as f64 * 1e9 / elapsed_ns as f64,
+            p50_ms: ns_to_ms(stats.overall.client_latency_ns.p50),
+            p95_ms: ns_to_ms(stats.overall.client_latency_ns.p95),
+            dispatch_p99_ms: ns_to_ms(stats.overall.dispatch_lag_ns.p99),
+            stats,
+        })
+    } else {
+        None
+    };
+    Ok(ConfiguredInterval {
+        row,
+        elapsed_ns,
+        stopped,
+    })
+}
+
+#[cfg(feature = "web")]
+struct SmoothWeightedScheduler<'a> {
+    variants: &'a [WeightedOperation],
+    scores: Vec<f64>,
+    total_weight: f64,
+}
+
+#[cfg(feature = "web")]
+impl<'a> SmoothWeightedScheduler<'a> {
+    fn new(variants: &'a [WeightedOperation], total_weight: f64) -> Self {
+        Self {
+            variants,
+            scores: vec![0.0; variants.len()],
+            total_weight,
+        }
+    }
+
+    fn next(&mut self) -> &'a WeightedOperation {
+        for (score, variant) in self.scores.iter_mut().zip(self.variants) {
+            *score += variant.weight;
+        }
+        let selected = self
+            .scores
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(index, _)| index)
+            .expect("prepared workloads contain at least one variant");
+        self.scores[selected] -= self.total_weight;
+        &self.variants[selected]
+    }
+}
+
+#[cfg(feature = "web")]
+fn sleep_until_or_stop(
+    handle: &EngineHandle,
+    run_id: RunId,
+    duration: Duration,
+) -> Result<bool, EngineError> {
+    let deadline = Instant::now() + duration;
+    loop {
+        if run_is_stopping(handle, run_id)? {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        thread::sleep(remaining.min(Duration::from_millis(25)));
+    }
+}
+
+#[cfg(feature = "web")]
+fn advance_dashboard_stages(
+    engine: &Engine,
+    handle: &EngineHandle,
+    run_id: RunId,
+    completed: usize,
+    total: usize,
+) -> Result<(), Box<dyn Error>> {
+    loop {
+        let event = match handle.snapshot(run_id)?.state {
+            RunState::Measuring {
+                stage: MeasurementStage::Baseline,
+            } if completed >= 1 => RunEvent::BaselineEstablished,
+            RunState::Measuring {
+                stage: MeasurementStage::Discovery,
+            } if completed >= total.saturating_sub(1).max(1) => {
+                RunEvent::SaturationBracketed
+            }
+            RunState::Measuring {
+                stage: MeasurementStage::Refinement,
+            } if completed >= total.max(1) => RunEvent::BracketRefined,
+            _ => return Ok(()),
+        };
+        if matches!(
+            advance_or_stop(engine, run_id, event)?,
+            DemoProgress::StopRequested
+        ) {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(feature = "web")]
+fn dashboard_outcome(rates: &[f64]) -> RunOutcome {
+    let expected_knee = theoretical_knee(WORKERS);
+    let minimum = rates.iter().copied().fold(f64::INFINITY, f64::min);
+    let maximum = rates.iter().copied().fold(0.0_f64, f64::max);
+    let mut warnings = vec!["queue demo uses two independent TCP workload agents".into()];
+    let (classification, knee) = if minimum <= expected_knee * 0.8
+        && maximum >= expected_knee * 1.1
+    {
+        (
+            RunClassification::TargetSaturated,
+            Some(KneeEstimate {
+                offered_rate: expected_knee,
+                lower_bound: expected_knee * 0.945,
+                upper_bound: expected_knee * 1.065,
+                recommended_operating_rate: expected_knee * 0.8,
+            }),
+        )
+    } else if maximum < expected_knee * 1.1 {
+        warnings.push("configured load plan did not reach the queue demo knee".into());
+        (RunClassification::MaximumLoadReached, None)
+    } else {
+        warnings.push("configured load plan did not establish a low-load baseline".into());
+        (RunClassification::UnstableMeasurement, None)
+    };
+    RunOutcome {
+        classification,
+        knee,
+        slo_maximum_rate: None,
+        warnings,
+    }
 }
 
 #[cfg(all(test, feature = "web"))]
@@ -489,6 +839,44 @@ mod web_stop_tests {
             handle.snapshot(configured.run_id).unwrap().state,
             RunState::Stopped
         );
+    }
+
+    #[test]
+    fn configured_plan_honors_up_down_cycles_and_repetitions() {
+        let mut config = dashboard_config(Vec::new(), &[100.0, 200.0, 300.0]);
+        config.strategy = Strategy::UpDown;
+        config.load.cycles = 2;
+        config.phases.repetitions = 2;
+
+        assert_eq!(
+            configured_rates(&config).unwrap(),
+            [
+                100.0, 100.0, 200.0, 200.0, 300.0, 300.0, 200.0, 200.0, 100.0, 100.0,
+                100.0, 100.0, 200.0, 200.0, 300.0, 300.0, 200.0, 200.0, 100.0, 100.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn weighted_scheduler_preserves_the_queue_demo_mix() {
+        let OperationSelection::Selected { operations } =
+            dashboard_config(Vec::new(), &[100.0]).workload.operations
+        else {
+            panic!("dashboard config should use concrete operations");
+        };
+        let total_weight = operations.iter().map(|operation| operation.weight).sum();
+        let mut scheduler = SmoothWeightedScheduler::new(&operations, total_weight);
+        let mut counts = BTreeMap::new();
+        for _ in 0..40 {
+            let operation = scheduler.next();
+            *counts
+                .entry((operation.name.clone(), operation.arguments.clone()))
+                .or_insert(0_u64) += 1;
+        }
+
+        let mut counts = counts.values().copied().collect::<Vec<_>>();
+        counts.sort_unstable();
+        assert_eq!(counts, [1, 3, 9, 27]);
     }
 }
 
