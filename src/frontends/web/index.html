@@ -43,9 +43,32 @@
               <label>Measure ms<input id="measurement" type="number" min="1" value="10000"></label>
               <label>Recover ms<input id="recovery" type="number" min="0" value="2000"></label>
             </div>
-            <label>Operation variants <span class="hint">one per line</span><textarea id="operations" rows="4" placeholder="read:key=0@27&#10;read:key=1@9&#10;write:value=small@3&#10;write:value=large@1"></textarea></label>
             <label>Adapter executable<input id="adapter-program" placeholder="./my-adapter"></label>
             <label>Adapter arguments <span class="hint">one per line</span><textarea id="adapter-args" rows="2" placeholder="--endpoint&#10;localhost:9000"></textarea></label>
+            <label>Remote agents <span class="hint">one ID=tcp://HOST:PORT per line</span><textarea id="agent-endpoints" rows="2" placeholder="client-a=tcp://10.0.0.10:9000&#10;client-b=tcp://10.0.0.11:9000"></textarea></label>
+
+            <section class="workload-editor" aria-labelledby="workload-editor-title">
+              <div class="editor-heading">
+                <div>
+                  <span class="field-title" id="workload-editor-title">Discovered workload</span>
+                  <span class="hint">queried from every configured agent</span>
+                </div>
+                <button id="query-agents" type="button">Query agents</button>
+              </div>
+              <p id="agent-query-status" class="catalog-status">Configure an adapter or remote agent, then query it.</p>
+              <div id="operation-catalog" class="operation-catalog">
+                <p class="empty">Operation schemas will appear here.</p>
+              </div>
+
+              <div class="variant-heading">
+                <span class="field-title">Configured variants</span>
+                <span id="variant-count" class="run-chip">Adapter defaults</span>
+              </div>
+              <div id="configured-workload" class="configured-workload">
+                <p class="empty">Safe adapter defaults will be selected after discovery.</p>
+              </div>
+            </section>
+
             <label>Output directory<input id="output-directory" value="results"></label>
           </form>
 
@@ -68,6 +91,7 @@
           <article class="metric"><p>Run state</p><strong id="metric-state">—</strong><span id="metric-stage">Waiting for a run</span></article>
           <article class="metric accent"><p>Knee</p><strong id="metric-knee">—</strong><span>offered operations / sec</span></article>
           <article class="metric"><p>Recommended</p><strong id="metric-recommended">—</strong><span>operating rate</span></article>
+          <article class="metric"><p>Agents</p><strong id="metric-agents">—</strong><span id="metric-agent-detail">workload clients</span></article>
           <article id="metric-errors" class="metric"><p>Unsuccessful</p><strong id="metric-error-rate">—</strong><span id="metric-error-detail">errors + timeouts</span></article>
           <article class="metric"><p>Measurements</p><strong id="metric-phases">0</strong><span>completed phases</span></article>
         </div>

@@ -12,9 +12,9 @@ use std::{
 };
 
 use kneefinder::protocol::{
-    AdapterMessage, ArgumentKind, ArgumentValue, Capabilities, ControllerMessage, LoadModel,
-    OperationArgument, OperationDescriptor, OperationKind, OperationResult, OperationStatus,
-    PROTOCOL_VERSION, ScheduledOperation,
+    AdapterIdentity, AdapterMessage, ArgumentKind, ArgumentValue, Capabilities, ControllerMessage,
+    LoadModel, OperationArgument, OperationDescriptor, OperationKind, OperationResult,
+    OperationStatus, PROTOCOL_VERSION, ScheduledOperation,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -29,6 +29,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                     &mut stdout,
                     &AdapterMessage::Ready {
                         protocol_version: PROTOCOL_VERSION,
+                        identity: AdapterIdentity {
+                            name: "rust-adapter-example".into(),
+                            version: Some(env!("CARGO_PKG_VERSION").into()),
+                        },
                         capabilities: Capabilities {
                             scheduled_operations: true,
                             adapter_managed_phases: false,

@@ -42,11 +42,19 @@ default transport is newline-delimited JSON over a child process's stdin and
 stdout. Human-readable logs go only to stderr. Never let adapter logs corrupt
 stdout framing.
 
-Keep message/session logic independent of subprocess I/O. Remote transport is
-planned in issue #10 in addition to, not instead of, zero-setup stdio. Remote
-multi-client work must account for client identity, aggregate load allocation,
-start barriers and clock skew, per-client attribution, disconnects, and fan-out
-cancellation rather than treating networking as a transparent byte pipe.
+Keep message/session logic independent of subprocess I/O. Persistent TCP is an
+additional transport under issue #10, not a replacement for zero-setup stdio.
+Remote multi-client work must account for client identity, aggregate load
+allocation, start barriers and clock skew, per-client attribution, disconnects,
+and fan-out cancellation rather than treating networking as a transparent byte
+pipe.
+
+The coordinator is always the initiating side of the workload control plane.
+Remote agents expose explicitly configured endpoints; they never dial,
+register with, or otherwise initiate calls to the coordinator. An agent may
+reply or stream results on a coordinator-established session, but every
+session and unit of work originates from the coordinator. Preserve this call
+direction in local, Docker, Kubernetes, and EC2 deployments.
 
 Do not include adapter IPC time in native client latency. Batching and dispatch
 lag exist so the load generator cannot silently become the bottleneck.
@@ -156,6 +164,9 @@ time buckets should support stationarity checks, repeats, and uncertainty.
 ## Repository map
 
 - `src/protocol.rs`: versioned controller/adapter messages and capability model
+- `src/adapter_session.rs`: protocol-state validation plus supervised stdio and
+  coordinator-initiated persistent TCP transports
+- `src/agent.rs`: fixed cohorts and generic transport-backed session agents
 - `src/workload.rs`: operation discovery validation and flat variant resolution
 - `src/stats.rs`: overall/per-variant counts, error codes, and distributions
 - `src/measurement.rs`: pure run lifecycle and outcome types
@@ -180,14 +191,23 @@ At the time this handoff was written, these pieces exist:
 - lifecycle reducer and frontend-neutral engine API
 - CLI configuration and `--print-config`
 - HTTP/WebSocket API and browser dashboard
+- coordinator-owned agent preparation with discovery events and retained
+  initialized cohorts
+- discovery-driven browser workload editor with typed arguments, safe defaults,
+  explicit opt-in operations, and multiple bound variants
 - Rust adapter example
-- runnable queue demonstration
+- supervised subprocess adapter session, bounded stderr diagnostics, and TCP
+  transport
+- fixed agent cohort with stable identities plus colocated and remote session
+  implementations
+- runnable queue demonstrations using the colocated path and two TCP clients
 
-The main missing vertical slice is the generic executor that connects
-`kneefinder run` and web Start to an arbitrary adapter. The browser currently
-demonstrates/control-streams engine state; do not claim that it executes an
-arbitrary configured adapter until the executor lands. Keep README's Current
-status section honest as work progresses.
+The main missing vertical slice is the generic executor that turns a prepared
+cohort and `RunConfig` into an arbitrary measured run. `kneefinder run` and the
+browser can prepare/query configured agents, but Start does not yet drive an
+arbitrary adapter through the full measurement strategy. The queue demo remains
+the complete measured flow. Keep README's Current status section honest as work
+progresses.
 
 `docs/design.md` is the contract and direction, not proof of implementation.
 Inspect source and current GitHub issue state before relying on a described
@@ -196,7 +216,9 @@ command or component.
 ## Queue demo contract
 
 `demo/queue-demo` is a separate Rust package that combines a protocol adapter
-and a fixed-worker FIFO service. It is the current complete measured E2E path.
+and a fixed-worker FIFO service. Its coordinator uses the real `AgentCohort`,
+`ColocatedAgent`, `TcpAgent`, and adapter session. It is the current complete
+measured E2E path for both colocated and multi-client transport modes.
 
 The default workload has four workers and four variants with weights 27:9:3:1:
 
@@ -214,6 +236,12 @@ Run it with:
 
 ```console
 cargo run --release --manifest-path demo/queue-demo/Cargo.toml -- e2e
+```
+
+Run the two-client TCP transport E2E with:
+
+```console
+cargo run --manifest-path demo/queue-demo/Cargo.toml -- e2e-tcp
 ```
 
 Keep the demo external to the main crate. When the generic session/executor is

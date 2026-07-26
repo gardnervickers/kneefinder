@@ -11,12 +11,15 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
+    agent::{AgentCohort, CohortReady},
     config::RunConfig,
     measurement::{RunEvent, RunState, TransitionError},
     protocol::{PhaseId, RunId},
     stats::PhaseReport,
+    workload::{WorkloadError, normalize_operation_mix, resolve_operation_mix},
 };
 
 /// A state-changing request accepted from any frontend.
@@ -29,6 +32,9 @@ pub enum EngineCommand {
     UpdateConfigured {
         run_id: RunId,
         config: Box<RunConfig>,
+    },
+    PrepareAgents {
+        run_id: RunId,
     },
     Start {
         run_id: RunId,
@@ -45,6 +51,22 @@ pub struct RunSnapshot {
     pub run_id: RunId,
     pub config: RunConfig,
     pub state: RunState,
+    #[serde(default)]
+    pub preparation: AgentPreparation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AgentPreparation {
+    #[default]
+    Unprepared,
+    Preparing,
+    Ready {
+        catalog: CohortReady,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -54,6 +76,9 @@ pub enum EngineEvent {
         snapshot: RunSnapshot,
     },
     RunConfigurationUpdated {
+        snapshot: RunSnapshot,
+    },
+    RunPreparationChanged {
         snapshot: RunSnapshot,
     },
     RunStateChanged {
@@ -105,6 +130,17 @@ impl Engine {
     ) -> Result<(), EngineError> {
         self.inner.phase_stats(run_id, phase_id, report)
     }
+
+    /// Transfers the initialized cohort to the runtime that executes the run.
+    /// Its discovery catalog remains attached to the run snapshot.
+    pub fn take_prepared_cohort(&self, run_id: RunId) -> Result<AgentCohort, EngineError> {
+        self.inner
+            .prepared
+            .lock()
+            .expect("prepared cohort mutex poisoned")
+            .remove(&run_id)
+            .ok_or(EngineError::PreparedCohortUnavailable(run_id))
+    }
 }
 
 impl Default for Engine {
@@ -126,9 +162,8 @@ impl EngineHandle {
             EngineCommand::UpdateConfigured { run_id, config } => {
                 self.inner.update_configured(run_id, *config)
             }
-            EngineCommand::Start { run_id } => {
-                self.inner.transition(run_id, RunEvent::StartRequested)
-            }
+            EngineCommand::PrepareAgents { run_id } => self.inner.prepare_agents(run_id),
+            EngineCommand::Start { run_id } => self.inner.start(run_id),
             EngineCommand::Stop { run_id } => {
                 self.inner.transition(run_id, RunEvent::StopRequested)
             }
@@ -194,6 +229,7 @@ impl EventSubscription {
 struct EngineInner {
     mutation: Mutex<()>,
     registry: Mutex<Registry>,
+    prepared: Mutex<BTreeMap<RunId, AgentCohort>>,
     subscribers: Mutex<Vec<mpsc::Sender<EngineEvent>>>,
 }
 
@@ -218,6 +254,7 @@ impl EngineInner {
                 run_id,
                 config,
                 state: RunState::Configured,
+                preparation: AgentPreparation::Unprepared,
             };
             registry.runs.insert(run_id, snapshot.clone());
             snapshot
@@ -268,13 +305,13 @@ impl EngineInner {
     fn update_configured(
         &self,
         run_id: RunId,
-        config: RunConfig,
+        mut config: RunConfig,
     ) -> Result<RunSnapshot, EngineError> {
         let _mutation = self
             .mutation
             .lock()
             .expect("engine mutation mutex poisoned");
-        let snapshot = {
+        let (snapshot, endpoints_changed) = {
             let mut registry = self
                 .registry
                 .lock()
@@ -286,18 +323,170 @@ impl EngineInner {
             if run.state != RunState::Configured {
                 return Err(EngineError::ConfigurationLocked(run_id));
             }
+            let endpoints_changed = run.config.agents != config.agents;
+            if !endpoints_changed && let AgentPreparation::Ready { catalog } = &run.preparation {
+                let operations = normalize_operation_mix(&config.workload, &catalog.operations)
+                    .map_err(|source| EngineError::InvalidWorkload { run_id, source })?;
+                config.workload.operations =
+                    crate::config::OperationSelection::Selected { operations };
+            }
             run.revision = run
                 .revision
                 .checked_add(1)
                 .ok_or(EngineError::RevisionExhausted(run_id))?;
             run.config = config;
-            run.clone()
+            if endpoints_changed {
+                run.preparation = AgentPreparation::Unprepared;
+            }
+            (run.clone(), endpoints_changed)
         };
 
+        if endpoints_changed
+            && let Some(mut cohort) = self
+                .prepared
+                .lock()
+                .expect("prepared cohort mutex poisoned")
+                .remove(&run_id)
+        {
+            let _ = cohort.shutdown();
+        }
         self.publish(EngineEvent::RunConfigurationUpdated {
             snapshot: snapshot.clone(),
         });
         Ok(snapshot)
+    }
+
+    fn prepare_agents(&self, run_id: RunId) -> Result<RunSnapshot, EngineError> {
+        let _mutation = self
+            .mutation
+            .lock()
+            .expect("engine mutation mutex poisoned");
+        let endpoints = {
+            let mut registry = self
+                .registry
+                .lock()
+                .expect("engine registry mutex poisoned");
+            let run = registry
+                .runs
+                .get_mut(&run_id)
+                .ok_or(EngineError::RunNotFound(run_id))?;
+            if run.state != RunState::Configured {
+                return Err(EngineError::ConfigurationLocked(run_id));
+            }
+            if run.config.agents.is_empty() {
+                return Err(EngineError::NoAgentsConfigured(run_id));
+            }
+            run.revision = run
+                .revision
+                .checked_add(1)
+                .ok_or(EngineError::RevisionExhausted(run_id))?;
+            run.preparation = AgentPreparation::Preparing;
+            let snapshot = run.clone();
+            self.publish(EngineEvent::RunPreparationChanged { snapshot });
+            run.config.agents.clone()
+        };
+
+        if let Some(mut cohort) = self
+            .prepared
+            .lock()
+            .expect("prepared cohort mutex poisoned")
+            .remove(&run_id)
+        {
+            let _ = cohort.shutdown();
+        }
+
+        let prepared =
+            AgentCohort::from_endpoints(&endpoints, Default::default()).and_then(|mut cohort| {
+                cohort
+                    .initialize(run_id, Value::Object(Default::default()))
+                    .map(|catalog| (cohort, catalog))
+            });
+
+        match prepared {
+            Ok((cohort, catalog)) => {
+                self.prepared
+                    .lock()
+                    .expect("prepared cohort mutex poisoned")
+                    .insert(run_id, cohort);
+                self.finish_preparation(run_id, AgentPreparation::Ready { catalog })
+            }
+            Err(source) => {
+                let error = EngineError::AgentPreparationFailed {
+                    run_id,
+                    message: source.to_string(),
+                };
+                self.fail_preparation(run_id, error.to_string())?;
+                Err(error)
+            }
+        }
+    }
+
+    fn fail_preparation(&self, run_id: RunId, message: String) -> Result<(), EngineError> {
+        self.finish_preparation(run_id, AgentPreparation::Failed { message })
+            .map(|_| ())
+    }
+
+    fn finish_preparation(
+        &self,
+        run_id: RunId,
+        preparation: AgentPreparation,
+    ) -> Result<RunSnapshot, EngineError> {
+        let snapshot = {
+            let mut registry = self
+                .registry
+                .lock()
+                .expect("engine registry mutex poisoned");
+            let run = registry
+                .runs
+                .get_mut(&run_id)
+                .ok_or(EngineError::RunNotFound(run_id))?;
+            if let AgentPreparation::Ready { catalog } = &preparation
+                && let Ok(operations) =
+                    normalize_operation_mix(&run.config.workload, &catalog.operations)
+            {
+                run.config.workload.operations =
+                    crate::config::OperationSelection::Selected { operations };
+            }
+            run.revision = run
+                .revision
+                .checked_add(1)
+                .ok_or(EngineError::RevisionExhausted(run_id))?;
+            run.preparation = preparation;
+            run.clone()
+        };
+        self.publish(EngineEvent::RunPreparationChanged {
+            snapshot: snapshot.clone(),
+        });
+        Ok(snapshot)
+    }
+
+    fn start(&self, run_id: RunId) -> Result<RunSnapshot, EngineError> {
+        {
+            let registry = self
+                .registry
+                .lock()
+                .expect("engine registry mutex poisoned");
+            let run = registry
+                .runs
+                .get(&run_id)
+                .ok_or(EngineError::RunNotFound(run_id))?;
+            if !run.config.agents.is_empty() {
+                let AgentPreparation::Ready { catalog } = &run.preparation else {
+                    return Err(EngineError::AgentsNotPrepared(run_id));
+                };
+                resolve_operation_mix(&run.config.workload, &catalog.operations)
+                    .map_err(|source| EngineError::InvalidWorkload { run_id, source })?;
+                if !self
+                    .prepared
+                    .lock()
+                    .expect("prepared cohort mutex poisoned")
+                    .contains_key(&run_id)
+                {
+                    return Err(EngineError::PreparedCohortUnavailable(run_id));
+                }
+            }
+        }
+        self.transition(run_id, RunEvent::StartRequested)
     }
 
     fn publish(&self, event: EngineEvent) {
@@ -355,6 +544,17 @@ pub enum EngineError {
     RunIdExhausted,
     RevisionExhausted(RunId),
     ConfigurationLocked(RunId),
+    NoAgentsConfigured(RunId),
+    AgentsNotPrepared(RunId),
+    PreparedCohortUnavailable(RunId),
+    AgentPreparationFailed {
+        run_id: RunId,
+        message: String,
+    },
+    InvalidWorkload {
+        run_id: RunId,
+        source: WorkloadError,
+    },
     InvalidTransition {
         run_id: RunId,
         source: Box<TransitionError>,
@@ -374,6 +574,29 @@ impl fmt::Display for EngineError {
                 "run {} configuration is immutable after the run starts",
                 run_id.0
             ),
+            Self::NoAgentsConfigured(run_id) => {
+                write!(formatter, "run {} has no configured agents", run_id.0)
+            }
+            Self::AgentsNotPrepared(run_id) => write!(
+                formatter,
+                "run {} agents must be queried before the run starts",
+                run_id.0
+            ),
+            Self::PreparedCohortUnavailable(run_id) => write!(
+                formatter,
+                "run {} prepared agent sessions are no longer available",
+                run_id.0
+            ),
+            Self::AgentPreparationFailed { run_id, message } => {
+                write!(
+                    formatter,
+                    "failed to prepare agents for run {}: {message}",
+                    run_id.0
+                )
+            }
+            Self::InvalidWorkload { run_id, source } => {
+                write!(formatter, "invalid workload for run {}: {source}", run_id.0)
+            }
             Self::InvalidTransition { run_id, source } => {
                 write!(
                     formatter,
@@ -388,6 +611,7 @@ impl fmt::Display for EngineError {
 impl std::error::Error for EngineError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::InvalidWorkload { source, .. } => Some(source),
             Self::InvalidTransition { source, .. } => Some(source.as_ref()),
             _ => None,
         }
@@ -396,11 +620,23 @@ impl std::error::Error for EngineError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        collections::BTreeMap,
+        io::{BufRead, BufReader, BufWriter, Write},
+        net::TcpListener,
+        path::PathBuf,
+        thread,
+    };
 
     use super::*;
     use crate::config::{
-        LoadConfig, OperationSelection, PhaseConfig, Preset, Strategy, WorkloadConfig,
+        AgentEndpointConfig, AgentTransportConfig, LoadConfig, OperationSelection, PhaseConfig,
+        Preset, Strategy, WeightedOperation, WorkloadConfig,
+    };
+    use crate::protocol::{
+        AdapterIdentity, AdapterMessage, ArgumentKind, ArgumentValue, Capabilities,
+        ControllerMessage, LoadModel, OperationArgument, OperationDescriptor, OperationKind,
+        PROTOCOL_VERSION,
     };
     use crate::stats::{PhaseReport, summarize_results};
 
@@ -425,8 +661,80 @@ mod tests {
                 operations: OperationSelection::AdapterDefaults,
             },
             output_directory: PathBuf::from("results"),
-            adapter: None,
+            agents: Vec::new(),
         }
+    }
+
+    fn tcp_ready_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut input = BufReader::new(stream.try_clone().unwrap());
+            let mut initialize = String::new();
+            assert_ne!(input.read_line(&mut initialize).unwrap(), 0);
+            assert!(matches!(
+                serde_json::from_str::<ControllerMessage>(&initialize).unwrap(),
+                ControllerMessage::Initialize { .. }
+            ));
+            let message = AdapterMessage::Ready {
+                protocol_version: PROTOCOL_VERSION,
+                identity: AdapterIdentity {
+                    name: "engine-test-adapter".into(),
+                    version: Some("1.0.0".into()),
+                },
+                capabilities: Capabilities {
+                    scheduled_operations: true,
+                    adapter_managed_phases: false,
+                    load_models: vec![LoadModel::OpenLoop],
+                    max_batch_size: None,
+                },
+                operations: vec![
+                    OperationDescriptor {
+                        name: "read".into(),
+                        description: None,
+                        kind: OperationKind::Read,
+                        enabled_by_default: true,
+                        default_weight: 9.0,
+                        arguments: vec![OperationArgument {
+                            name: "key".into(),
+                            description: None,
+                            kind: ArgumentKind::Integer,
+                            required: true,
+                            default: Some(ArgumentValue::Integer(0)),
+                        }],
+                    },
+                    OperationDescriptor {
+                        name: "write".into(),
+                        description: None,
+                        kind: OperationKind::Write,
+                        enabled_by_default: false,
+                        default_weight: 1.0,
+                        arguments: vec![OperationArgument {
+                            name: "value".into(),
+                            description: None,
+                            kind: ArgumentKind::String,
+                            required: true,
+                            default: None,
+                        }],
+                    },
+                ],
+            };
+            let mut output = BufWriter::new(stream);
+            serde_json::to_writer(&mut output, &message).unwrap();
+            output.write_all(b"\n").unwrap();
+            output.flush().unwrap();
+        });
+        (endpoint, server)
+    }
+
+    fn remote_config(endpoint: String) -> RunConfig {
+        let mut config = config();
+        config.agents.push(AgentEndpointConfig {
+            id: "tcp-0".into(),
+            transport: AgentTransportConfig::Tcp { address: endpoint },
+        });
+        config
     }
 
     #[test]
@@ -565,5 +873,174 @@ mod tests {
                 report,
             }
         );
+    }
+
+    #[test]
+    fn preparation_queries_agents_and_retains_the_initialized_cohort() {
+        let (endpoint, server) = tcp_ready_server();
+        let engine = Engine::new();
+        let handle = engine.handle();
+        let events = handle.subscribe();
+        let configured = handle
+            .execute(EngineCommand::Configure {
+                config: Box::new(remote_config(endpoint)),
+            })
+            .unwrap();
+        assert!(matches!(
+            events.recv().unwrap(),
+            EngineEvent::RunConfigured { .. }
+        ));
+
+        let prepared = handle
+            .execute(EngineCommand::PrepareAgents {
+                run_id: configured.run_id,
+            })
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(prepared.revision, 3);
+        let AgentPreparation::Ready { catalog } = &prepared.preparation else {
+            panic!("expected a ready agent catalog");
+        };
+        assert_eq!(catalog.agents.len(), 1);
+        assert_eq!(
+            catalog
+                .operations
+                .iter()
+                .map(|operation| operation.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read", "write"]
+        );
+        assert!(matches!(
+            events.recv().unwrap(),
+            EngineEvent::RunPreparationChanged {
+                snapshot: RunSnapshot {
+                    preparation: AgentPreparation::Preparing,
+                    ..
+                },
+            }
+        ));
+        assert!(matches!(
+            events.recv().unwrap(),
+            EngineEvent::RunPreparationChanged {
+                snapshot: RunSnapshot {
+                    preparation: AgentPreparation::Ready { .. },
+                    ..
+                },
+            }
+        ));
+
+        let started = handle
+            .execute(EngineCommand::Start {
+                run_id: configured.run_id,
+            })
+            .unwrap();
+        assert_eq!(started.revision, 4);
+        drop(engine.take_prepared_cohort(configured.run_id).unwrap());
+        assert!(matches!(
+            engine.take_prepared_cohort(configured.run_id),
+            Err(EngineError::PreparedCohortUnavailable(id)) if id == configured.run_id
+        ));
+    }
+
+    #[test]
+    fn prepared_catalog_validates_required_types_and_duplicate_variants() {
+        let (endpoint, server) = tcp_ready_server();
+        let engine = Engine::new();
+        let handle = engine.handle();
+        let configured = handle
+            .execute(EngineCommand::Configure {
+                config: Box::new(remote_config(endpoint)),
+            })
+            .unwrap();
+        handle
+            .execute(EngineCommand::PrepareAgents {
+                run_id: configured.run_id,
+            })
+            .unwrap();
+        server.join().unwrap();
+
+        let mut missing = configured.config.clone();
+        missing.workload.operations = OperationSelection::Selected {
+            operations: vec![WeightedOperation {
+                name: "write".into(),
+                weight: 1.0,
+                arguments: BTreeMap::new(),
+            }],
+        };
+        assert!(matches!(
+            handle.execute(EngineCommand::UpdateConfigured {
+                run_id: configured.run_id,
+                config: Box::new(missing),
+            }),
+            Err(EngineError::InvalidWorkload {
+                source: WorkloadError::MissingArgument { .. },
+                ..
+            })
+        ));
+
+        let numeric_string = WeightedOperation {
+            name: "write".into(),
+            weight: 2.0,
+            arguments: BTreeMap::from([("value".into(), ArgumentValue::String("007".into()))]),
+        };
+        let mut valid = configured.config.clone();
+        valid.workload.operations = OperationSelection::Selected {
+            operations: vec![numeric_string.clone()],
+        };
+        let normalized = handle
+            .execute(EngineCommand::UpdateConfigured {
+                run_id: configured.run_id,
+                config: Box::new(valid.clone()),
+            })
+            .unwrap();
+        let OperationSelection::Selected { operations } = normalized.config.workload.operations
+        else {
+            panic!("prepared workloads must be materialized");
+        };
+        assert_eq!(operations[0].weight, 1.0);
+        assert_eq!(
+            operations[0].arguments.get("value"),
+            Some(&ArgumentValue::String("007".into()))
+        );
+
+        valid.workload.operations = OperationSelection::Selected {
+            operations: vec![numeric_string.clone(), numeric_string],
+        };
+        assert!(matches!(
+            handle.execute(EngineCommand::UpdateConfigured {
+                run_id: configured.run_id,
+                config: Box::new(valid),
+            }),
+            Err(EngineError::InvalidWorkload {
+                source: WorkloadError::DuplicateSelectedVariant { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn probe_failure_is_visible_in_the_run_snapshot() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let engine = Engine::new();
+        let handle = engine.handle();
+        let configured = handle
+            .execute(EngineCommand::Configure {
+                config: Box::new(remote_config(endpoint)),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            handle.execute(EngineCommand::PrepareAgents {
+                run_id: configured.run_id,
+            }),
+            Err(EngineError::AgentPreparationFailed { .. })
+        ));
+        assert!(matches!(
+            handle.snapshot(configured.run_id).unwrap().preparation,
+            AgentPreparation::Failed { .. }
+        ));
     }
 }

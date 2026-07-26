@@ -6,8 +6,9 @@ queueing delay. That point is the **knee**.
 
 The benchmark driver is generic. A small external adapter describes the
 operations it supports and calls the native client for the system being tested.
-The adapter protocol is versioned newline-delimited JSON, so the adapter can be
-written in any language.
+The transport-independent adapter protocol is versioned newline-delimited JSON,
+so an agent can be written in any language and reached through either a
+supervised stdio process or a persistent TCP connection.
 
 ![Kneefinder dashboard showing a throughput knee](docs/images/dashboard-knee.png)
 
@@ -43,6 +44,16 @@ handshake, schedules seven offered-load levels, and prints the throughput,
 latency, and per-variant results. Around the knee, goodput flattens while latency
 rises sharply.
 
+Run the multi-client transport E2E with two independent TCP agent processes:
+
+```console
+cargo run --manifest-path demo/queue-demo/Cargo.toml -- e2e-tcp
+```
+
+The coordinator opens both connections, validates both discovery responses,
+splits one global schedule deterministically, and verifies the per-agent and
+aggregate results.
+
 ## Browser UI and API
 
 Build and serve the optional web frontend:
@@ -65,6 +76,14 @@ clients receive an explicit resynchronization snapshot rather than silently
 continuing with gaps. The server binds to loopback by default; remote binding
 requires `--allow-remote` and should be placed behind authenticated TLS.
 
+The browser first saves the configured colocated and TCP endpoints, then sends
+`prepare_agents`. The coordinator opens every session, performs the normal
+`initialize`/`ready` handshake, validates that the cohort shares one schema,
+and retains those initialized sessions for the run. The resulting operation
+catalog updates the browser dynamically. Its structured editor uses typed
+integer/string inputs, supports multiple bound variants of one operation, and
+keeps operations that are not safe defaults behind an explicit add action.
+
 ## Configure a workload
 
 The same resolved configuration is shared by CLI, web, and future TUI
@@ -79,6 +98,20 @@ cargo run -- run \
   --operation 'write:value=large@1' \
   --print-config
 ```
+
+A run may combine the colocated `-- ./adapter` mode with explicitly addressed
+remote agents:
+
+```console
+cargo run -- run \
+  --agent-endpoint client-a=tcp://10.0.0.10:9000 \
+  --agent-endpoint client-b=tcp://10.0.0.11:9000 \
+  --print-config \
+  -- ./local-adapter
+```
+
+The coordinator always initiates these TCP sessions. Agents listen on the
+configured endpoints and never dial or register with the coordinator.
 
 Durations and load traversal are configurable without a YAML file:
 
@@ -96,17 +129,22 @@ cargo run -- run \
 
 ## Write an adapter
 
-An adapter is a process whose stdin and stdout carry one JSON message per line.
-Logs go to stderr. Its lifecycle is:
+An agent implements one protocol regardless of transport. The zero-setup mode
+uses a child process whose stdin and stdout carry one JSON message per line;
+logs go to stderr. The remote mode listens for a coordinator-initiated TCP
+connection and carries the same newline-delimited messages over that stream.
+Its lifecycle is:
 
-1. Receive `initialize` and reply with `ready`, including operation descriptors.
+1. Receive `initialize` and reply with `ready`, including adapter identity,
+   capabilities, and operation descriptors.
 2. Receive batches of scheduled operations with absolute phase time and relative
    per-operation deadlines.
 3. Call the target's native client and return measured operation results.
 4. Echo the operation name and concrete arguments in every result.
 5. Return stable, low-cardinality error codes and represent timeouts explicitly.
 
-The complete runnable Rust example is [examples/rust-adapter.rs](examples/rust-adapter.rs).
+The complete stdio Rust example is [examples/rust-adapter.rs](examples/rust-adapter.rs),
+and the queue demo provides both stdio and TCP implementations.
 The only target-specific part is the function that calls the system under test:
 
 ```rust
@@ -154,10 +192,16 @@ saturated target visibly different failure modes.
 
 ## Current status
 
-The adapter protocol, workload model, measurement types, statistics, lifecycle
-engine, queue demonstration, CLI configuration, HTTP/WebSocket control plane,
-and browser UI are implemented. The generic executor that connects `kneefinder
-run` and the web Start button to an arbitrary adapter is the next major piece;
-until then, use the queue demo for the complete measured flow.
+The adapter protocol, supervised subprocess and persistent TCP transports,
+coordinator-owned colocated and remote session agents, fixed multi-agent cohort,
+workload model, measurement types, statistics, lifecycle engine, queue
+demonstration, CLI configuration, HTTP/WebSocket control plane, and browser UI
+are implemented. The engine and browser also implement coordinator-owned agent
+preparation, retained initialized cohorts, discovery events, and a typed
+workload editor. The queue demo exercises both the colocated path and a
+two-process TCP cohort, including the preparation flow in its live dashboard.
+The generic executor that turns a prepared cohort and `RunConfig` into an
+arbitrary measured run is the next major piece; until then, use the queue demo
+for the complete measured flows.
 
 See [docs/design.md](docs/design.md) for the measurement and knee-finding design.

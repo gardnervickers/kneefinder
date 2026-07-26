@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -52,6 +52,7 @@ pub enum ControllerMessage {
 pub enum AdapterMessage {
     Ready {
         protocol_version: u16,
+        identity: AdapterIdentity,
         capabilities: Capabilities,
         #[serde(default)]
         operations: Vec<OperationDescriptor>,
@@ -70,6 +71,12 @@ pub enum AdapterMessage {
         message: String,
         retryable: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterIdentity {
+    pub name: String,
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

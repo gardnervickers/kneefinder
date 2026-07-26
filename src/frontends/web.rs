@@ -449,9 +449,14 @@ async fn queue_message(
 fn engine_error_response(request_id: Option<String>, error: EngineError) -> Response {
     let status = match error {
         EngineError::RunNotFound(_) => StatusCode::NOT_FOUND,
-        EngineError::ConfigurationLocked(_) | EngineError::InvalidTransition { .. } => {
-            StatusCode::CONFLICT
+        EngineError::NoAgentsConfigured(_) | EngineError::InvalidWorkload { .. } => {
+            StatusCode::BAD_REQUEST
         }
+        EngineError::ConfigurationLocked(_)
+        | EngineError::AgentsNotPrepared(_)
+        | EngineError::PreparedCohortUnavailable(_)
+        | EngineError::InvalidTransition { .. } => StatusCode::CONFLICT,
+        EngineError::AgentPreparationFailed { .. } => StatusCode::BAD_GATEWAY,
         EngineError::RunIdExhausted | EngineError::RevisionExhausted(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
@@ -468,6 +473,11 @@ fn engine_error_code(error: &EngineError) -> &'static str {
     match error {
         EngineError::RunNotFound(_) => "run_not_found",
         EngineError::ConfigurationLocked(_) => "configuration_locked",
+        EngineError::NoAgentsConfigured(_) => "no_agents_configured",
+        EngineError::AgentsNotPrepared(_) => "agents_not_prepared",
+        EngineError::PreparedCohortUnavailable(_) => "prepared_cohort_unavailable",
+        EngineError::AgentPreparationFailed { .. } => "agent_preparation_failed",
+        EngineError::InvalidWorkload { .. } => "invalid_workload",
         EngineError::InvalidTransition { .. } => "invalid_transition",
         EngineError::RunIdExhausted => "run_id_exhausted",
         EngineError::RevisionExhausted(_) => "revision_exhausted",
@@ -560,6 +570,38 @@ mod tests {
         let json = serde_json::to_string(&message).unwrap();
         assert!(json.contains(r#""type":"snapshot""#));
         assert!(json.contains(r#""api_version":1"#));
+    }
+
+    #[test]
+    fn preparation_command_is_part_of_the_versioned_api() {
+        let message = ClientMessage::Command {
+            request_id: "probe-1".into(),
+            command: EngineCommand::PrepareAgents { run_id: RunId(7) },
+        };
+        let json = serde_json::to_string(&message).unwrap();
+
+        assert!(json.contains(r#""command":"prepare_agents""#));
+        assert!(json.contains(r#""run_id":7"#));
+    }
+
+    #[test]
+    fn browser_uses_the_discovery_driven_workload_editor() {
+        assert!(INDEX_HTML.contains(r#"id="query-agents""#));
+        assert!(INDEX_HTML.contains(r#"id="operation-catalog""#));
+        assert!(INDEX_HTML.contains(r#"id="configured-workload""#));
+        assert!(!INDEX_HTML.contains(r#"id="operations""#));
+        assert!(APP_JS.contains(r#"event.event === "run_preparation_changed""#));
+        assert!(APP_JS.contains(r#"argument.kind === "integer""#));
+        assert!(APP_JS.contains(r#""Add explicitly""#));
+    }
+
+    #[test]
+    fn probe_failures_have_a_stable_api_error_code() {
+        let error = EngineError::AgentPreparationFailed {
+            run_id: RunId(3),
+            message: "agent disconnected".into(),
+        };
+        assert_eq!(engine_error_code(&error), "agent_preparation_failed");
     }
 
     #[test]

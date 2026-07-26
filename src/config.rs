@@ -30,7 +30,7 @@ pub struct RunConfig {
     pub load: LoadConfig,
     pub workload: WorkloadConfig,
     pub output_directory: PathBuf,
-    pub adapter: Option<AdapterCommand>,
+    pub agents: Vec<AgentEndpointConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -78,6 +78,22 @@ pub struct LoadConfig {
 pub struct AdapterCommand {
     pub program: String,
     pub arguments: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEndpointConfig {
+    /// Stable identity used for deterministic schedule assignment and attribution.
+    pub id: String,
+    pub transport: AgentTransportConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentTransportConfig {
+    /// Coordinator-owned colocated agent using the adapter protocol over stdio.
+    Subprocess { command: AdapterCommand },
+    /// Coordinator-initiated persistent TCP connection to an explicit endpoint.
+    Tcp { address: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

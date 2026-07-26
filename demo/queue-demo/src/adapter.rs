@@ -1,15 +1,17 @@
 use std::{
+    env,
     error::Error,
-    io::{self, BufRead, Write},
+    io::{self, BufRead, BufReader, BufWriter, Write},
+    net::TcpListener,
     sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use kneefinder::protocol::{
-    AdapterMessage, ArgumentKind, ArgumentValue, Capabilities, ControllerMessage, LoadModel,
-    OperationArgument, OperationDescriptor, OperationKind, OperationResult, OperationStatus,
-    PROTOCOL_VERSION, ScheduledOperation,
+    AdapterIdentity, AdapterMessage, ArgumentKind, ArgumentValue, Capabilities, ControllerMessage,
+    LoadModel, OperationArgument, OperationDescriptor, OperationKind, OperationResult,
+    OperationStatus, PROTOCOL_VERSION, ScheduledOperation,
 };
 use serde::Deserialize;
 
@@ -26,7 +28,10 @@ struct AdapterConfig {
 }
 
 fn default_workers() -> usize {
-    4
+    env::var("KNEEFINDER_QUEUE_DEMO_WORKERS")
+        .ok()
+        .and_then(|workers| workers.parse().ok())
+        .unwrap_or(4)
 }
 
 fn default_read_service_ms() -> u64 {
@@ -43,10 +48,28 @@ fn default_queue_capacity() -> usize {
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let stdin = io::stdin();
-    let mut stdout = io::BufWriter::new(io::stdout().lock());
+    let stdout = io::stdout();
+    run_session(stdin.lock(), BufWriter::new(stdout.lock()))
+}
+
+pub fn run_tcp(address: &str) -> Result<(), Box<dyn Error>> {
+    let listener = TcpListener::bind(address)?;
+    let address = listener.local_addr()?;
+    println!("tcp://{address}");
+    io::stdout().flush()?;
+
+    let (stream, peer) = listener.accept()?;
+    stream.set_nodelay(true)?;
+    eprintln!("demo TCP agent accepted coordinator connection from {peer}");
+    let input = BufReader::new(stream.try_clone()?);
+    let output = BufWriter::new(stream);
+    run_session(input, output)
+}
+
+fn run_session(input: impl BufRead, mut output: impl Write) -> Result<(), Box<dyn Error>> {
     let mut service: Option<QueueService> = None;
 
-    for line in stdin.lock().lines() {
+    for line in input.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -61,7 +84,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             } => {
                 if protocol_version != PROTOCOL_VERSION {
                     write_message(
-                        &mut stdout,
+                        &mut output,
                         &AdapterMessage::Error {
                             phase_id: None,
                             code: "unsupported_protocol".into(),
@@ -77,9 +100,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 let config: AdapterConfig = serde_json::from_value(supplied_config)?;
                 service = Some(QueueService::new(config)?);
                 write_message(
-                    &mut stdout,
+                    &mut output,
                     &AdapterMessage::Ready {
                         protocol_version: PROTOCOL_VERSION,
+                        identity: AdapterIdentity {
+                            name: "kneefinder-queue-demo".into(),
+                            version: Some(env!("CARGO_PKG_VERSION").into()),
+                        },
                         capabilities: Capabilities {
                             scheduled_operations: true,
                             adapter_managed_phases: false,
@@ -111,7 +138,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                         .into(),
                                 ),
                                 kind: OperationKind::Write,
-                                enabled_by_default: true,
+                                enabled_by_default: false,
                                 default_weight: 1.0,
                                 arguments: vec![OperationArgument {
                                     name: "value".into(),
@@ -132,7 +159,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             } => {
                 let Some(service) = &service else {
                     write_message(
-                        &mut stdout,
+                        &mut output,
                         &AdapterMessage::Error {
                             phase_id: Some(phase_id),
                             code: "not_initialized".into(),
@@ -164,7 +191,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     .map(|call| call.join().expect("client call thread panicked"))
                     .collect();
                 write_message(
-                    &mut stdout,
+                    &mut output,
                     &AdapterMessage::Results {
                         phase_id,
                         operations: results,
@@ -175,7 +202,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             ControllerMessage::Shutdown => break,
             ControllerMessage::RunPhase { phase_id, .. } => {
                 write_message(
-                    &mut stdout,
+                    &mut output,
                     &AdapterMessage::Error {
                         phase_id: Some(phase_id),
                         code: "unsupported_mode".into(),

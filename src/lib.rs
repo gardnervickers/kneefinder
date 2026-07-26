@@ -1,5 +1,7 @@
 //! Core types for the kneefinder experiment engine.
 
+pub mod adapter_session;
+pub mod agent;
 pub mod config;
 pub mod engine;
 pub mod frontends;

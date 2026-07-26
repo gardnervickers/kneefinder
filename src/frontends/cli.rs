@@ -2,14 +2,20 @@
 
 #[cfg(feature = "web")]
 use std::net::SocketAddr;
-use std::{collections::BTreeMap, fmt, num::NonZeroU32, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    num::NonZeroU32,
+    path::PathBuf,
+};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::{
     config::{
-        AdapterCommand, HumanDuration, LoadConfig, OperationSelection, PhaseConfig, Preset,
-        RunConfig, Strategy, WeightedOperation, WorkloadConfig,
+        AdapterCommand, AgentEndpointConfig, AgentTransportConfig, HumanDuration, LoadConfig,
+        OperationSelection, PhaseConfig, Preset, RunConfig, Strategy, WeightedOperation,
+        WorkloadConfig,
     },
     engine::{EngineCommand, EngineError, EngineHandle},
     protocol::ArgumentValue,
@@ -114,7 +120,15 @@ pub struct RunArgs {
     #[arg(long)]
     pub print_config: bool,
 
-    /// Adapter executable followed by its arguments. Must appear after `--`.
+    /// Connect to a remote workload agent. May be repeated.
+    #[arg(
+        long = "agent-endpoint",
+        value_name = "ID=tcp://HOST:PORT",
+        action = clap::ArgAction::Append
+    )]
+    agent_endpoints: Vec<String>,
+
+    /// Colocated adapter executable followed by its arguments. Must appear after `--`.
     #[arg(last = true, value_name = "ADAPTER [ARG]...")]
     adapter: Vec<String>,
 }
@@ -157,14 +171,37 @@ impl RunArgs {
             return Err("--levels cannot be used with the adaptive strategy".into());
         }
 
-        let adapter = match self.adapter.split_first() {
-            Some((program, arguments)) => Some(AdapterCommand {
-                program: program.clone(),
-                arguments: arguments.to_vec(),
-            }),
-            None if self.print_config => None,
-            None => return Err("an adapter command is required after `--`".into()),
-        };
+        let mut agents = self
+            .agent_endpoints
+            .iter()
+            .map(|endpoint| parse_agent_endpoint(endpoint))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some((program, arguments)) = self.adapter.split_first() {
+            agents.push(AgentEndpointConfig {
+                id: "local-0".into(),
+                transport: AgentTransportConfig::Subprocess {
+                    command: AdapterCommand {
+                        program: program.clone(),
+                        arguments: arguments.to_vec(),
+                    },
+                },
+            });
+        }
+        let mut agent_ids = BTreeSet::new();
+        for agent in &agents {
+            if !agent_ids.insert(&agent.id) {
+                return Err(format!(
+                    "agent id {:?} is configured more than once",
+                    agent.id
+                ));
+            }
+        }
+        if agents.is_empty() && !self.print_config {
+            return Err(
+                "at least one agent is required: use --agent-endpoint or a command after `--`"
+                    .into(),
+            );
+        }
         let operations = if self.all_operations {
             OperationSelection::All
         } else if self.operations.is_empty() {
@@ -196,9 +233,45 @@ impl RunArgs {
             },
             workload: WorkloadConfig { operations },
             output_directory: self.output.clone(),
-            adapter,
+            agents,
         })
     }
+}
+
+fn parse_agent_endpoint(value: &str) -> Result<AgentEndpointConfig, String> {
+    let (id, endpoint) = value
+        .split_once('=')
+        .ok_or_else(|| format!("agent endpoint {value:?} must be ID=tcp://HOST:PORT"))?;
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(format!(
+            "agent id {id:?} must contain only ASCII letters, digits, '-' or '_'"
+        ));
+    }
+    let address = endpoint
+        .strip_prefix("tcp://")
+        .ok_or_else(|| format!("agent endpoint {value:?} must use tcp://"))?;
+    let (host, port) = address
+        .rsplit_once(':')
+        .ok_or_else(|| format!("agent endpoint {value:?} must include a TCP port"))?;
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| format!("agent endpoint {value:?} has an invalid TCP port"))?;
+    if host.is_empty() || port == 0 || address.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "agent endpoint {value:?} is not a valid TCP address"
+        ));
+    }
+
+    Ok(AgentEndpointConfig {
+        id: id.into(),
+        transport: AgentTransportConfig::Tcp {
+            address: address.into(),
+        },
+    })
 }
 
 fn parse_operation(value: &str) -> Result<WeightedOperation, String> {
@@ -371,6 +444,9 @@ impl Frontend for CliFrontend {
                     return Ok(());
                 }
 
+                engine.execute(EngineCommand::PrepareAgents {
+                    run_id: snapshot.run_id,
+                })?;
                 engine.execute(EngineCommand::Start {
                     run_id: snapshot.run_id,
                 })?;
@@ -461,7 +537,17 @@ mod tests {
         assert_eq!(config.strategy, Strategy::Adaptive);
         assert_eq!(config.phases.warmup_ms, 2_000);
         assert_eq!(config.phases.measurement_ms, 10_000);
-        assert_eq!(config.adapter.unwrap().program, "./adapter");
+        assert_eq!(config.agents.len(), 1);
+        assert_eq!(config.agents[0].id, "local-0");
+        assert_eq!(
+            config.agents[0].transport,
+            AgentTransportConfig::Subprocess {
+                command: AdapterCommand {
+                    program: "./adapter".into(),
+                    arguments: vec!["--verbose".into()],
+                }
+            }
+        );
     }
 
     #[test]
@@ -491,7 +577,47 @@ mod tests {
     #[test]
     fn print_config_does_not_require_an_adapter() {
         let arguments = parse(&["kneefinder", "run", "--print-config"]);
-        assert!(arguments.resolve().unwrap().adapter.is_none());
+        assert!(arguments.resolve().unwrap().agents.is_empty());
+    }
+
+    #[test]
+    fn remote_and_colocated_agents_can_be_combined() {
+        let arguments = parse(&[
+            "kneefinder",
+            "run",
+            "--agent-endpoint",
+            "east=tcp://loadgen.example:9000",
+            "--agent-endpoint",
+            "west=tcp://[::1]:9001",
+            "--",
+            "./adapter",
+        ]);
+        let config = arguments.resolve().unwrap();
+
+        assert_eq!(config.agents.len(), 3);
+        assert_eq!(config.agents[0].id, "east");
+        assert_eq!(
+            config.agents[0].transport,
+            AgentTransportConfig::Tcp {
+                address: "loadgen.example:9000".into()
+            }
+        );
+        assert_eq!(config.agents[1].id, "west");
+        assert_eq!(config.agents[2].id, "local-0");
+    }
+
+    #[test]
+    fn duplicate_agent_ids_are_rejected() {
+        let arguments = parse(&[
+            "kneefinder",
+            "run",
+            "--agent-endpoint",
+            "local-0=tcp://127.0.0.1:9000",
+            "--",
+            "./adapter",
+        ]);
+
+        assert!(arguments.resolve().unwrap_err().contains("more than once"));
     }
 
     #[test]

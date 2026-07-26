@@ -6,6 +6,9 @@ const pending = new Map();
 let selectedRunId = null;
 let socket = null;
 let nextRequestId = 1;
+let configuredVariants = [];
+let formDirty = false;
+let queryInFlight = false;
 
 const $ = (id) => document.getElementById(id);
 const svgNs = "http://www.w3.org/2000/svg";
@@ -68,14 +71,20 @@ function applySnapshot(snapshot) {
   results.clear();
   for (const run of snapshot.runs) runs.set(run.run_id, run);
   for (const result of snapshot.results) results.set(result.run_id, result.phases);
+  let selectionChanged = false;
   if (selectedRunId === null || !runs.has(selectedRunId)) {
     selectedRunId = latestRunId();
+    selectionChanged = true;
   }
+  if (selectionChanged && selectedRunId !== null) loadForm(runs.get(selectedRunId));
   render();
 }
 
 function applyEvent(event) {
-  if (event.event === "run_configured" || event.event === "run_configuration_updated" || event.event === "run_state_changed") {
+  if (event.event === "run_configured"
+      || event.event === "run_configuration_updated"
+      || event.event === "run_preparation_changed"
+      || event.event === "run_state_changed") {
     upsertRun(event.snapshot);
     if (selectedRunId === null) selectedRunId = event.snapshot.run_id;
   } else if (event.event === "phase_stats") {
@@ -106,42 +115,28 @@ function sendCommand(command) {
   });
 }
 
-function parseVariant(line) {
-  let variant = line.trim();
-  let weight = 1;
-  const at = variant.lastIndexOf("@");
-  if (at >= 0) {
-    weight = Number(variant.slice(at + 1));
-    variant = variant.slice(0, at);
-  }
-  if (!Number.isFinite(weight) || weight <= 0) throw new Error(`Invalid weight in ${line}`);
-  const colon = variant.indexOf(":");
-  const name = (colon < 0 ? variant : variant.slice(0, colon)).trim();
-  if (!name) throw new Error("Operation names cannot be empty.");
-  const arguments_ = {};
-  if (colon >= 0) {
-    for (const assignment of variant.slice(colon + 1).split(",")) {
-      const equals = assignment.indexOf("=");
-      if (equals < 1) throw new Error(`Invalid argument assignment ${assignment}`);
-      const key = assignment.slice(0, equals).trim();
-      let value = assignment.slice(equals + 1);
-      if (Object.hasOwn(arguments_, key)) throw new Error(`Duplicate argument ${key}`);
-      if (value.startsWith("str:")) value = value.slice(4);
-      else if (/^-?\d+$/.test(value)) value = Number(value);
-      arguments_[key] = value;
-    }
-  }
-  return { name, weight, arguments: arguments_ };
-}
-
 function readConfig() {
-  const operationLines = $("operations").value.split("\n").map((line) => line.trim()).filter(Boolean);
-  const operations = operationLines.length
-    ? { selection: "selected", operations: operationLines.map(parseVariant) }
+  const selected = readStructuredOperations();
+  const operations = selected.length
+    ? { selection: "selected", operations: selected }
     : { selection: "adapter_defaults" };
   const levels = $("levels").value.split(",").map((value) => value.trim()).filter(Boolean).map(Number);
   if (levels.some((level) => !Number.isFinite(level) || level <= 0)) throw new Error("Explicit levels must be positive numbers.");
   const program = $("adapter-program").value.trim();
+  const agents = $("agent-endpoints").value.split("\n").map((line) => line.trim()).filter(Boolean).map(parseAgentEndpoint);
+  if (program) {
+    agents.push({
+      id: "local-0",
+      transport: {
+        kind: "subprocess",
+        command: {
+          program,
+          arguments: $("adapter-args").value.split("\n").map((line) => line.trim()).filter(Boolean),
+        },
+      },
+    });
+  }
+  if (new Set(agents.map((agent) => agent.id)).size !== agents.length) throw new Error("Agent IDs must be unique.");
   const config = {
     preset: $("preset").value,
     strategy: $("strategy").value,
@@ -160,15 +155,68 @@ function readConfig() {
     },
     workload: { operations },
     output_directory: $("output-directory").value.trim() || "results",
-    adapter: program ? {
-      program,
-      arguments: $("adapter-args").value.split("\n").map((line) => line.trim()).filter(Boolean),
-    } : null,
+    agents,
   };
   if (config.phases.measurement_ms < 1) throw new Error("Measurement time must be positive.");
   if (config.load.initial_rate <= 0 || config.load.maximum_rate < config.load.initial_rate) throw new Error("Check the initial and maximum rates.");
   if (config.load.growth_factor <= 1) throw new Error("Growth factor must exceed one.");
   return config;
+}
+
+function readStructuredOperations() {
+  if (!configuredVariants.length) return [];
+  const catalog = selectedCatalog();
+  const descriptors = new Map(catalog.map((operation) => [operation.name, operation]));
+  const seen = new Set();
+  return configuredVariants.map((variant) => {
+    const descriptor = descriptors.get(variant.name);
+    const weight = Number(variant.weight);
+    if (!Number.isFinite(weight) || weight <= 0) {
+      throw new Error(`${variant.name} must have a positive finite weight.`);
+    }
+    const arguments_ = {};
+    if (descriptor) {
+      for (const argument of descriptor.arguments) {
+        if (!Object.hasOwn(variant.arguments, argument.name)) {
+          if (argument.required) throw new Error(`${variant.name} requires ${argument.name}.`);
+          continue;
+        }
+        const value = variant.arguments[argument.name];
+        if (argument.kind === "integer" && !Number.isSafeInteger(value)) {
+          throw new Error(`${variant.name}.${argument.name} must be an integer.`);
+        }
+        if (argument.kind === "string" && typeof value !== "string") {
+          throw new Error(`${variant.name}.${argument.name} must be text.`);
+        }
+        arguments_[argument.name] = value;
+      }
+      const unknown = Object.keys(variant.arguments).find(
+        (name) => !descriptor.arguments.some((argument) => argument.name === name),
+      );
+      if (unknown) throw new Error(`${variant.name} does not advertise argument ${unknown}.`);
+    } else {
+      for (const [name, value] of Object.entries(variant.arguments)) {
+        if (!(typeof value === "string" || Number.isSafeInteger(value))) {
+          throw new Error(`${variant.name}.${name} must be text or an integer.`);
+        }
+        arguments_[name] = value;
+      }
+    }
+    const key = `${variant.name}\u0000${JSON.stringify(
+      Object.entries(arguments_).sort(([left], [right]) => left.localeCompare(right)),
+    )}`;
+    if (seen.has(key)) throw new Error(`Duplicate configured variant: ${formatVariantName(variant.name, arguments_)}.`);
+    seen.add(key);
+    return { name: variant.name, weight, arguments: arguments_ };
+  });
+}
+
+function parseAgentEndpoint(value) {
+  const match = value.match(/^([A-Za-z0-9_-]+)=tcp:\/\/(\S+):(\d+)$/);
+  if (!match || Number(match[3]) < 1 || Number(match[3]) > 65535) {
+    throw new Error(`Invalid agent endpoint ${value}; use ID=tcp://HOST:PORT.`);
+  }
+  return { id: match[1], transport: { kind: "tcp", address: `${match[2]}:${match[3]}` } };
 }
 
 function numberValue(id) {
@@ -179,15 +227,48 @@ function numberValue(id) {
 
 async function applyConfiguration() {
   try {
-    const config = readConfig();
-    const run = selectedRun();
-    const command = run && run.state.state === "configured"
-      ? { command: "update_configured", run_id: run.run_id, config }
-      : { command: "configure", config };
-    const snapshot = await sendCommand(command);
+    const { snapshot, updated } = await persistConfiguration();
     selectedRunId = snapshot.run_id;
-    showMessage(run && run.state.state === "configured" ? "Configuration updated." : "Run configured.", false);
+    loadConfiguredVariants(snapshot.config);
+    formDirty = false;
+    updateButtons();
+    showMessage(updated ? "Configuration updated." : "Run configured.", false);
   } catch (error) { showMessage(error.message, true); }
+}
+
+async function persistConfiguration() {
+  const config = readConfig();
+  const run = selectedRun();
+  const updated = Boolean(run && run.state.state === "configured");
+  const command = updated
+    ? { command: "update_configured", run_id: run.run_id, config }
+    : { command: "configure", config };
+  const snapshot = await sendCommand(command);
+  selectedRunId = snapshot.run_id;
+  return { snapshot, updated };
+}
+
+async function queryAgents() {
+  if (queryInFlight) return;
+  queryInFlight = true;
+  render();
+  showMessage("Querying configured agents…", false);
+  try {
+    const { snapshot } = await persistConfiguration();
+    const prepared = await sendCommand({ command: "prepare_agents", run_id: snapshot.run_id });
+    loadConfiguredVariants(prepared.config);
+    formDirty = false;
+    const catalog = prepared.preparation.catalog;
+    showMessage(
+      `Ready: ${catalog.agents.length} agent${catalog.agents.length === 1 ? "" : "s"}, ${catalog.operations.length} operation${catalog.operations.length === 1 ? "" : "s"}.`,
+      false,
+    );
+  } catch (error) {
+    showMessage(error.message, true);
+  } finally {
+    queryInFlight = false;
+    render();
+  }
 }
 
 async function startRun() {
@@ -217,6 +298,7 @@ function showMessage(message, error) {
 
 function render() {
   renderRuns();
+  renderWorkloadEditor();
   renderMetrics();
   renderCharts();
   renderErrorCodes();
@@ -240,12 +322,13 @@ function renderRuns() {
     info.append(title, detail);
     const state = document.createElement("span"); state.className = "state-pill"; state.textContent = stateName(run.state);
     button.append(info, state);
-    button.addEventListener("click", () => { selectedRunId = run.run_id; loadForm(run.config); render(); });
+    button.addEventListener("click", () => { selectedRunId = run.run_id; loadForm(run); render(); });
     container.append(button);
   }
 }
 
-function loadForm(config) {
+function loadForm(run) {
+  const config = run.config;
   $("preset").value = config.preset;
   $("strategy").value = config.strategy;
   $("initial-rate").value = config.load.initial_rate;
@@ -256,16 +339,224 @@ function loadForm(config) {
   $("warmup").value = config.phases.warmup_ms;
   $("measurement").value = config.phases.measurement_ms;
   $("recovery").value = config.phases.recovery_ms;
-  const selection = config.workload.operations;
-  $("operations").value = selection.selection === "selected" ? selection.operations.map(formatConfiguredVariant).join("\n") : "";
-  $("adapter-program").value = config.adapter?.program || "";
-  $("adapter-args").value = config.adapter?.arguments?.join("\n") || "";
+  loadConfiguredVariants(config);
+  const subprocess = config.agents.find((agent) => agent.transport.kind === "subprocess");
+  $("adapter-program").value = subprocess?.transport.command.program || "";
+  $("adapter-args").value = subprocess?.transport.command.arguments?.join("\n") || "";
+  $("agent-endpoints").value = config.agents
+    .filter((agent) => agent.transport.kind === "tcp")
+    .map((agent) => `${agent.id}=tcp://${agent.transport.address}`)
+    .join("\n");
   $("output-directory").value = config.output_directory;
+  formDirty = false;
 }
 
-function formatConfiguredVariant(variant) {
-  const args = Object.entries(variant.arguments).map(([name, value]) => `${name}=${typeof value === "string" && /^-?\d+$/.test(value) ? `str:${value}` : value}`).join(",");
-  return `${variant.name}${args ? `:${args}` : ""}@${variant.weight}`;
+function loadConfiguredVariants(config) {
+  const selection = config.workload.operations;
+  configuredVariants = selection.selection === "selected"
+    ? selection.operations.map((variant) => structuredClone(variant))
+    : [];
+}
+
+function selectedCatalog() {
+  const preparation = selectedRun()?.preparation;
+  return preparation?.status === "ready" ? preparation.catalog.operations : [];
+}
+
+function variantFromDescriptor(operation) {
+  const arguments_ = {};
+  for (const argument of operation.arguments || []) {
+    if (argument.default !== null && argument.default !== undefined) {
+      arguments_[argument.name] = argument.default;
+    }
+  }
+  return {
+    name: operation.name,
+    weight: operation.default_weight,
+    arguments: arguments_,
+  };
+}
+
+function renderWorkloadEditor() {
+  const run = selectedRun();
+  const preparation = run?.preparation || { status: "unprepared" };
+  const status = $("agent-query-status");
+  const catalog = preparation.status === "ready" ? preparation.catalog : null;
+  if (queryInFlight || preparation.status === "preparing") {
+    status.className = "catalog-status preparing";
+    status.textContent = "Coordinator is opening and querying every configured agent…";
+  } else if (preparation.status === "failed") {
+    status.className = "catalog-status failed";
+    status.textContent = preparation.message;
+  } else if (catalog) {
+    status.className = "catalog-status ready";
+    const adapter = `${catalog.adapter.name}${catalog.adapter.version ? ` ${catalog.adapter.version}` : ""}`;
+    status.textContent = `${adapter} · ${catalog.agents.length} agent${catalog.agents.length === 1 ? "" : "s"} ready · ${catalog.operations.length} operation${catalog.operations.length === 1 ? "" : "s"} share one schema`;
+  } else {
+    status.className = "catalog-status";
+    status.textContent = run?.config.agents.length
+      ? "Agent endpoints changed or have not been queried yet."
+      : "Configure an adapter or remote agent, then query it.";
+  }
+
+  const operations = [...(catalog?.operations || [])].sort((left, right) => {
+    if (left.enabled_by_default !== right.enabled_by_default) {
+      return left.enabled_by_default ? -1 : 1;
+    }
+    return left.name.localeCompare(right.name);
+  });
+  const catalogContainer = $("operation-catalog");
+  catalogContainer.replaceChildren();
+  if (!operations.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty";
+    empty.textContent = "Operation schemas will appear here.";
+    catalogContainer.append(empty);
+  }
+  for (const operation of operations) {
+    const card = document.createElement("article");
+    card.className = `operation-card${operation.enabled_by_default ? "" : " opt-in"}`;
+    const heading = document.createElement("div");
+    heading.className = "operation-heading";
+    const identity = document.createElement("div");
+    const name = document.createElement("strong");
+    name.textContent = operation.name;
+    const badges = document.createElement("span");
+    badges.className = "operation-badges";
+    const kind = document.createElement("span");
+    kind.className = `operation-kind ${operation.kind}`;
+    kind.textContent = operation.kind;
+    badges.append(kind);
+    if (operation.enabled_by_default) {
+      const defaultBadge = document.createElement("span");
+      defaultBadge.className = "default-badge";
+      defaultBadge.textContent = "safe default";
+      badges.append(defaultBadge);
+    } else {
+      const optInBadge = document.createElement("span");
+      optInBadge.className = "opt-in-badge";
+      optInBadge.textContent = "explicit opt-in";
+      badges.append(optInBadge);
+    }
+    identity.append(name, badges);
+    const add = document.createElement("button");
+    add.type = "button";
+    add.textContent = operation.enabled_by_default ? "Add variant" : "Add explicitly";
+    add.addEventListener("click", () => {
+      configuredVariants.push(variantFromDescriptor(operation));
+      formDirty = true;
+      renderWorkloadEditor();
+      updateButtons();
+    });
+    heading.append(identity, add);
+    card.append(heading);
+    if (operation.description) {
+      const description = document.createElement("p");
+      description.textContent = operation.description;
+      card.append(description);
+    }
+    if (operation.arguments?.length) {
+      const arguments_ = document.createElement("p");
+      arguments_.className = "argument-summary";
+      arguments_.textContent = operation.arguments
+        .map((argument) => `${argument.name}: ${argument.kind}${argument.required ? " required" : ""}`)
+        .join(" · ");
+      card.append(arguments_);
+    }
+    catalogContainer.append(card);
+  }
+
+  const variants = $("configured-workload");
+  variants.replaceChildren();
+  $("variant-count").textContent = configuredVariants.length
+    ? `${configuredVariants.length} variant${configuredVariants.length === 1 ? "" : "s"}`
+    : "Adapter defaults";
+  if (!configuredVariants.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty";
+    empty.textContent = catalog
+      ? "Safe adapter defaults are active. Querying from this form materializes them as editable variants."
+      : "Safe adapter defaults will be selected after discovery.";
+    variants.append(empty);
+    return;
+  }
+
+  const descriptors = new Map(operations.map((operation) => [operation.name, operation]));
+  configuredVariants.forEach((variant, index) => {
+    const descriptor = descriptors.get(variant.name);
+    const card = document.createElement("article");
+    card.className = "configured-variant";
+    const heading = document.createElement("div");
+    heading.className = "configured-variant-heading";
+    const title = document.createElement("strong");
+    title.textContent = descriptor
+      ? formatVariantName(variant.name, variant.arguments)
+      : `${variant.name} · catalog unavailable`;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "remove-variant";
+    remove.textContent = "Remove";
+    remove.addEventListener("click", () => {
+      configuredVariants.splice(index, 1);
+      formDirty = true;
+      renderWorkloadEditor();
+      updateButtons();
+    });
+    heading.append(title, remove);
+    card.append(heading);
+
+    const fields = document.createElement("div");
+    fields.className = "variant-fields";
+    for (const argument of descriptor?.arguments || []) {
+      const label = document.createElement("label");
+      label.textContent = `${argument.name} · ${argument.kind}${argument.required ? " · required" : ""}`;
+      const input = document.createElement("input");
+      input.type = argument.kind === "integer" ? "number" : "text";
+      if (argument.kind === "integer") input.step = "1";
+      input.placeholder = argument.default === null || argument.default === undefined
+        ? (argument.required ? "required" : "optional")
+        : String(argument.default);
+      if (Object.hasOwn(variant.arguments, argument.name)) {
+        input.value = String(variant.arguments[argument.name]);
+      }
+      input.addEventListener("input", () => {
+        if (argument.kind === "integer") {
+          if (input.value === "") delete variant.arguments[argument.name];
+          else variant.arguments[argument.name] = Number(input.value);
+        } else {
+          variant.arguments[argument.name] = input.value;
+        }
+        title.textContent = formatVariantName(variant.name, variant.arguments);
+        formDirty = true;
+        updateButtons();
+      });
+      label.append(input);
+      fields.append(label);
+    }
+    const weight = document.createElement("label");
+    weight.textContent = "Relative weight";
+    const weightInput = document.createElement("input");
+    weightInput.type = "number";
+    weightInput.min = "0.000001";
+    weightInput.step = "any";
+    weightInput.value = variant.weight;
+    weightInput.addEventListener("input", () => {
+      variant.weight = Number(weightInput.value);
+      formDirty = true;
+      updateButtons();
+    });
+    weight.append(weightInput);
+    fields.append(weight);
+    card.append(fields);
+    variants.append(card);
+  });
+}
+
+function formatVariantName(name, arguments_) {
+  const values = Object.entries(arguments_)
+    .map(([argument, value]) => `${argument}=${typeof value === "string" ? JSON.stringify(value) : value}`)
+    .join(", ");
+  return `${name}${values ? `(${values})` : ""}`;
 }
 
 function renderMetrics() {
@@ -281,6 +572,17 @@ function renderMetrics() {
   $("metric-stage").textContent = run ? stageName(run.state) : "Waiting for a run";
   $("metric-knee").textContent = knee ? formatRate(knee.offered_rate) : "—";
   $("metric-recommended").textContent = knee ? formatRate(knee.recommended_operating_rate) : "—";
+  const agents = run?.config.agents || [];
+  const tcpAgents = agents.filter((agent) => agent.transport.kind === "tcp").length;
+  const colocatedAgents = agents.length - tcpAgents;
+  $("metric-agents").textContent = run ? String(agents.length) : "—";
+  $("metric-agent-detail").textContent = run
+    ? [
+      run.preparation?.status === "ready" ? "queried" : run.preparation?.status || "unprepared",
+      `${tcpAgents} TCP`,
+      `${colocatedAgents} colocated`,
+    ].filter((entry) => !entry.startsWith("0 ")).join(" · ") || "No agents"
+    : "workload clients";
   $("metric-error-rate").textContent = stats ? formatPercent(unsuccessfulRate) : "—";
   $("metric-error-detail").textContent = stats ? `${stats.failed} errors · ${stats.timed_out} timeouts` : "errors + timeouts";
   $("metric-errors").classList.toggle("warning", unsuccessful > 0);
@@ -291,7 +593,10 @@ function stateName(state) { return state.state.replaceAll("_", " "); }
 function stageName(state) {
   if (state.state === "measuring") return `Stage: ${state.stage}`;
   if (state.state === "completed") return state.outcome.classification.replaceAll("_", " ");
-  return state.state === "configured" ? "Ready to start" : stateName(state);
+  if (state.state === "configured") {
+    return selectedRun()?.preparation?.status === "ready" ? "Agents ready" : "Query agents before starting";
+  }
+  return stateName(state);
 }
 function formatRate(rate) { return Number(rate).toLocaleString(undefined, { maximumFractionDigits: 1 }); }
 function formatPercent(rate) { return `${(rate * 100).toFixed(rate >= .1 ? 1 : 2)}%`; }
@@ -407,13 +712,22 @@ function updateButtons() {
   const connected = socket?.readyState === WebSocket.OPEN;
   const run = selectedRun();
   const state = run?.state?.state;
+  const prepared = run?.preparation?.status === "ready";
   $("apply").disabled = !connected;
-  $("start").disabled = !connected || state !== "configured";
+  $("query-agents").disabled = !connected || queryInFlight || (run && state !== "configured");
+  $("query-agents").textContent = prepared ? "Refresh catalog" : "Query agents";
+  $("start").disabled = !connected || state !== "configured" || !prepared || formDirty || queryInFlight;
   $("stop").disabled = !connected || !["starting", "measuring"].includes(state);
 }
 
 $("apply").addEventListener("click", applyConfiguration);
+$("query-agents").addEventListener("click", queryAgents);
 $("start").addEventListener("click", startRun);
 $("stop").addEventListener("click", stopRun);
+$("config-form").addEventListener("submit", (event) => event.preventDefault());
+$("config-form").addEventListener("input", () => {
+  formDirty = true;
+  updateButtons();
+});
 connect();
 render();

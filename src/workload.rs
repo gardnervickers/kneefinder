@@ -61,6 +61,30 @@ pub fn resolve_operation_mix(
     Ok(resolved)
 }
 
+/// Materializes defaults and converts relative weights into a canonical
+/// probability distribution suitable for a resolved run configuration.
+pub fn normalize_operation_mix(
+    config: &WorkloadConfig,
+    advertised: &[OperationDescriptor],
+) -> Result<Vec<WeightedOperation>, WorkloadError> {
+    let resolved = resolve_operation_mix(config, advertised)?;
+    let total_weight = resolved
+        .iter()
+        .map(|operation| operation.weight)
+        .sum::<f64>();
+    if !total_weight.is_finite() || total_weight <= 0.0 {
+        return Err(WorkloadError::InvalidTotalWeight);
+    }
+    Ok(resolved
+        .into_iter()
+        .map(|operation| WeightedOperation {
+            name: operation.name,
+            weight: operation.weight / total_weight,
+            arguments: operation.arguments,
+        })
+        .collect())
+}
+
 fn resolve_selected(
     selected: &[WeightedOperation],
     advertised: &BTreeMap<&str, &OperationDescriptor>,
@@ -180,6 +204,7 @@ pub enum WorkloadError {
     },
     UnknownOperation(String),
     InvalidWeight(String),
+    InvalidTotalWeight,
     NoOperationsSelected,
     EmptyArgumentName(String),
     DuplicateAdvertisedArgument {
@@ -228,6 +253,9 @@ impl fmt::Display for WorkloadError {
             }
             Self::InvalidWeight(name) => {
                 write!(formatter, "operation {name:?} has an invalid weight")
+            }
+            Self::InvalidTotalWeight => {
+                formatter.write_str("operation weights cannot be normalized")
             }
             Self::NoOperationsSelected => formatter.write_str("no operations were selected"),
             Self::EmptyArgumentName(operation) => {
@@ -391,6 +419,88 @@ mod tests {
             resolve_operation_mix(&wrong_type, &operations()),
             Err(WorkloadError::InvalidArgumentType { .. })
         ));
+    }
+
+    #[test]
+    fn required_arguments_without_defaults_must_be_bound() {
+        let mut advertised = operations();
+        advertised[1].arguments[0].default = None;
+        let missing = workload(OperationSelection::Selected {
+            operations: vec![WeightedOperation {
+                name: "write".into(),
+                weight: 1.0,
+                arguments: BTreeMap::new(),
+            }],
+        });
+
+        assert!(matches!(
+            resolve_operation_mix(&missing, &advertised),
+            Err(WorkloadError::MissingArgument {
+                operation,
+                argument,
+            }) if operation == "write" && argument == "value"
+        ));
+    }
+
+    #[test]
+    fn numeric_looking_strings_preserve_their_advertised_type() {
+        let selected = workload(OperationSelection::Selected {
+            operations: vec![WeightedOperation {
+                name: "write".into(),
+                weight: 1.0,
+                arguments: BTreeMap::from([("value".into(), ArgumentValue::String("007".into()))]),
+            }],
+        });
+
+        let resolved = resolve_operation_mix(&selected, &operations()).unwrap();
+        assert_eq!(
+            resolved[0].arguments.get("value"),
+            Some(&ArgumentValue::String("007".into()))
+        );
+    }
+
+    #[test]
+    fn duplicate_advertised_operations_are_rejected() {
+        let mut advertised = operations();
+        advertised.push(advertised[0].clone());
+
+        assert!(matches!(
+            resolve_operation_mix(
+                &workload(OperationSelection::AdapterDefaults),
+                &advertised
+            ),
+            Err(WorkloadError::DuplicateAdvertisedOperation(name)) if name == "read"
+        ));
+    }
+
+    #[test]
+    fn normalized_mix_materializes_exact_variants_and_probability_weights() {
+        let selected = workload(OperationSelection::Selected {
+            operations: vec![
+                WeightedOperation {
+                    name: "read".into(),
+                    weight: 3.0,
+                    arguments: BTreeMap::from([("key".into(), ArgumentValue::Integer(7))]),
+                },
+                WeightedOperation {
+                    name: "write".into(),
+                    weight: 1.0,
+                    arguments: BTreeMap::from([(
+                        "value".into(),
+                        ArgumentValue::String("007".into()),
+                    )]),
+                },
+            ],
+        });
+
+        let normalized = normalize_operation_mix(&selected, &operations()).unwrap();
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0].weight, 0.75);
+        assert_eq!(normalized[1].weight, 0.25);
+        assert_eq!(
+            normalized[1].arguments.get("value"),
+            Some(&ArgumentValue::String("007".into()))
+        );
     }
 
     #[test]

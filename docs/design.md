@@ -29,16 +29,19 @@ specific database, service, queue, or other system.
 ## Components
 
 ```text
-                          commands
-  CLI / TUI / web UI  ---------------->  run engine
-         ^                                   |
-         | events                            | scheduled batches
-         |                                   v
-    artifact writer                    adapter process
-         ^                                   |
-         | observations                      | native calls
-         +-----------------------------------+v
-                                         target system
+                           commands
+  CLI / TUI / web UI  ----------------->  run engine
+         ^                                    |
+         | events                             | phase plan
+         |                                    v
+    artifact writer                     agent cohort
+         ^                               /          \
+         | observations       stdio session       TCP session
+         |                         |                  |
+         +----------------- colocated agent     remote agent
+                                   \                /
+                                    \ native calls /
+                                     target system
 ```
 
 ### Run engine
@@ -50,6 +53,7 @@ and events rather than UI-specific callbacks.
 Commands include:
 
 - configure a new run
+- query and retain its configured agent cohort
 - start a configured run
 - request graceful stop
 - force cancellation after a deadline
@@ -81,6 +85,40 @@ frontend features, while the `cli` feature supplies the command-line frontend
 and binary. TUI and web implementations can live in separate packages, depend
 on the feature-free core, and choose their own runtime and rendering stack.
 
+### Workload agents and placement
+
+The run engine coordinates a fixed cohort of workload agents. An agent owns an
+adapter session, executes its assigned portion of the global schedule, and
+returns results with stable agent attribution. The coordinator validates that
+every cohort member advertises compatible capabilities and the same operation
+schema before starting a phase.
+
+The default mode is **colocated**: the agent runs inside the coordinator process
+and supervises the adapter as a child. This preserves the zero-setup
+`kneefinder run -- ./adapter` experience and is also useful when one machine can
+generate enough load. Multiple colocated agents may be used to isolate several
+client runtimes on the same host.
+
+In distributed mode, separately deployed agents implement the same typed
+adapter protocol over persistent NDJSON/TCP. There is no second
+coordinator/agent protocol and no mandatory sidecar. A client program may expose
+the TCP listener and call its target's native client directly. Containers,
+Kubernetes, and EC2 are responsible only for starting those programs; they do
+not own experiment scheduling. Each agent exposes an explicitly configured
+endpoint and the coordinator establishes the persistent session. Agents never
+dial or register with the coordinator; they only answer requests or stream
+results on a session the coordinator opened. Docker DNS names, EC2 private
+addresses, or Kubernetes headless-service/pod addresses may supply those
+endpoints without introducing scheduler-specific discovery into the core.
+
+Cohort membership is frozen for a run. The coordinator divides aggregate load
+deterministically and sends every member the same absolute phase start. A lost
+or late agent invalidates the phase; its allocation is never silently moved to
+a surviving agent mid-measurement. The cohort result retains per-agent
+attribution before aggregate statistics are computed. Explicit clock-skew
+estimation and richer per-agent artifact reports remain required before remote
+measurements can support strong target-knee claims.
+
 ### Web control plane
 
 The optional `web` feature serves a dependency-free browser client and a
@@ -98,11 +136,13 @@ per-phase statistics, and completed knee estimates. A bounded broadcast buffer
 prevents slow clients from impeding the engine; a lagged client receives a
 fresh snapshot and an explicit resynchronization notice.
 
-The browser GUI uses that API for configuration, start/stop controls, run
-history, throughput and latency curves, knee markers, and per-variant tables.
-Configuration may be edited while a run is still configured. Once started it
-is immutable, so a changed workload becomes a new run rather than silently
-altering the experiment being measured.
+The browser GUI uses that API for configuration, agent discovery, structured
+workload editing, start/stop controls, run history, throughput and latency
+curves, knee markers, and per-variant tables. Agent preparation has its own
+`unprepared`/`preparing`/`ready`/`failed` snapshot state so discovery does not
+pretend that measurement has started. Configuration may be edited while a run
+is still configured. Once started it is immutable, so a changed workload
+becomes a new run rather than silently altering the experiment being measured.
 
 The server binds only to loopback by default. Non-loopback binding is rejected
 unless `--allow-remote` is supplied because this first API version has no
@@ -111,20 +151,44 @@ authenticated reverse proxy. Browser command and WebSocket requests also
 require their `Origin` to match the server host, while non-browser API clients
 may omit `Origin`.
 
-### Workload adapter
+### Workload-agent protocol and transports
 
-Kneefinder launches the adapter once and passes its executable and arguments as
-an argv array:
+In colocated mode, the coordinator-owned agent launches the adapter and passes
+its executable and arguments as an argv array:
 
 ```console
 kneefinder run [kneefinder options] -- ./my-adapter --endpoint db.example.com
 ```
 
-The adapter reads protocol messages from stdin, writes protocol messages to
-stdout, and writes human-readable logs to stderr. Stdout is never used for
-logs. The first transport is newline-delimited JSON with an explicit protocol
-version. The message model is transport-independent so length-prefixed binary
-frames, Unix sockets, or remote workers can be added later.
+The protocol consists only of the versioned `ControllerMessage` and
+`AdapterMessage` types. Session state, discovery validation, scheduling,
+cancellation, and result validation are independent of I/O. Two transport
+bindings currently carry those exact messages:
+
+- **Subprocess:** the agent reads NDJSON from stdin, writes NDJSON to stdout,
+  and writes human-readable logs only to stderr.
+- **TCP:** the agent listens on an explicitly configured address and the
+  coordinator opens one persistent full-duplex stream carrying the same NDJSON
+  frames.
+
+TCP was selected before HTTP because a persistent byte stream preserves the
+existing framing and naturally supports asynchronous results and cancellation.
+HTTP can be added as another transport if deployment evidence warrants it; it
+does not require a new workload protocol.
+
+The initial TCP transport provides neither authentication nor encryption. Do
+not expose it directly to an untrusted network. Cross-host deployments should
+use private networking plus restrictive security groups/network policies, or a
+mutually authenticated TLS tunnel, until native authenticated TLS is added.
+
+Remote endpoints may be combined with the colocated child syntax:
+
+```console
+kneefinder run \
+  --agent-endpoint client-a=tcp://10.0.0.10:9000 \
+  --agent-endpoint client-b=tcp://10.0.0.11:9000 \
+  -- ./local-adapter
+```
 
 Secrets should be supplied through inherited environment variables, files, or
 the initialization message rather than command-line arguments visible in a
@@ -132,13 +196,14 @@ process listing.
 
 ### Operation discovery
 
-After initialization, the adapter's `ready` message advertises its supported
-operations. Each operation has a stable name, description, broad kind (`read`,
-`write`, `administrative`, or `other`), default participation and weight, and
-a list of simple named arguments. Arguments are either signed integers or
-strings and may be required or provide a default. This intentionally small type
-system is easy to implement consistently across languages and straightforward
-for CLI, TUI, and browser frontends to render.
+After initialization, the adapter's `ready` message advertises its name,
+optional implementation version, capabilities, and supported operations. Each
+operation has a stable name, description, broad kind (`read`, `write`,
+`administrative`, or `other`), default participation and weight, and a list of
+simple named arguments. Arguments are either signed integers or strings and may
+be required or provide a default. This intentionally small type system is easy
+to implement consistently across languages and straightforward for CLI, TUI,
+and browser frontends to render.
 
 The run configuration selects one of three workload forms:
 
@@ -193,10 +258,19 @@ Because weights apply to flat variants, nested ratios multiply. A 90/10
 read/write mix with 3:1 argument ratios becomes weights `27, 9, 3, 1` for the
 four variants shown above.
 
-An interactive frontend can eventually probe an adapter before constructing a
-run and render the discovered operations as a workload editor. The probe and a
-normal run use the same initialization/ready handshake; discovery is not a
-separate adapter-specific API.
+An interactive frontend prepares a configured run before starting it. The
+coordinator establishes each configured subprocess or TCP session, performs the
+normal initialization/ready handshake, validates the cohort schema, publishes
+the catalog in the run snapshot, and retains those initialized sessions for the
+executor. Discovery is not a separate adapter-specific API and agents never
+register with or call the coordinator.
+
+The browser renders that catalog as a structured workload editor. It
+materializes safe defaults, uses the advertised argument type for each input,
+preserves numeric-looking strings as strings, permits several concrete variants
+of one operation, and validates required arguments, weights, and duplicates.
+Resolved relative weights are normalized to sum to one in `RunConfig`.
+Operations not marked as defaults require an explicit add action.
 
 ## Adapter execution modes
 
@@ -448,8 +522,10 @@ and terminal classification.
 ## Initial implementation slices
 
 1. Typed protocol messages and a lifecycle reducer with transition tests.
-2. NDJSON subprocess transport and a deterministic fake adapter.
-3. Scheduled-operation executor, phase aggregation, and generator-lag checks.
+2. Transport-independent adapter session with supervised NDJSON subprocess and
+   coordinator-initiated persistent TCP bindings.
+3. Fixed agent cohort, colocated/remote session agents, deterministic schedule
+   fan-out, phase aggregation, and generator-lag checks.
 4. Baseline, geometric discovery, and bracket refinement.
 5. Segmented fit, confidence interval, and JSON artifacts.
 6. Terminal progress and static SVG report.
@@ -461,6 +537,7 @@ errors, and generator lag. It will make the search algorithm and every frontend
 testable without a real target system.
 
 The first external fixture is maintained as the separate Rust package under
-`demo/queue-demo`. It combines a real fixed-worker queue with its adapter in one
-external process, plus a small end-to-end controller that exercises the
-protocol before the full kneefinder engine is available.
+`demo/queue-demo`. It combines a real fixed-worker queue with its agent in one
+external process. Its small end-to-end coordinator exercises both the real
+colocated stdio path and a two-process TCP cohort before the full kneefinder
+executor is available.

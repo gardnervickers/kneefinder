@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+web = ["kneefinder/web"]
+
 [dependencies]
 kneefinder = { path = "../..", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
