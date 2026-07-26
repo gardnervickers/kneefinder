@@ -29,9 +29,9 @@ use kneefinder::{
         LoadConfig, OperationSelection, PhaseConfig, Preset, RunConfig, Strategy,
         WeightedOperation, WorkloadConfig,
     },
-    engine::{Engine, EngineCommand},
+    engine::{Engine, EngineCommand, EngineError, EngineHandle},
     frontends::{Frontend, web::WebFrontend},
-    measurement::{KneeEstimate, RunClassification, RunEvent, RunOutcome},
+    measurement::{KneeEstimate, RunClassification, RunEvent, RunOutcome, RunState},
     stats::PhaseReport,
 };
 
@@ -303,10 +303,18 @@ fn run_tcp_multi_client_dashboard(
         run_id: configured.run_id,
     })?;
     let mut agents = engine.take_prepared_cohort(configured.run_id)?;
-    engine.record_run_event(configured.run_id, RunEvent::AdapterReady)?;
+    let mut stop_requested = matches!(
+        advance_or_stop(&engine, configured.run_id, RunEvent::AdapterReady)?,
+        DemoProgress::StopRequested
+    );
 
     let mut rows = Vec::new();
     for (index, rate) in rates.into_iter().enumerate() {
+        if stop_requested || run_is_stopping(&handle, configured.run_id)? {
+            stop_requested = true;
+            break;
+        }
+
         eprint!("measuring {rate:.0} req/s across two TCP agents... ");
         io_flush_stderr()?;
         let phase_id = PhaseId(index as u64 + 1);
@@ -324,17 +332,25 @@ fn run_tcp_multi_client_dashboard(
         )?;
         rows.push(row);
 
-        match index {
-            0 => {
-                engine.record_run_event(configured.run_id, RunEvent::BaselineEstablished)?;
-            }
-            4 => {
-                engine.record_run_event(configured.run_id, RunEvent::SaturationBracketed)?;
-            }
-            5 => {
-                engine.record_run_event(configured.run_id, RunEvent::BracketRefined)?;
-            }
-            _ => {}
+        if run_is_stopping(&handle, configured.run_id)? {
+            stop_requested = true;
+            break;
+        }
+
+        let progress = match index {
+            0 => Some(RunEvent::BaselineEstablished),
+            4 => Some(RunEvent::SaturationBracketed),
+            5 => Some(RunEvent::BracketRefined),
+            _ => None,
+        };
+        if let Some(progress) = progress
+            && matches!(
+                advance_or_stop(&engine, configured.run_id, progress)?,
+                DemoProgress::StopRequested
+            )
+        {
+            stop_requested = true;
+            break;
         }
     }
 
@@ -343,26 +359,132 @@ fn run_tcp_multi_client_dashboard(
         process.wait()?;
     }
     let expected_knee = theoretical_knee(WORKERS);
-    engine.record_run_event(
-        configured.run_id,
-        RunEvent::CandidateValidated {
-            outcome: RunOutcome {
-                classification: RunClassification::TargetSaturated,
-                knee: Some(KneeEstimate {
-                    offered_rate: expected_knee,
-                    lower_bound: 275.0,
-                    upper_bound: 310.0,
-                    recommended_operating_rate: expected_knee * 0.8,
-                }),
-                slo_maximum_rate: None,
-                warnings: vec!["queue demo uses two independent TCP workload agents".into()],
-            },
-        },
-    )?;
+    let completed = if stop_requested {
+        false
+    } else {
+        matches!(
+            advance_or_stop(
+                &engine,
+                configured.run_id,
+                RunEvent::CandidateValidated {
+                    outcome: RunOutcome {
+                        classification: RunClassification::TargetSaturated,
+                        knee: Some(KneeEstimate {
+                            offered_rate: expected_knee,
+                            lower_bound: 275.0,
+                            upper_bound: 310.0,
+                            recommended_operating_rate: expected_knee * 0.8,
+                        }),
+                        slo_maximum_rate: None,
+                        warnings: vec![
+                            "queue demo uses two independent TCP workload agents".into(),
+                        ],
+                    },
+                },
+            )?,
+            DemoProgress::Advanced
+        )
+    };
+    if !completed {
+        engine.record_run_event(configured.run_id, RunEvent::AdapterStopped)?;
+    }
     print_rows(&rows, expected_knee);
-    println!("\nmulti-client dashboard ready: http://{bind}");
+    if completed {
+        println!("\nmulti-client dashboard ready: http://{bind}");
+    } else {
+        println!("\nmulti-client run stopped; dashboard remains available at http://{bind}");
+    }
     loop {
         thread::park();
+    }
+}
+
+#[cfg(feature = "web")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DemoProgress {
+    Advanced,
+    StopRequested,
+}
+
+#[cfg(feature = "web")]
+fn advance_or_stop(
+    engine: &Engine,
+    run_id: RunId,
+    event: RunEvent,
+) -> Result<DemoProgress, Box<dyn Error>> {
+    match engine.record_run_event(run_id, event) {
+        Ok(_) => Ok(DemoProgress::Advanced),
+        Err(EngineError::InvalidTransition { source, .. })
+            if matches!(*source.state, RunState::Stopping { .. }) =>
+        {
+            Ok(DemoProgress::StopRequested)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(feature = "web")]
+fn run_is_stopping(handle: &EngineHandle, run_id: RunId) -> Result<bool, EngineError> {
+    Ok(matches!(
+        handle.snapshot(run_id)?.state,
+        RunState::Stopping { .. }
+    ))
+}
+
+#[cfg(all(test, feature = "web"))]
+mod web_stop_tests {
+    use super::*;
+
+    #[test]
+    fn validation_completion_yields_to_a_stop_request() {
+        let engine = Engine::new();
+        let handle = engine.handle();
+        let configured = handle
+            .execute(EngineCommand::Configure {
+                config: Box::new(dashboard_config(Vec::new(), &[100.0, 200.0])),
+            })
+            .unwrap();
+        handle
+            .execute(EngineCommand::Start {
+                run_id: configured.run_id,
+            })
+            .unwrap();
+        for event in [
+            RunEvent::AdapterReady,
+            RunEvent::BaselineEstablished,
+            RunEvent::SaturationBracketed,
+            RunEvent::BracketRefined,
+        ] {
+            engine.record_run_event(configured.run_id, event).unwrap();
+        }
+        handle
+            .execute(EngineCommand::Stop {
+                run_id: configured.run_id,
+            })
+            .unwrap();
+
+        let progress = advance_or_stop(
+            &engine,
+            configured.run_id,
+            RunEvent::CandidateValidated {
+                outcome: RunOutcome {
+                    classification: RunClassification::TargetSaturated,
+                    knee: None,
+                    slo_maximum_rate: None,
+                    warnings: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(progress, DemoProgress::StopRequested);
+        engine
+            .record_run_event(configured.run_id, RunEvent::AdapterStopped)
+            .unwrap();
+        assert_eq!(
+            handle.snapshot(configured.run_id).unwrap().state,
+            RunState::Stopped
+        );
     }
 }
 
