@@ -11,9 +11,15 @@ let formDirty = false;
 let queryInFlight = false;
 let configurationSyncTimer = null;
 let configurationSyncPending = false;
+let selectedPreset = "quick";
 
 const $ = (id) => document.getElementById(id);
 const svgNs = "http://www.w3.org/2000/svg";
+const strategyDescriptions = Object.freeze({
+  adaptive: "Increases load to bracket saturation, then refines around the likely knee.",
+  sweep: "Runs each configured load level from low to high for a predictable capacity curve.",
+  "up-down": "Runs load upward and then downward to reveal hysteresis: different behavior while load is falling.",
+});
 
 function connect() {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
@@ -140,7 +146,7 @@ function readConfig() {
   }
   if (new Set(agents.map((agent) => agent.id)).size !== agents.length) throw new Error("Agent IDs must be unique.");
   const config = {
-    preset: $("preset").value,
+    preset: selectedPreset,
     strategy: $("strategy").value,
     phases: {
       warmup_ms: numberValue("warmup"),
@@ -321,6 +327,7 @@ function showMessage(message, error) {
 function render() {
   renderRuns();
   renderWorkloadEditor();
+  renderRunProgress();
   renderMetrics();
   renderCharts();
   renderErrorCodes();
@@ -351,8 +358,9 @@ function renderRuns() {
 
 function loadForm(run) {
   const config = run.config;
-  $("preset").value = config.preset;
+  selectedPreset = config.preset;
   $("strategy").value = config.strategy;
+  updateStrategyHelp();
   $("initial-rate").value = config.load.initial_rate;
   $("maximum-rate").value = config.load.maximum_rate;
   $("growth-factor").value = config.load.growth_factor;
@@ -378,6 +386,12 @@ function loadConfiguredVariants(config) {
   configuredVariants = selection.selection === "selected"
     ? selection.operations.map((variant) => structuredClone(variant))
     : [];
+}
+
+function updateStrategyHelp() {
+  const description = strategyDescriptions[$("strategy").value] || "";
+  $("strategy-help").textContent = description;
+  $("strategy").title = description;
 }
 
 function selectedCatalog() {
@@ -600,6 +614,70 @@ function formatVariantName(name, arguments_) {
   return `${name}${values ? `(${values})` : ""}`;
 }
 
+function renderRunProgress() {
+  const run = selectedRun();
+  const track = $("run-progress-track");
+  const fill = $("run-progress-fill");
+  if (!run) {
+    $("run-progress-title").textContent = "No run selected";
+    $("run-progress-status").textContent = "Ready to configure";
+    fill.style.width = "0%";
+    track.setAttribute("aria-valuenow", "0");
+    track.setAttribute("aria-valuetext", "No run selected");
+    return;
+  }
+
+  const progress = progressForRun(run);
+  $("run-progress-title").textContent = `Run ${run.run_id}`;
+  $("run-progress-status").textContent = progress.label;
+  fill.style.width = `${progress.percent}%`;
+  track.setAttribute("aria-valuenow", String(Math.round(progress.percent)));
+  track.setAttribute("aria-valuetext", progress.label);
+}
+
+function progressForRun(run) {
+  const state = run.state.state;
+  const completed = (results.get(run.run_id) || []).length;
+  const planned = plannedPhaseCount(run.config);
+  const measuredPercent = planned ? Math.min(96, completed / planned * 100) : 0;
+  if (state === "configured") return { percent: 0, label: "Ready to start" };
+  if (state === "starting") return { percent: 3, label: "Starting workload agents" };
+  if (state === "completed") return { percent: 100, label: `Complete · ${completed} measurements` };
+  if (state === "stopped") return { percent: measuredPercent, label: `Stopped · ${completed} measurements` };
+  if (state === "failed") return { percent: measuredPercent, label: `Failed · ${completed} measurements` };
+
+  if (state === "measuring" || state === "stopping") {
+    const stopping = state === "stopping";
+    if (run.config.strategy !== "adaptive" && planned) {
+      const activePhase = Math.min(completed + 1, planned);
+      const label = stopping
+        ? `${completed} of ${planned} measurements complete · stopping`
+        : `Measurement ${activePhase} of ${planned} · ${completed} complete`;
+      return { percent: Math.max(5, measuredPercent), label };
+    }
+    const stage = state === "measuring" ? run.state.stage : run.state.interrupted_stage;
+    const stagePercent = { baseline: 10, discovery: 35, refinement: 65, validation: 88 }[stage] || 5;
+    const label = `${completed} measurements complete · ${stopping ? "stopping" : stageName(run.state)}`;
+    return { percent: Math.max(measuredPercent, stagePercent), label };
+  }
+
+  return { percent: measuredPercent, label: stateName(run.state) };
+}
+
+function plannedPhaseCount(config) {
+  let levels = config.load.explicit_levels.length;
+  if (!levels) {
+    let rate = config.load.initial_rate;
+    while (rate < config.load.maximum_rate && levels < 10_000) {
+      levels += 1;
+      rate *= config.load.growth_factor;
+    }
+    levels += 1;
+  }
+  if (config.strategy === "up-down" && levels > 1) levels = levels * 2 - 1;
+  return levels * config.load.cycles * config.phases.repetitions;
+}
+
 function renderMetrics() {
   const run = selectedRun();
   const phases = run ? (results.get(run.run_id) || []) : [];
@@ -764,7 +842,9 @@ function updateButtons() {
 
 $("start").addEventListener("click", startRun);
 $("stop").addEventListener("click", stopRun);
+$("strategy").addEventListener("change", updateStrategyHelp);
 $("config-form").addEventListener("submit", (event) => event.preventDefault());
 $("config-form").addEventListener("input", markConfigurationDirty);
+updateStrategyHelp();
 connect();
 render();

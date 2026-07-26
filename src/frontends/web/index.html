@@ -25,10 +25,14 @@
           </div>
 
           <form id="config-form">
-            <div class="field-pair">
-              <label>Preset<select id="preset"><option value="quick">Quick</option><option value="careful">Careful</option><option value="hysteresis">Hysteresis</option></select></label>
-              <label>Strategy<select id="strategy"><option value="adaptive">Adaptive</option><option value="sweep">Sweep</option><option value="up-down">Up/down</option></select></label>
-            </div>
+            <label>Strategy
+              <select id="strategy" aria-describedby="strategy-help">
+                <option value="adaptive">Adaptive</option>
+                <option value="sweep">Sweep</option>
+                <option value="up-down">Up/down (detect hysteresis)</option>
+              </select>
+              <span id="strategy-help" class="strategy-help"></span>
+            </label>
             <div class="field-pair">
               <label>Initial rate<input id="initial-rate" type="number" min="0.001" step="any" value="100"></label>
               <label>Maximum rate<input id="maximum-rate" type="number" min="0.001" step="any" value="10000"></label>
@@ -85,6 +89,27 @@
       </aside>
 
       <section class="dashboard">
+        <section class="panel run-progress" aria-labelledby="run-progress-title">
+          <div class="run-progress-heading">
+            <div>
+              <p class="eyebrow">PROGRESS</p>
+              <h2 id="run-progress-title">No run selected</h2>
+            </div>
+            <span id="run-progress-status">Ready to configure</span>
+          </div>
+          <div
+            id="run-progress-track"
+            class="run-progress-track"
+            role="progressbar"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow="0"
+            aria-valuetext="No run selected"
+          >
+            <span id="run-progress-fill"></span>
+          </div>
+        </section>
+
         <div class="metrics">
           <article class="metric"><p>Run state</p><strong id="metric-state">—</strong><span id="metric-stage">Waiting for a run</span></article>
           <article class="metric accent"><p>Knee</p><strong id="metric-knee">—</strong><span>offered operations / sec</span></article>

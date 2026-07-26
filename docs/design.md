@@ -490,7 +490,12 @@ requires explicit configuration and authentication; arbitrary adapter commands
 must not be exposed by default.
 
 The browser is a client of the engine API, not the owner of a run. Closing or
-reloading the page does not terminate the experiment.
+reloading the page does not terminate the experiment. It exposes resolved
+configuration values and traversal strategies directly rather than presenting
+CLI presets whose only purpose is to select starting values. Strategy help
+distinguishes the up/down traversal from the hysteresis it is intended to
+detect. Run progress is based on completed planned phases for fixed traversals
+and lifecycle stages for adaptive runs.
 
 ## Events and persistence
 

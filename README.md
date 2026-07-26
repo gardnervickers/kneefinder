@@ -58,10 +58,12 @@ both TCP sessions, queries their operation catalogs, validates that their
 schemas match, and exposes the discovered workload in the browser. It does not
 start workload traffic automatically. Review or edit the prepared seven-level
 plan, then press Start. The dashboard updates with throughput, latency,
-reliability, and per-variant results. Around the knee, goodput flattens while
-latency rises sharply. After that run, edit the load levels, timings, strategy,
-operation variants, or remote-agent list. The dashboard saves the form and
-checks agent connectivity automatically; press Start when it reports ready.
+reliability, per-variant results, and run progress based on completed phases.
+Around the knee, goodput flattens while latency rises sharply. After that run,
+edit the load levels, timings, strategy, operation variants, or remote-agent
+list. The dashboard saves the form and checks agent connectivity automatically;
+press Start when it reports ready. The browser exposes the actual traversal
+strategy directly and explains it in place; CLI-oriented presets are not shown.
 Stop ends the active run while leaving both agents available for the next one.
 
 The agents only listen on the private Compose network; they never dial or

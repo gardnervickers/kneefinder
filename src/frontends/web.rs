@@ -590,6 +590,12 @@ mod tests {
     fn browser_uses_the_discovery_driven_workload_editor() {
         assert!(!INDEX_HTML.contains(r#"id="query-agents""#));
         assert!(!INDEX_HTML.contains(r#"id="apply""#));
+        assert!(!INDEX_HTML.contains(r#"id="preset""#));
+        assert!(!APP_JS.contains(r#"$("preset")"#));
+        assert!(INDEX_HTML.contains(r#"id="strategy-help""#));
+        assert!(INDEX_HTML.contains("Up/down (detect hysteresis)"));
+        assert!(INDEX_HTML.contains(r#"id="run-progress-track""#));
+        assert!(INDEX_HTML.contains(r#"role="progressbar""#));
         assert!(INDEX_HTML.contains(r#"id="operation-catalog""#));
         assert!(INDEX_HTML.contains(r#"id="configured-workload""#));
         assert!(!INDEX_HTML.contains(r#"id="operations""#));
@@ -598,6 +604,10 @@ mod tests {
         assert!(APP_JS.contains(r#"argument.kind === "enum""#));
         assert!(APP_JS.contains(r#""select" : "input""#));
         assert!(APP_JS.contains(r#""Add explicitly""#));
+        assert!(APP_JS.contains("strategyDescriptions"));
+        assert!(APP_JS.contains("updateStrategyHelp"));
+        assert!(APP_JS.contains("renderRunProgress"));
+        assert!(APP_JS.contains("plannedPhaseCount"));
         assert!(APP_JS.contains("scheduleConfigurationSync"));
         assert!(APP_JS.contains("Could not prepare agents"));
     }
