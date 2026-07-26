@@ -110,8 +110,9 @@ The browser first saves the configured colocated and TCP endpoints, then sends
 `initialize`/`ready` handshake, validates that the cohort shares one schema,
 and retains those initialized sessions for the run. The resulting operation
 catalog updates the browser dynamically. Its structured editor uses typed
-integer/string inputs, supports multiple bound variants of one operation, and
-keeps operations that are not safe defaults behind an explicit add action.
+integer and text inputs plus dropdowns for advertised enum choices, supports
+multiple bound variants of one operation, and keeps operations that are not
+safe defaults behind an explicit add action.
 
 ## Configure a workload
 

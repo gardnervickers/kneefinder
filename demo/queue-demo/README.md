@@ -60,9 +60,10 @@ The service has four workers and exposes two operations:
 - `write`: explicit opt-in operation, weight 1
 
 `read` advertises an integer `key` argument. `key=0` costs 10 ms and `key=1`
-costs 20 ms, with a 3:1 workload ratio. `write` advertises a string `value`;
-`small` costs 20 ms and `large` costs 40 ms, also with a 3:1 ratio. The adapter
-validates every concrete variant before enqueueing it.
+costs 20 ms, with a 3:1 workload ratio. `write` advertises an enum `value` with
+the ordered choices `small` and `large`, which the dashboard renders as a
+dropdown. `small` costs 20 ms and `large` costs 40 ms, also with a 3:1 ratio.
+The adapter validates every concrete variant before enqueueing it.
 
 All four variants share the same bounded worker queue. Combining the 90/10
 operation ratio and 3:1 argument ratios gives an average service time of 13.75
@@ -125,7 +126,7 @@ protocol `Shutdown` command. The coordinator is always the side that connects.
 The adapter expects an `initialize` message containing its queue configuration:
 
 ```json
-{"type":"initialize","protocol_version":2,"run_id":1,"config":{"workers":4,"read_service_ms":10,"write_service_ms":20,"queue_capacity":4096}}
+{"type":"initialize","protocol_version":3,"run_id":1,"config":{"workers":4,"read_service_ms":10,"write_service_ms":20,"queue_capacity":4096}}
 ```
 
 Its `ready` response advertises adapter identity, capabilities, and both

@@ -206,10 +206,13 @@ After initialization, the adapter's `ready` message advertises its name,
 optional implementation version, capabilities, and supported operations. Each
 operation has a stable name, description, broad kind (`read`, `write`,
 `administrative`, or `other`), default participation and weight, and a list of
-simple named arguments. Arguments are either signed integers or strings and may
-be required or provide a default. This intentionally small type system is easy
-to implement consistently across languages and straightforward for CLI, TUI,
-and browser frontends to render.
+simple named arguments. Concrete arguments are either signed integers or
+strings and may be required or provide a default. An enum argument advertises
+an ordered, non-empty set of allowed string values, so interactive frontends
+can render a dropdown while scheduled operations continue to carry ordinary
+string values. This intentionally small type system is easy to implement
+consistently across languages and straightforward for CLI, TUI, and browser
+frontends to render.
 
 The run configuration selects one of three workload forms:
 
@@ -273,8 +276,9 @@ register with or call the coordinator.
 
 The browser renders that catalog as a structured workload editor. It
 materializes safe defaults, uses the advertised argument type for each input,
-preserves numeric-looking strings as strings, permits several concrete variants
-of one operation, and validates required arguments, weights, and duplicates.
+renders enum choices as dropdowns, preserves numeric-looking strings as
+strings, permits several concrete variants of one operation, and validates
+required arguments, weights, and duplicates.
 Resolved relative weights are normalized to sum to one in `RunConfig`.
 Operations not marked as defaults require an explicit add action.
 

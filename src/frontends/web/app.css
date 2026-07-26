@@ -67,7 +67,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--cyan); box-shado
 .remove-variant { color: #ffadb4; }
 .variant-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
 .variant-fields label { min-width: 0; font-size: 9px; }
-.variant-fields input { padding: 7px 8px; font-size: 11px; }
+.variant-fields input, .variant-fields select { padding: 7px 8px; font-size: 11px; }
 .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 17px; }
 button { cursor: pointer; color: var(--text); background: var(--panel-2); border: 1px solid var(--line); border-radius: 7px; padding: 9px 11px; font-weight: 700; font-size: 12px; }
 button:hover:not(:disabled) { border-color: #476072; transform: translateY(-1px); }

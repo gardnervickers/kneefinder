@@ -190,6 +190,12 @@ function readStructuredOperations() {
         if (argument.kind === "string" && typeof value !== "string") {
           throw new Error(`${variant.name}.${argument.name} must be text.`);
         }
+        if (argument.kind === "enum"
+            && (typeof value !== "string" || !argument.values.includes(value))) {
+          throw new Error(
+            `${variant.name}.${argument.name} must be one of: ${argument.values.join(", ")}.`,
+          );
+        }
         arguments_[argument.name] = value;
       }
       const unknown = Object.keys(variant.arguments).find(
@@ -474,7 +480,10 @@ function renderWorkloadEditor() {
       const arguments_ = document.createElement("p");
       arguments_.className = "argument-summary";
       arguments_.textContent = operation.arguments
-        .map((argument) => `${argument.name}: ${argument.kind}${argument.required ? " required" : ""}`)
+        .map((argument) => {
+          const choices = argument.kind === "enum" ? ` [${argument.values.join(" | ")}]` : "";
+          return `${argument.name}: ${argument.kind}${choices}${argument.required ? " required" : ""}`;
+        })
         .join(" · ");
       card.append(arguments_);
     }
@@ -524,17 +533,36 @@ function renderWorkloadEditor() {
     for (const argument of descriptor?.arguments || []) {
       const label = document.createElement("label");
       label.textContent = `${argument.name} · ${argument.kind}${argument.required ? " · required" : ""}`;
-      const input = document.createElement("input");
-      input.type = argument.kind === "integer" ? "number" : "text";
-      if (argument.kind === "integer") input.step = "1";
-      input.placeholder = argument.default === null || argument.default === undefined
-        ? (argument.required ? "required" : "optional")
-        : String(argument.default);
+      const input = document.createElement(argument.kind === "enum" ? "select" : "input");
+      if (argument.kind === "enum") {
+        if (!argument.required || !Object.hasOwn(variant.arguments, argument.name)) {
+          const placeholder = document.createElement("option");
+          placeholder.value = "";
+          placeholder.textContent = argument.required ? "Select a value" : "Unset";
+          placeholder.disabled = argument.required;
+          placeholder.selected = true;
+          input.append(placeholder);
+        }
+        for (const value of argument.values) {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = value;
+          input.append(option);
+        }
+      } else {
+        input.type = argument.kind === "integer" ? "number" : "text";
+        if (argument.kind === "integer") input.step = "1";
+        input.placeholder = argument.default === null || argument.default === undefined
+          ? (argument.required ? "required" : "optional")
+          : String(argument.default);
+      }
       if (Object.hasOwn(variant.arguments, argument.name)) {
         input.value = String(variant.arguments[argument.name]);
       }
-      input.addEventListener("input", () => {
-        if (argument.kind === "integer") {
+      const updateArgument = () => {
+        if (input.value === "" && !argument.required) {
+          delete variant.arguments[argument.name];
+        } else if (argument.kind === "integer") {
           if (input.value === "") delete variant.arguments[argument.name];
           else variant.arguments[argument.name] = Number(input.value);
         } else {
@@ -542,7 +570,8 @@ function renderWorkloadEditor() {
         }
         title.textContent = formatVariantName(variant.name, variant.arguments);
         markConfigurationDirty();
-      });
+      };
+      input.addEventListener(argument.kind === "enum" ? "change" : "input", updateArgument);
       label.append(input);
       fields.append(label);
     }

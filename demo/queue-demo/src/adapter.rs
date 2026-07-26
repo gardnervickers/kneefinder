@@ -140,6 +140,7 @@ fn run_session(input: impl BufRead, mut output: impl Write) -> Result<SessionExi
                                     name: "key".into(),
                                     description: Some("integer key to read".into()),
                                     kind: ArgumentKind::Integer,
+                                    values: Vec::new(),
                                     required: true,
                                     default: Some(ArgumentValue::Integer(0)),
                                 }],
@@ -156,7 +157,8 @@ fn run_session(input: impl BufRead, mut output: impl Write) -> Result<SessionExi
                                 arguments: vec![OperationArgument {
                                     name: "value".into(),
                                     description: Some("string value to write".into()),
-                                    kind: ArgumentKind::String,
+                                    kind: ArgumentKind::Enum,
+                                    values: vec!["small".into(), "large".into()],
                                     required: true,
                                     default: Some(ArgumentValue::String("small".into())),
                                 }],

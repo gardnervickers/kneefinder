@@ -595,6 +595,8 @@ mod tests {
         assert!(!INDEX_HTML.contains(r#"id="operations""#));
         assert!(APP_JS.contains(r#"event.event === "run_preparation_changed""#));
         assert!(APP_JS.contains(r#"argument.kind === "integer""#));
+        assert!(APP_JS.contains(r#"argument.kind === "enum""#));
+        assert!(APP_JS.contains(r#""select" : "input""#));
         assert!(APP_JS.contains(r#""Add explicitly""#));
         assert!(APP_JS.contains("scheduleConfigurationSync"));
         assert!(APP_JS.contains("Could not prepare agents"));

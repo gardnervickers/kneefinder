@@ -70,7 +70,8 @@ An operation name plus its complete concrete argument map is one schedulable
 and statistical operation. For example, `read(key=0)` and `read(key=1)` have
 independent weights and independent statistics.
 
-- argument types are deliberately limited to signed integers and strings
+- concrete argument values are deliberately limited to signed integers and
+  strings; enum descriptors add an ordered set of allowed string values
 - adapter discovery declares required/default arguments and safe defaults
 - weights apply to flat variants; nested ratios are multiplied by the caller
 - `all operations` is always explicit because advertised operations may mutate
@@ -191,15 +192,16 @@ time buckets should support stationarity checks, repeats, and uncertainty.
 At the time this handoff was written, these pieces exist:
 
 - protocol and operation discovery types
-- int/string arguments and flat weighted variants
+- integer, string, and enum arguments plus flat weighted variants
 - per-variant latency, error, timeout, and error-code statistics
 - lifecycle reducer and frontend-neutral engine API
 - CLI configuration and `--print-config`
 - HTTP/WebSocket API and browser dashboard
 - coordinator-owned agent preparation with discovery events and retained
   initialized cohorts
-- discovery-driven browser workload editor with typed arguments, safe defaults,
-  explicit opt-in operations, and multiple bound variants
+- discovery-driven browser workload editor with typed arguments and enum
+  dropdowns, safe defaults, explicit opt-in operations, and multiple bound
+  variants
 - Rust adapter example
 - supervised subprocess adapter session, bounded stderr diagnostics, and TCP
   transport

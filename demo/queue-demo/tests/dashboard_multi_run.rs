@@ -13,7 +13,7 @@ use kneefinder::{
     engine::{AgentPreparation, EngineCommand, RunSnapshot},
     frontends::web::ApiSnapshot,
     measurement::RunState,
-    protocol::RunId,
+    protocol::{ArgumentKind, RunId},
 };
 
 struct DemoProcess(Child);
@@ -42,6 +42,17 @@ fn dashboard_completes_adjusts_stops_and_reruns_on_persistent_agents() {
         run.state == RunState::Configured
             && matches!(&run.preparation, AgentPreparation::Ready { .. })
     });
+    let AgentPreparation::Ready { catalog } = &ready.preparation else {
+        unreachable!("wait predicate requires a ready catalog");
+    };
+    let size = catalog
+        .operations
+        .iter()
+        .find(|operation| operation.name == "write")
+        .and_then(|operation| operation.arguments.iter().find(|argument| argument.name == "value"))
+        .expect("queue demo should advertise its write value argument");
+    assert_eq!(size.kind, ArgumentKind::Enum);
+    assert_eq!(size.values, ["small", "large"]);
     thread::sleep(Duration::from_millis(300));
     let still_idle = snapshot(&address)
         .runs

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -105,6 +105,10 @@ pub struct OperationArgument {
     pub name: String,
     pub description: Option<String>,
     pub kind: ArgumentKind,
+    /// Ordered choices for an enum argument. Empty for integer and free-form
+    /// string arguments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
     pub required: bool,
     pub default: Option<ArgumentValue>,
 }
@@ -114,6 +118,7 @@ pub struct OperationArgument {
 pub enum ArgumentKind {
     Integer,
     String,
+    Enum,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -290,5 +295,25 @@ mod tests {
 
         assert_eq!(result.dispatch_lag_ns(), 250);
         assert_eq!(result.total_latency_ns(), 1_000);
+    }
+
+    #[test]
+    fn enum_argument_descriptor_round_trips_with_ordered_values() {
+        let argument = OperationArgument {
+            name: "size".into(),
+            description: Some("payload size".into()),
+            kind: ArgumentKind::Enum,
+            values: vec!["small".into(), "large".into()],
+            required: true,
+            default: Some(ArgumentValue::String("small".into())),
+        };
+
+        let json = serde_json::to_string(&argument).unwrap();
+        assert!(json.contains(r#""kind":"enum""#));
+        assert!(json.contains(r#""values":["small","large"]"#));
+        assert_eq!(
+            serde_json::from_str::<OperationArgument>(&json).unwrap(),
+            argument
+        );
     }
 }

@@ -1,12 +1,17 @@
 //! Adapter operation discovery and workload-mix resolution.
 
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{OperationSelection, WeightedOperation, WorkloadConfig},
-    protocol::{ArgumentValue, OperationDescriptor, OperationKind},
+    protocol::{
+        ArgumentKind, ArgumentValue, OperationArgument, OperationDescriptor, OperationKind,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -137,10 +142,25 @@ fn validate_argument_descriptors(descriptor: &OperationDescriptor) -> Result<(),
                 argument: argument.name.clone(),
             });
         }
+        let valid_values = match argument.kind {
+            ArgumentKind::Enum => {
+                !argument.values.is_empty()
+                    && argument.values.iter().all(|value| !value.is_empty())
+                    && argument.values.iter().collect::<BTreeSet<_>>().len()
+                        == argument.values.len()
+            }
+            ArgumentKind::Integer | ArgumentKind::String => argument.values.is_empty(),
+        };
+        if !valid_values {
+            return Err(WorkloadError::InvalidArgumentValues {
+                operation: descriptor.name.clone(),
+                argument: argument.name.clone(),
+            });
+        }
         if argument
             .default
             .as_ref()
-            .is_some_and(|value| value.kind() != argument.kind)
+            .is_some_and(|value| !argument_accepts(argument, value))
         {
             return Err(WorkloadError::InvalidArgumentDefault {
                 operation: descriptor.name.clone(),
@@ -177,8 +197,14 @@ fn resolve_arguments(
                 .cloned()
                 .or_else(|| argument.default.clone());
             match value {
-                Some(value) if value.kind() != argument.kind => {
+                Some(value) if !argument_type_matches(argument, &value) => {
                     Some(Err(WorkloadError::InvalidArgumentType {
+                        operation: descriptor.name.clone(),
+                        argument: argument.name.clone(),
+                    }))
+                }
+                Some(value) if !argument_accepts(argument, &value) => {
+                    Some(Err(WorkloadError::InvalidArgumentValue {
                         operation: descriptor.name.clone(),
                         argument: argument.name.clone(),
                     }))
@@ -192,6 +218,29 @@ fn resolve_arguments(
             }
         })
         .collect()
+}
+
+fn argument_accepts(argument: &OperationArgument, value: &ArgumentValue) -> bool {
+    if !argument_type_matches(argument, value) {
+        return false;
+    }
+    match (&argument.kind, value) {
+        (ArgumentKind::Integer, ArgumentValue::Integer(_))
+        | (ArgumentKind::String, ArgumentValue::String(_)) => true,
+        (ArgumentKind::Enum, ArgumentValue::String(value)) => argument.values.contains(value),
+        _ => false,
+    }
+}
+
+fn argument_type_matches(argument: &OperationArgument, value: &ArgumentValue) -> bool {
+    matches!(
+        (&argument.kind, value),
+        (ArgumentKind::Integer, ArgumentValue::Integer(_))
+            | (
+                ArgumentKind::String | ArgumentKind::Enum,
+                ArgumentValue::String(_)
+            )
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +264,10 @@ pub enum WorkloadError {
         operation: String,
         argument: String,
     },
+    InvalidArgumentValues {
+        operation: String,
+        argument: String,
+    },
     UnknownArgument {
         operation: String,
         argument: String,
@@ -224,6 +277,10 @@ pub enum WorkloadError {
         argument: String,
     },
     InvalidArgumentType {
+        operation: String,
+        argument: String,
+    },
+    InvalidArgumentValue {
         operation: String,
         argument: String,
     },
@@ -278,6 +335,13 @@ impl fmt::Display for WorkloadError {
                 formatter,
                 "operation {operation:?} has an invalid default for argument {argument:?}"
             ),
+            Self::InvalidArgumentValues {
+                operation,
+                argument,
+            } => write!(
+                formatter,
+                "operation {operation:?} advertises invalid enum values for argument {argument:?}"
+            ),
             Self::UnknownArgument {
                 operation,
                 argument,
@@ -299,6 +363,13 @@ impl fmt::Display for WorkloadError {
                 formatter,
                 "operation {operation:?} received the wrong type for argument {argument:?}"
             ),
+            Self::InvalidArgumentValue {
+                operation,
+                argument,
+            } => write!(
+                formatter,
+                "operation {operation:?} received a value outside the advertised enum for argument {argument:?}"
+            ),
         }
     }
 }
@@ -308,7 +379,6 @@ impl std::error::Error for WorkloadError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ArgumentKind, OperationArgument};
 
     fn operations() -> Vec<OperationDescriptor> {
         vec![
@@ -322,6 +392,7 @@ mod tests {
                     name: "key".into(),
                     description: None,
                     kind: ArgumentKind::Integer,
+                    values: Vec::new(),
                     required: true,
                     default: Some(ArgumentValue::Integer(0)),
                 }],
@@ -336,6 +407,7 @@ mod tests {
                     name: "value".into(),
                     description: None,
                     kind: ArgumentKind::String,
+                    values: Vec::new(),
                     required: true,
                     default: Some(ArgumentValue::String("demo".into())),
                 }],
@@ -345,6 +417,24 @@ mod tests {
 
     fn workload(operations: OperationSelection) -> WorkloadConfig {
         WorkloadConfig { operations }
+    }
+
+    fn enum_operation(values: &[&str], default: Option<&str>) -> OperationDescriptor {
+        OperationDescriptor {
+            name: "write".into(),
+            description: None,
+            kind: OperationKind::Write,
+            enabled_by_default: true,
+            default_weight: 1.0,
+            arguments: vec![OperationArgument {
+                name: "size".into(),
+                description: None,
+                kind: ArgumentKind::Enum,
+                values: values.iter().map(|value| (*value).into()).collect(),
+                required: true,
+                default: default.map(|value| ArgumentValue::String(value.into())),
+            }],
+        }
     }
 
     #[test]
@@ -418,6 +508,79 @@ mod tests {
         assert!(matches!(
             resolve_operation_mix(&wrong_type, &operations()),
             Err(WorkloadError::InvalidArgumentType { .. })
+        ));
+    }
+
+    #[test]
+    fn enum_arguments_accept_only_advertised_string_values() {
+        let advertised = vec![enum_operation(&["small", "large"], Some("small"))];
+        let defaults =
+            resolve_operation_mix(&workload(OperationSelection::AdapterDefaults), &advertised)
+                .unwrap();
+        assert_eq!(
+            defaults[0].arguments.get("size"),
+            Some(&ArgumentValue::String("small".into()))
+        );
+
+        let selected = workload(OperationSelection::Selected {
+            operations: vec![WeightedOperation {
+                name: "write".into(),
+                weight: 1.0,
+                arguments: BTreeMap::from([("size".into(), ArgumentValue::String("large".into()))]),
+            }],
+        });
+        assert_eq!(
+            resolve_operation_mix(&selected, &advertised).unwrap()[0]
+                .arguments
+                .get("size"),
+            Some(&ArgumentValue::String("large".into()))
+        );
+
+        let invalid = workload(OperationSelection::Selected {
+            operations: vec![WeightedOperation {
+                name: "write".into(),
+                weight: 1.0,
+                arguments: BTreeMap::from([(
+                    "size".into(),
+                    ArgumentValue::String("medium".into()),
+                )]),
+            }],
+        });
+        assert!(matches!(
+            resolve_operation_mix(&invalid, &advertised),
+            Err(WorkloadError::InvalidArgumentValue { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_enum_descriptors_are_rejected() {
+        for descriptor in [
+            enum_operation(&[], None),
+            enum_operation(&["small", "small"], Some("small")),
+            enum_operation(&["small", ""], Some("small")),
+        ] {
+            assert!(matches!(
+                resolve_operation_mix(
+                    &workload(OperationSelection::AdapterDefaults),
+                    &[descriptor]
+                ),
+                Err(WorkloadError::InvalidArgumentValues { .. })
+            ));
+        }
+
+        assert!(matches!(
+            resolve_operation_mix(
+                &workload(OperationSelection::AdapterDefaults),
+                &[enum_operation(&["small", "large"], Some("medium"))]
+            ),
+            Err(WorkloadError::InvalidArgumentDefault { .. })
+        ));
+
+        let mut non_enum = operations()[0].clone();
+        non_enum.arguments[0].values = vec!["zero".into(), "one".into()];
+        assert!(matches!(
+            resolve_operation_mix(&workload(OperationSelection::AdapterDefaults), &[non_enum]),
+            Err(WorkloadError::InvalidArgumentValues { .. })
         ));
     }
 
