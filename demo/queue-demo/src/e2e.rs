@@ -307,10 +307,6 @@ fn run_tcp_multi_client_dashboard(
         )
         .into());
     }
-    handle.execute(EngineCommand::Start {
-        run_id: configured.run_id,
-    })?;
-
     println!("multi-client dashboard ready: http://{bind}");
     let _processes = processes;
     loop {

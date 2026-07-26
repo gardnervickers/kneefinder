@@ -51,11 +51,10 @@
               <div class="editor-heading">
                 <div>
                   <span class="field-title" id="workload-editor-title">Discovered workload</span>
-                  <span class="hint">queried from every configured agent</span>
+                  <span class="hint">checked automatically for every configured agent</span>
                 </div>
-                <button id="query-agents" type="button">Query agents</button>
               </div>
-              <p id="agent-query-status" class="catalog-status">Configure an adapter or remote agent, then query it.</p>
+              <p id="agent-query-status" class="catalog-status">Enter an adapter or remote agent to connect automatically.</p>
               <div id="operation-catalog" class="operation-catalog">
                 <p class="empty">Operation schemas will appear here.</p>
               </div>
@@ -73,8 +72,7 @@
           </form>
 
           <div class="actions">
-            <button id="apply" class="primary">Apply configuration</button>
-            <button id="start">Start</button>
+            <button id="start" class="primary">Start</button>
             <button id="stop" class="danger">Stop</button>
           </div>
           <p id="form-message" class="message" aria-live="polite"></p>

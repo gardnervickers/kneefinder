@@ -9,6 +9,8 @@ let nextRequestId = 1;
 let configuredVariants = [];
 let formDirty = false;
 let queryInFlight = false;
+let configurationSyncTimer = null;
+let configurationSyncPending = false;
 
 const $ = (id) => document.getElementById(id);
 const svgNs = "http://www.w3.org/2000/svg";
@@ -225,17 +227,6 @@ function numberValue(id) {
   return value;
 }
 
-async function applyConfiguration() {
-  try {
-    const { snapshot, updated } = await persistConfiguration();
-    selectedRunId = snapshot.run_id;
-    loadConfiguredVariants(snapshot.config);
-    formDirty = false;
-    updateButtons();
-    showMessage(updated ? "Configuration updated." : "Run configured.", false);
-  } catch (error) { showMessage(error.message, true); }
-}
-
 async function persistConfiguration() {
   const config = readConfig();
   const run = selectedRun();
@@ -245,29 +236,54 @@ async function persistConfiguration() {
     : { command: "configure", config };
   const snapshot = await sendCommand(command);
   selectedRunId = snapshot.run_id;
-  return { snapshot, updated };
+  return snapshot;
 }
 
-async function queryAgents() {
-  if (queryInFlight) return;
+function scheduleConfigurationSync(delay = 650) {
+  if (configurationSyncTimer !== null) clearTimeout(configurationSyncTimer);
+  configurationSyncTimer = setTimeout(() => {
+    configurationSyncTimer = null;
+    synchronizeConfiguration();
+  }, delay);
+}
+
+function markConfigurationDirty() {
+  formDirty = true;
+  updateButtons();
+  scheduleConfigurationSync();
+}
+
+async function synchronizeConfiguration() {
+  if (queryInFlight) {
+    configurationSyncPending = true;
+    return;
+  }
   queryInFlight = true;
-  render();
-  showMessage("Querying configured agents…", false);
+  updateButtons();
+  showMessage("Saving configuration…", false);
   try {
-    const { snapshot } = await persistConfiguration();
-    const prepared = await sendCommand({ command: "prepare_agents", run_id: snapshot.run_id });
-    loadConfiguredVariants(prepared.config);
+    const snapshot = await persistConfiguration();
+    let current = snapshot;
+    if (snapshot.preparation.status !== "ready") {
+      showMessage("Connecting to configured agents…", false);
+      current = await sendCommand({ command: "prepare_agents", run_id: snapshot.run_id });
+    }
+    loadConfiguredVariants(current.config);
     formDirty = false;
-    const catalog = prepared.preparation.catalog;
+    const catalog = current.preparation.catalog;
     showMessage(
-      `Ready: ${catalog.agents.length} agent${catalog.agents.length === 1 ? "" : "s"}, ${catalog.operations.length} operation${catalog.operations.length === 1 ? "" : "s"}.`,
+      `Ready: ${catalog.agents.length} agent${catalog.agents.length === 1 ? "" : "s"} connected, ${catalog.operations.length} operation${catalog.operations.length === 1 ? "" : "s"} discovered.`,
       false,
     );
   } catch (error) {
-    showMessage(error.message, true);
+    showMessage(`Could not prepare agents: ${error.message}`, true);
   } finally {
     queryInFlight = false;
     render();
+    if (configurationSyncPending) {
+      configurationSyncPending = false;
+      scheduleConfigurationSync(0);
+    }
   }
 }
 
@@ -395,8 +411,8 @@ function renderWorkloadEditor() {
   } else {
     status.className = "catalog-status";
     status.textContent = run?.config.agents.length
-      ? "Agent endpoints changed or have not been queried yet."
-      : "Configure an adapter or remote agent, then query it.";
+      ? "Agent endpoints changed; waiting to connect automatically."
+      : "Enter an adapter or remote agent to connect automatically.";
   }
 
   const operations = [...(catalog?.operations || [])].sort((left, right) => {
@@ -444,9 +460,8 @@ function renderWorkloadEditor() {
     add.textContent = operation.enabled_by_default ? "Add variant" : "Add explicitly";
     add.addEventListener("click", () => {
       configuredVariants.push(variantFromDescriptor(operation));
-      formDirty = true;
+      markConfigurationDirty();
       renderWorkloadEditor();
-      updateButtons();
     });
     heading.append(identity, add);
     card.append(heading);
@@ -475,7 +490,7 @@ function renderWorkloadEditor() {
     const empty = document.createElement("p");
     empty.className = "empty";
     empty.textContent = catalog
-      ? "Safe adapter defaults are active. Querying from this form materializes them as editable variants."
+      ? "Safe adapter defaults are active. Editing the form materializes them as variants."
       : "Safe adapter defaults will be selected after discovery.";
     variants.append(empty);
     return;
@@ -498,9 +513,8 @@ function renderWorkloadEditor() {
     remove.textContent = "Remove";
     remove.addEventListener("click", () => {
       configuredVariants.splice(index, 1);
-      formDirty = true;
+      markConfigurationDirty();
       renderWorkloadEditor();
-      updateButtons();
     });
     heading.append(title, remove);
     card.append(heading);
@@ -527,8 +541,7 @@ function renderWorkloadEditor() {
           variant.arguments[argument.name] = input.value;
         }
         title.textContent = formatVariantName(variant.name, variant.arguments);
-        formDirty = true;
-        updateButtons();
+        markConfigurationDirty();
       });
       label.append(input);
       fields.append(label);
@@ -542,8 +555,7 @@ function renderWorkloadEditor() {
     weightInput.value = variant.weight;
     weightInput.addEventListener("input", () => {
       variant.weight = Number(weightInput.value);
-      formDirty = true;
-      updateButtons();
+      markConfigurationDirty();
     });
     weight.append(weightInput);
     fields.append(weight);
@@ -578,7 +590,7 @@ function renderMetrics() {
   $("metric-agents").textContent = run ? String(agents.length) : "—";
   $("metric-agent-detail").textContent = run
     ? [
-      run.preparation?.status === "ready" ? "queried" : run.preparation?.status || "unprepared",
+      run.preparation?.status === "ready" ? "connected" : run.preparation?.status || "unprepared",
       `${tcpAgents} TCP`,
       `${colocatedAgents} colocated`,
     ].filter((entry) => !entry.startsWith("0 ")).join(" · ") || "No agents"
@@ -594,7 +606,7 @@ function stageName(state) {
   if (state.state === "measuring") return `Stage: ${state.stage}`;
   if (state.state === "completed") return state.outcome.classification.replaceAll("_", " ");
   if (state.state === "configured") {
-    return selectedRun()?.preparation?.status === "ready" ? "Agents ready" : "Query agents before starting";
+    return selectedRun()?.preparation?.status === "ready" ? "Agents ready" : "Connecting to agents";
   }
   return stateName(state);
 }
@@ -717,21 +729,13 @@ function updateButtons() {
     ["starting", "measuring", "stopping"].includes(candidate.state?.state)
   );
   const anotherRunActive = Boolean(activeRun && activeRun.run_id !== run?.run_id);
-  $("apply").disabled = !connected;
-  $("query-agents").disabled = !connected || queryInFlight || anotherRunActive || (run && state !== "configured");
-  $("query-agents").textContent = prepared ? "Refresh catalog" : "Query agents";
   $("start").disabled = !connected || anotherRunActive || state !== "configured" || !prepared || formDirty || queryInFlight;
   $("stop").disabled = !connected || !["starting", "measuring"].includes(state);
 }
 
-$("apply").addEventListener("click", applyConfiguration);
-$("query-agents").addEventListener("click", queryAgents);
 $("start").addEventListener("click", startRun);
 $("stop").addEventListener("click", stopRun);
 $("config-form").addEventListener("submit", (event) => event.preventDefault());
-$("config-form").addEventListener("input", () => {
-  formDirty = true;
-  updateButtons();
-});
+$("config-form").addEventListener("input", markConfigurationDirty);
 connect();
 render();

@@ -10,7 +10,7 @@ use std::{
 
 use kneefinder::{
     config::RunConfig,
-    engine::{EngineCommand, RunSnapshot},
+    engine::{AgentPreparation, EngineCommand, RunSnapshot},
     frontends::web::ApiSnapshot,
     measurement::RunState,
     protocol::RunId,
@@ -38,7 +38,32 @@ fn dashboard_completes_adjusts_stops_and_reruns_on_persistent_agents() {
             .expect("dashboard demo should start"),
     );
 
-    let first = wait_for_run(&address, RunId(1), Duration::from_secs(20), |state| {
+    let ready = wait_for_snapshot(&address, RunId(1), Duration::from_secs(10), |run| {
+        run.state == RunState::Configured
+            && matches!(&run.preparation, AgentPreparation::Ready { .. })
+    });
+    thread::sleep(Duration::from_millis(300));
+    let still_idle = snapshot(&address)
+        .runs
+        .into_iter()
+        .find(|run| run.run_id == ready.run_id)
+        .expect("initial configured run should remain visible");
+    assert_eq!(still_idle.state, RunState::Configured);
+    assert!(
+        snapshot(&address)
+            .results
+            .iter()
+            .all(|result| result.run_id != ready.run_id),
+        "the dashboard must not execute a workload before Start"
+    );
+    command(
+        &address,
+        &EngineCommand::Start {
+            run_id: ready.run_id,
+        },
+    );
+
+    let first = wait_for_run(&address, ready.run_id, Duration::from_secs(20), |state| {
         matches!(state, RunState::Completed { .. })
     });
     let first_results = run_result(&snapshot(&address), first.run_id);
@@ -147,13 +172,22 @@ fn wait_for_run(
     timeout: Duration,
     predicate: impl Fn(&RunState) -> bool,
 ) -> RunSnapshot {
+    wait_for_snapshot(address, run_id, timeout, |run| predicate(&run.state))
+}
+
+fn wait_for_snapshot(
+    address: &str,
+    run_id: RunId,
+    timeout: Duration,
+    predicate: impl Fn(&RunSnapshot) -> bool,
+) -> RunSnapshot {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(run) = snapshot(address)
             .runs
             .into_iter()
             .find(|run| run.run_id == run_id)
-            && predicate(&run.state)
+            && predicate(&run)
         {
             return run;
         }

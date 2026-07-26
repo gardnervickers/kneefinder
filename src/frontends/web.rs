@@ -588,13 +588,16 @@ mod tests {
 
     #[test]
     fn browser_uses_the_discovery_driven_workload_editor() {
-        assert!(INDEX_HTML.contains(r#"id="query-agents""#));
+        assert!(!INDEX_HTML.contains(r#"id="query-agents""#));
+        assert!(!INDEX_HTML.contains(r#"id="apply""#));
         assert!(INDEX_HTML.contains(r#"id="operation-catalog""#));
         assert!(INDEX_HTML.contains(r#"id="configured-workload""#));
         assert!(!INDEX_HTML.contains(r#"id="operations""#));
         assert!(APP_JS.contains(r#"event.event === "run_preparation_changed""#));
         assert!(APP_JS.contains(r#"argument.kind === "integer""#));
         assert!(APP_JS.contains(r#""Add explicitly""#));
+        assert!(APP_JS.contains("scheduleConfigurationSync"));
+        assert!(APP_JS.contains("Could not prepare agents"));
     }
 
     #[test]

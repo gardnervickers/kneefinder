@@ -55,13 +55,14 @@ podman-compose -f demo/queue-demo/compose.yaml up --build
 
 Open <http://127.0.0.1:8080>. The coordinator waits for both agents, initiates
 both TCP sessions, queries their operation catalogs, validates that their
-schemas match, and exposes the discovered workload in the browser. It then
-schedules seven aggregate offered-load levels across the two agents while the
-dashboard updates with throughput, latency, reliability, and per-variant
-results. Around the knee, goodput flattens while latency rises sharply. After
-that run, edit the load levels, timings, strategy, or operation variants; query
-the agents; and start another run. Stop ends the active run while leaving both
-agents available for the next one.
+schemas match, and exposes the discovered workload in the browser. It does not
+start workload traffic automatically. Review or edit the prepared seven-level
+plan, then press Start. The dashboard updates with throughput, latency,
+reliability, and per-variant results. Around the knee, goodput flattens while
+latency rises sharply. After that run, edit the load levels, timings, strategy,
+operation variants, or remote-agent list. The dashboard saves the form and
+checks agent connectivity automatically; press Start when it reports ready.
+Stop ends the active run while leaving both agents available for the next one.
 
 The agents only listen on the private Compose network; they never dial or
 register with the coordinator. They remain available for subsequent runs

@@ -23,12 +23,14 @@ podman-compose -f demo/queue-demo/compose.yaml up --build
 
 Open <http://127.0.0.1:8080>. The coordinator waits for both agent containers,
 opens both TCP sessions, discovers and validates their shared operation schema,
-and retains the initialized cohort. It runs a seven-level aggregate sweep and
-streams the real phase results to the dashboard. The browser workload editor
-shows the typed four-variant catalog discovered from the agents. When it
-finishes, change the settings, query the agents, and press Start to execute a
-new run. Stop completes the active run as stopped and leaves the agents ready
-to be queried again.
+and retains the initialized cohort. The browser workload editor shows the typed
+four-variant catalog discovered from the agents, but no workload starts
+automatically. Review or edit the prepared seven-level aggregate sweep, then
+press Start to stream real phase results to the dashboard. When it finishes,
+change the settings or remote-agent list. The dashboard saves and checks agent
+connectivity automatically; press Start when it reports ready. Stop completes
+the active run as stopped and leaves the agents available for another automatic
+connectivity check.
 
 Both agents are isolated services on the private Compose network. The
 coordinator is always the side that connects, and the dashboard is published
