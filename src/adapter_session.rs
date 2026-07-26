@@ -666,6 +666,18 @@ impl<T: AdapterTransport> AdapterSession<T> {
         send.and(close).map_err(SessionError::Transport)
     }
 
+    /// Closes this coordinator-owned session without asking a remote agent
+    /// process to terminate. A colocated subprocess observes EOF and exits;
+    /// a persistent TCP agent returns to accepting coordinator connections.
+    pub fn disconnect(&mut self) -> Result<(), SessionError> {
+        if self.state == SessionState::Closed {
+            return Ok(());
+        }
+        let close = self.transport.close(self.options.shutdown_timeout);
+        self.state = SessionState::Closed;
+        close.map_err(SessionError::Transport)
+    }
+
     fn require_state(&self, expected: SessionState) -> Result<(), SessionError> {
         if self.state == expected {
             Ok(())
@@ -1151,6 +1163,22 @@ mod tests {
         session.initialize(RunId(7), Value::Null).unwrap();
         session.shutdown().unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn disconnect_closes_the_transport_without_sending_shutdown() {
+        let (transport, sent) = FakeTransport::new(vec![ready(PROTOCOL_VERSION)]);
+        let mut session = AdapterSession::new(transport, SessionOptions::default());
+
+        session.initialize(RunId(7), Value::Null).unwrap();
+        session.disconnect().unwrap();
+
+        assert_eq!(session.state(), SessionState::Closed);
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(matches!(
+            sent.lock().unwrap().first(),
+            Some(ControllerMessage::Initialize { .. })
+        ));
     }
 
     #[test]

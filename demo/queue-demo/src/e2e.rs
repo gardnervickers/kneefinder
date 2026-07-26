@@ -98,7 +98,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         rows.push(row);
     }
 
-    agents.shutdown()?;
+    agents.disconnect()?;
     print_rows(&rows, expected_knee);
     print_variant_stats(&rows);
     Ok(())
@@ -354,9 +354,13 @@ fn run_tcp_multi_client_dashboard(
         }
     }
 
-    agents.shutdown()?;
-    for process in &mut processes {
-        process.wait()?;
+    if processes.is_empty() {
+        agents.disconnect()?;
+    } else {
+        agents.shutdown()?;
+        for process in &mut processes {
+            process.wait()?;
+        }
     }
     let expected_knee = theoretical_knee(WORKERS);
     let completed = if stop_requested {

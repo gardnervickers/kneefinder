@@ -56,6 +56,11 @@ reply or stream results on a coordinator-established session, but every
 session and unit of work originates from the coordinator. Preserve this call
 direction in local, Docker, Kubernetes, and EC2 deployments.
 
+Normal run completion or stop disconnects the coordinator-owned session and
+leaves a remote agent listening for another session. Sending the protocol
+`Shutdown` command is an explicit agent-process termination action, not normal
+run cleanup. Do not add a one-shot TCP agent mode.
+
 Do not include adapter IPC time in native client latency. Batching and dispatch
 lag exist so the load generator cannot silently become the bottleneck.
 

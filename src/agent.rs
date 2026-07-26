@@ -90,6 +90,11 @@ pub trait WorkloadAgent: Send {
 
     fn cancel(&mut self, phase_id: PhaseId) -> Result<(), AgentError>;
 
+    /// Ends the current coordinator-owned session without terminating a
+    /// separately deployed agent process.
+    fn disconnect(&mut self) -> Result<(), AgentError>;
+
+    /// Explicitly asks the agent process to terminate.
     fn shutdown(&mut self) -> Result<(), AgentError>;
 
     fn diagnostics(&self) -> Vec<String>;
@@ -171,6 +176,10 @@ impl<T: AdapterTransport> WorkloadAgent for SessionAgent<T> {
 
     fn cancel(&mut self, phase_id: PhaseId) -> Result<(), AgentError> {
         self.session.cancel(phase_id).map_err(Into::into)
+    }
+
+    fn disconnect(&mut self) -> Result<(), AgentError> {
+        self.session.disconnect().map_err(Into::into)
     }
 
     fn shutdown(&mut self) -> Result<(), AgentError> {
@@ -381,6 +390,10 @@ impl AgentCohort {
         self.for_each_concurrently(move |agent| agent.cancel(phase_id))
     }
 
+    pub fn disconnect(&mut self) -> Result<(), CohortError> {
+        self.for_each_concurrently(|agent| agent.disconnect())
+    }
+
     pub fn shutdown(&mut self) -> Result<(), CohortError> {
         self.for_each_concurrently(|agent| agent.shutdown())
     }
@@ -576,6 +589,10 @@ mod tests {
         }
 
         fn cancel(&mut self, _phase_id: PhaseId) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        fn disconnect(&mut self) -> Result<(), AgentError> {
             Ok(())
         }
 

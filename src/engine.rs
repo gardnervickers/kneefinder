@@ -348,7 +348,7 @@ impl EngineInner {
                 .expect("prepared cohort mutex poisoned")
                 .remove(&run_id)
         {
-            let _ = cohort.shutdown();
+            let _ = cohort.disconnect();
         }
         self.publish(EngineEvent::RunConfigurationUpdated {
             snapshot: snapshot.clone(),
@@ -392,7 +392,7 @@ impl EngineInner {
             .expect("prepared cohort mutex poisoned")
             .remove(&run_id)
         {
-            let _ = cohort.shutdown();
+            let _ = cohort.disconnect();
         }
 
         let prepared =

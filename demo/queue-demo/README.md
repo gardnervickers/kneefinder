@@ -24,7 +24,9 @@ Both agents are isolated services on the private Compose network. The
 coordinator is always the side that connects, and the dashboard is published
 to host loopback only. The containers use the same queue-demo binary with
 different commands, so this is also an executable example of independently
-deploying the coordinator and workload agents.
+deploying the coordinator and workload agents. Each agent keeps listening after
+a run closes its protocol session, allowing the browser to query the same
+endpoints again for subsequent runs.
 
 After stopping the foreground process with `Ctrl+C`, remove the containers and
 network:
@@ -94,13 +96,15 @@ The adapter/service can also be run directly:
 cargo run --manifest-path demo/queue-demo/Cargo.toml --release -- adapter
 ```
 
-Or expose the same protocol over a persistent TCP connection:
+Or expose the same protocol over a persistent TCP agent endpoint:
 
 ```console
 cargo run --manifest-path demo/queue-demo/Cargo.toml --release -- adapter-tcp 127.0.0.1:9000
 ```
 
-The TCP agent listens; the coordinator is always the side that connects.
+The TCP agent accepts sequential coordinator-owned sessions and keeps listening
+when a session disconnects. It exits only when a coordinator sends the explicit
+protocol `Shutdown` command. The coordinator is always the side that connects.
 
 The adapter expects an `initialize` message containing its queue configuration:
 

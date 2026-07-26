@@ -111,6 +111,12 @@ results on a session the coordinator opened. Docker DNS names, EC2 private
 addresses, or Kubernetes headless-service/pod addresses may supply those
 endpoints without introducing scheduler-specific discovery into the core.
 
+Completing or stopping a run disconnects its coordinator-owned sessions; it
+does not terminate separately deployed agent processes. A remote agent returns
+to listening for the next coordinator session. The protocol `Shutdown` message
+is reserved for an explicit agent-termination action rather than ordinary run
+cleanup.
+
 Cohort membership is frozen for a run. The coordinator divides aggregate load
 deterministically and sends every member the same absolute phase start. A lost
 or late agent invalidates the phase; its allocation is never silently moved to

@@ -55,9 +55,10 @@ dashboard updates with throughput, latency, reliability, and per-variant
 results. Around the knee, goodput flattens while latency rises sharply.
 
 The agents only listen on the private Compose network; they never dial or
-register with the coordinator. The dashboard is published on loopback only.
-When finished, stop the foreground process with `Ctrl+C` and remove the demo
-containers:
+register with the coordinator. They remain available for subsequent runs
+configured in the dashboard, even after a prior run disconnects its sessions.
+The dashboard is published on loopback only. When finished, stop the foreground
+process with `Ctrl+C` and remove the demo containers:
 
 ```console
 docker compose -f demo/queue-demo/compose.yaml down
