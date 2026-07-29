@@ -63,6 +63,9 @@ impl RunState {
                     outcome: outcome.clone(),
                 }
             }
+            (Self::Measuring { .. }, RunCompleted { outcome }) => Self::Completed {
+                outcome: outcome.clone(),
+            },
             (Self::Starting, StopRequested) => Self::Stopping {
                 interrupted_stage: None,
             },
@@ -93,10 +96,19 @@ pub enum RunEvent {
     BaselineEstablished,
     SaturationBracketed,
     BracketRefined,
-    CandidateValidated { outcome: RunOutcome },
+    CandidateValidated {
+        outcome: RunOutcome,
+    },
+    /// Completes a fixed execution whose analysis does not require traversing
+    /// the adaptive bracket/refinement lifecycle.
+    RunCompleted {
+        outcome: RunOutcome,
+    },
     StopRequested,
     AdapterStopped,
-    Failed { message: String },
+    Failed {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

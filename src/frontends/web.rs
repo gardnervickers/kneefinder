@@ -458,9 +458,9 @@ fn engine_error_response(request_id: Option<String>, error: EngineError) -> Resp
         | EngineError::PreparedCohortUnavailable(_)
         | EngineError::InvalidTransition { .. } => StatusCode::CONFLICT,
         EngineError::AgentPreparationFailed { .. } => StatusCode::BAD_GATEWAY,
-        EngineError::RunIdExhausted | EngineError::RevisionExhausted(_) => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        EngineError::ExecutionSpawnFailed { .. }
+        | EngineError::RunIdExhausted
+        | EngineError::RevisionExhausted(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let message = ServerMessage::CommandRejected {
         request_id,
@@ -479,6 +479,7 @@ fn engine_error_code(error: &EngineError) -> &'static str {
         EngineError::RunAlreadyActive { .. } => "run_already_active",
         EngineError::PreparedCohortUnavailable(_) => "prepared_cohort_unavailable",
         EngineError::AgentPreparationFailed { .. } => "agent_preparation_failed",
+        EngineError::ExecutionSpawnFailed { .. } => "execution_spawn_failed",
         EngineError::InvalidWorkload { .. } => "invalid_workload",
         EngineError::InvalidTransition { .. } => "invalid_transition",
         EngineError::RunIdExhausted => "run_id_exhausted",

@@ -49,7 +49,12 @@ fn dashboard_completes_adjusts_stops_and_reruns_on_persistent_agents() {
         .operations
         .iter()
         .find(|operation| operation.name == "write")
-        .and_then(|operation| operation.arguments.iter().find(|argument| argument.name == "value"))
+        .and_then(|operation| {
+            operation
+                .arguments
+                .iter()
+                .find(|argument| argument.name == "value")
+        })
         .expect("queue demo should advertise its write value argument");
     assert_eq!(size.kind, ArgumentKind::Enum);
     assert_eq!(size.values, ["small", "large"]);
@@ -145,12 +150,9 @@ fn dashboard_completes_adjusts_stops_and_reruns_on_persistent_agents() {
     rerun.phases.measurement_ms = 300;
     rerun.phases.recovery_ms = 0;
     let rerun = configure_prepare_start(&address, rerun);
-    wait_for_run(
-        &address,
-        rerun.run_id,
-        Duration::from_secs(10),
-        |state| matches!(state, RunState::Completed { .. }),
-    );
+    wait_for_run(&address, rerun.run_id, Duration::from_secs(10), |state| {
+        matches!(state, RunState::Completed { .. })
+    });
     let rerun_results = run_result(&snapshot(&address), rerun.run_id);
     assert_eq!(rerun_results.phases.len(), 1);
     assert_eq!(rerun_results.phases[0].report.offered_rate, 160.0);
@@ -211,10 +213,7 @@ fn wait_for_snapshot(
     }
 }
 
-fn run_result(
-    snapshot: &ApiSnapshot,
-    run_id: RunId,
-) -> kneefinder::frontends::web::RunResults {
+fn run_result(snapshot: &ApiSnapshot, run_id: RunId) -> kneefinder::frontends::web::RunResults {
     snapshot
         .results
         .iter()
@@ -231,8 +230,9 @@ fn snapshot(address: &str) -> ApiSnapshot {
 fn command(address: &str, command: &EngineCommand) -> RunSnapshot {
     let body = serde_json::to_string(command).unwrap();
     let response = http(address, "POST", "/api/v1/commands", Some(&body));
-    serde_json::from_str(&response)
-        .unwrap_or_else(|error| panic!("command response should be a run snapshot: {error}: {response}"))
+    serde_json::from_str(&response).unwrap_or_else(|error| {
+        panic!("command response should be a run snapshot: {error}: {response}")
+    })
 }
 
 fn http(address: &str, method: &str, path: &str, body: Option<&str>) -> String {

@@ -17,7 +17,8 @@ use crate::{
         OperationSelection, PhaseConfig, Preset, RunConfig, Strategy, WeightedOperation,
         WorkloadConfig,
     },
-    engine::{EngineCommand, EngineError, EngineHandle},
+    engine::{EngineCommand, EngineError, EngineEvent, EngineHandle},
+    measurement::RunState,
     protocol::ArgumentValue,
 };
 
@@ -435,6 +436,7 @@ impl Frontend for CliFrontend {
         match self.cli.command {
             Command::Run(arguments) => {
                 let config = arguments.resolve().map_err(CliFrontendError::Config)?;
+                let events = engine.subscribe();
                 let snapshot = engine.execute(EngineCommand::Configure {
                     config: Box::new(config),
                 })?;
@@ -450,7 +452,46 @@ impl Frontend for CliFrontend {
                 engine.execute(EngineCommand::Start {
                     run_id: snapshot.run_id,
                 })?;
-                Err(CliFrontendError::ExecutionUnavailable)
+                loop {
+                    match events
+                        .recv()
+                        .map_err(|_| CliFrontendError::EventStreamClosed)?
+                    {
+                        EngineEvent::PhaseStats {
+                            run_id,
+                            phase_id,
+                            report,
+                        } if run_id == snapshot.run_id => {
+                            eprintln!(
+                                "phase {}: offered {:.1} ops/s, goodput {:.1} ops/s, p95 {}",
+                                phase_id.0,
+                                report.offered_rate,
+                                report.goodput_rate,
+                                report.stats.overall.client_latency_ns.p95.map_or_else(
+                                    || "n/a".into(),
+                                    |value| format!("{:.2} ms", value as f64 / 1_000_000.0)
+                                )
+                            );
+                        }
+                        EngineEvent::RunStateChanged {
+                            snapshot: completed,
+                            ..
+                        } if completed.run_id == snapshot.run_id
+                            && completed.state.is_terminal() =>
+                        {
+                            match &completed.state {
+                                RunState::Failed { message } => {
+                                    return Err(CliFrontendError::RunFailed(message.clone()));
+                                }
+                                _ => {
+                                    println!("{}", serde_json::to_string_pretty(&completed)?);
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
             #[cfg(feature = "web")]
             Command::Serve(arguments) => {
@@ -468,7 +509,8 @@ pub enum CliFrontendError {
     Serialization(serde_json::Error),
     #[cfg(feature = "web")]
     Web(WebFrontendError),
-    ExecutionUnavailable,
+    EventStreamClosed,
+    RunFailed(String),
 }
 
 impl fmt::Display for CliFrontendError {
@@ -479,9 +521,10 @@ impl fmt::Display for CliFrontendError {
             Self::Serialization(error) => error.fmt(formatter),
             #[cfg(feature = "web")]
             Self::Web(error) => error.fmt(formatter),
-            Self::ExecutionUnavailable => formatter.write_str(
-                "the run executor is not implemented yet; use --print-config to inspect the resolved plan",
-            ),
+            Self::EventStreamClosed => {
+                formatter.write_str("the engine event stream closed before the run completed")
+            }
+            Self::RunFailed(message) => write!(formatter, "run failed: {message}"),
         }
     }
 }

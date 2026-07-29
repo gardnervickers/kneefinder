@@ -16,7 +16,7 @@ let selectedPreset = "quick";
 const $ = (id) => document.getElementById(id);
 const svgNs = "http://www.w3.org/2000/svg";
 const strategyDescriptions = Object.freeze({
-  adaptive: "Increases load to bracket saturation, then refines around the likely knee.",
+  adaptive: "Currently increases load geometrically through the configured bounds. Automatic knee bracketing and refinement are planned next.",
   sweep: "Runs each configured load level from low to high for a predictable capacity curve.",
   "up-down": "Runs load upward and then downward to reveal hysteresis: different behavior while load is falling.",
 });
@@ -648,7 +648,7 @@ function progressForRun(run) {
 
   if (state === "measuring" || state === "stopping") {
     const stopping = state === "stopping";
-    if (run.config.strategy !== "adaptive" && planned) {
+    if (planned) {
       const activePhase = Math.min(completed + 1, planned);
       const label = stopping
         ? `${completed} of ${planned} measurements complete · stopping`

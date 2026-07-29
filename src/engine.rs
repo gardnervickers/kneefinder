@@ -5,8 +5,10 @@ use std::{
     fmt,
     sync::{
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvError, RecvTimeoutError, TryRecvError},
     },
+    thread,
     time::Duration,
 };
 
@@ -16,6 +18,7 @@ use serde_json::Value;
 use crate::{
     agent::{AgentCohort, CohortReady},
     config::RunConfig,
+    executor::{ExecutionSink, ExecutorCompletion, RunExecutor},
     measurement::{RunEvent, RunState, TransitionError},
     protocol::{PhaseId, RunId},
     stats::PhaseReport,
@@ -101,7 +104,14 @@ pub struct Engine {
 impl Engine {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(EngineInner::default()),
+            inner: Arc::new(EngineInner::new(true)),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_manual() -> Self {
+        Self {
+            inner: Arc::new(EngineInner::new(false)),
         }
     }
 
@@ -164,9 +174,7 @@ impl EngineHandle {
             }
             EngineCommand::PrepareAgents { run_id } => self.inner.prepare_agents(run_id),
             EngineCommand::Start { run_id } => self.inner.start(run_id),
-            EngineCommand::Stop { run_id } => {
-                self.inner.transition(run_id, RunEvent::StopRequested)
-            }
+            EngineCommand::Stop { run_id } => self.inner.stop(run_id),
         }
     }
 
@@ -225,15 +233,27 @@ impl EventSubscription {
     }
 }
 
-#[derive(Default)]
 struct EngineInner {
+    execution_enabled: bool,
     mutation: Mutex<()>,
     registry: Mutex<Registry>,
     prepared: Mutex<BTreeMap<RunId, AgentCohort>>,
+    executions: Mutex<BTreeMap<RunId, ExecutionControl>>,
     subscribers: Mutex<Vec<mpsc::Sender<EngineEvent>>>,
 }
 
 impl EngineInner {
+    fn new(execution_enabled: bool) -> Self {
+        Self {
+            execution_enabled,
+            mutation: Mutex::new(()),
+            registry: Mutex::new(Registry::default()),
+            prepared: Mutex::new(BTreeMap::new()),
+            executions: Mutex::new(BTreeMap::new()),
+            subscribers: Mutex::new(Vec::new()),
+        }
+    }
+
     fn configure(&self, config: RunConfig) -> Result<RunSnapshot, EngineError> {
         let _mutation = self
             .mutation
@@ -474,8 +494,11 @@ impl EngineInner {
         Ok(snapshot)
     }
 
-    fn start(&self, run_id: RunId) -> Result<RunSnapshot, EngineError> {
-        {
+    fn start(self: &Arc<Self>, run_id: RunId) -> Result<RunSnapshot, EngineError> {
+        if !self.execution_enabled {
+            return self.transition(run_id, RunEvent::StartRequested);
+        }
+        let (config, catalog) = {
             let registry = self
                 .registry
                 .lock()
@@ -484,23 +507,169 @@ impl EngineInner {
                 .runs
                 .get(&run_id)
                 .ok_or(EngineError::RunNotFound(run_id))?;
-            if !run.config.agents.is_empty() {
-                let AgentPreparation::Ready { catalog } = &run.preparation else {
-                    return Err(EngineError::AgentsNotPrepared(run_id));
-                };
-                resolve_operation_mix(&run.config.workload, &catalog.operations)
-                    .map_err(|source| EngineError::InvalidWorkload { run_id, source })?;
-                if !self
-                    .prepared
-                    .lock()
-                    .expect("prepared cohort mutex poisoned")
-                    .contains_key(&run_id)
-                {
-                    return Err(EngineError::PreparedCohortUnavailable(run_id));
-                }
+            if run.config.agents.is_empty() {
+                return Err(EngineError::NoAgentsConfigured(run_id));
             }
+            let AgentPreparation::Ready { catalog } = &run.preparation else {
+                return Err(EngineError::AgentsNotPrepared(run_id));
+            };
+            resolve_operation_mix(&run.config.workload, &catalog.operations)
+                .map_err(|source| EngineError::InvalidWorkload { run_id, source })?;
+            if !self
+                .prepared
+                .lock()
+                .expect("prepared cohort mutex poisoned")
+                .contains_key(&run_id)
+            {
+                return Err(EngineError::PreparedCohortUnavailable(run_id));
+            }
+            (run.config.clone(), catalog.clone())
+        };
+
+        let snapshot = self.transition(run_id, RunEvent::StartRequested)?;
+        let Some(mut cohort) = self
+            .prepared
+            .lock()
+            .expect("prepared cohort mutex poisoned")
+            .remove(&run_id)
+        else {
+            let _ = self.transition(
+                run_id,
+                RunEvent::Failed {
+                    message: EngineError::PreparedCohortUnavailable(run_id).to_string(),
+                },
+            );
+            return Err(EngineError::PreparedCohortUnavailable(run_id));
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        self.executions
+            .lock()
+            .expect("execution registry mutex poisoned")
+            .insert(
+                run_id,
+                ExecutionControl {
+                    stop: Arc::clone(&stop),
+                },
+            );
+        let inner = Arc::clone(self);
+        let spawn = thread::Builder::new()
+            .name(format!("kneefinder-run-{}", run_id.0))
+            .spawn(move || {
+                let mut sink = EngineExecutionSink {
+                    inner: Arc::clone(&inner),
+                    run_id,
+                };
+                let result = RunExecutor::default().execute(
+                    &config,
+                    &catalog,
+                    &mut cohort,
+                    &stop,
+                    &mut sink,
+                );
+                let disconnect = cohort.disconnect();
+                if let Err(error) = disconnect {
+                    let state = inner
+                        .registry
+                        .lock()
+                        .expect("engine registry mutex poisoned")
+                        .runs
+                        .get(&run_id)
+                        .map(|run| run.state.clone());
+                    if let Some(state) = state
+                        && !state.is_terminal()
+                    {
+                        let _ = inner.transition(
+                            run_id,
+                            RunEvent::Failed {
+                                message: format!("failed to disconnect workload agents: {error}"),
+                            },
+                        );
+                    }
+                } else if let Err(error) = result {
+                    let state = inner
+                        .registry
+                        .lock()
+                        .expect("engine registry mutex poisoned")
+                        .runs
+                        .get(&run_id)
+                        .map(|run| run.state.clone());
+                    match state {
+                        Some(RunState::Stopping { .. }) => {
+                            let _ = inner.transition(run_id, RunEvent::AdapterStopped);
+                        }
+                        Some(state) if !state.is_terminal() => {
+                            let _ = inner.transition(
+                                run_id,
+                                RunEvent::Failed {
+                                    message: error.to_string(),
+                                },
+                            );
+                        }
+                        _ => {}
+                    }
+                } else if let Ok(completion) = result {
+                    let state = inner
+                        .registry
+                        .lock()
+                        .expect("engine registry mutex poisoned")
+                        .runs
+                        .get(&run_id)
+                        .map(|run| run.state.clone());
+                    match (state, completion) {
+                        (Some(RunState::Stopping { .. }), _) => {
+                            let _ = inner.transition(run_id, RunEvent::AdapterStopped);
+                        }
+                        (Some(state), ExecutorCompletion::Completed(outcome))
+                            if !state.is_terminal() =>
+                        {
+                            let _ = inner.transition(run_id, RunEvent::RunCompleted { outcome });
+                        }
+                        (Some(state), ExecutorCompletion::Stopped) if !state.is_terminal() => {
+                            let _ = inner.transition(
+                                run_id,
+                                RunEvent::Failed {
+                                    message: "executor stopped without a frontend stop request"
+                                        .into(),
+                                },
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                inner
+                    .executions
+                    .lock()
+                    .expect("execution registry mutex poisoned")
+                    .remove(&run_id);
+            });
+        if let Err(source) = spawn {
+            self.executions
+                .lock()
+                .expect("execution registry mutex poisoned")
+                .remove(&run_id);
+            let message = source.to_string();
+            let _ = self.transition(
+                run_id,
+                RunEvent::Failed {
+                    message: message.clone(),
+                },
+            );
+            return Err(EngineError::ExecutionSpawnFailed { run_id, message });
         }
-        self.transition(run_id, RunEvent::StartRequested)
+        Ok(snapshot)
+    }
+
+    fn stop(&self, run_id: RunId) -> Result<RunSnapshot, EngineError> {
+        let snapshot = self.transition(run_id, RunEvent::StopRequested)?;
+        if let Some(execution) = self
+            .executions
+            .lock()
+            .expect("execution registry mutex poisoned")
+            .get(&run_id)
+        {
+            execution.stop.store(true, Ordering::Release);
+        }
+        Ok(snapshot)
     }
 
     fn publish(&self, event: EngineEvent) {
@@ -535,6 +704,30 @@ impl EngineInner {
             report,
         });
         Ok(())
+    }
+}
+
+struct ExecutionControl {
+    stop: Arc<AtomicBool>,
+}
+
+struct EngineExecutionSink {
+    inner: Arc<EngineInner>,
+    run_id: RunId,
+}
+
+impl ExecutionSink for EngineExecutionSink {
+    fn record_run_event(&mut self, event: RunEvent) -> Result<(), String> {
+        self.inner
+            .transition(self.run_id, event)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn record_phase_stats(&mut self, phase_id: PhaseId, report: PhaseReport) -> Result<(), String> {
+        self.inner
+            .phase_stats(self.run_id, phase_id, report)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -577,6 +770,10 @@ pub enum EngineError {
     },
     PreparedCohortUnavailable(RunId),
     AgentPreparationFailed {
+        run_id: RunId,
+        message: String,
+    },
+    ExecutionSpawnFailed {
         run_id: RunId,
         message: String,
     },
@@ -625,6 +822,13 @@ impl fmt::Display for EngineError {
                 write!(
                     formatter,
                     "failed to prepare agents for run {}: {message}",
+                    run_id.0
+                )
+            }
+            Self::ExecutionSpawnFailed { run_id, message } => {
+                write!(
+                    formatter,
+                    "failed to start run {} executor: {message}",
                     run_id.0
                 )
             }
@@ -775,7 +979,7 @@ mod tests {
 
     #[test]
     fn multiple_frontends_receive_the_same_ordered_events() {
-        let engine = Engine::new();
+        let engine = Engine::new_manual();
         let handle = engine.handle();
         let cli_events = handle.subscribe();
         let web_events = handle.subscribe();
@@ -799,7 +1003,7 @@ mod tests {
 
     #[test]
     fn runtime_events_update_snapshots_visible_to_frontends() {
-        let engine = Engine::new();
+        let engine = Engine::new_manual();
         let handle = engine.handle();
         let run = handle
             .execute(EngineCommand::Configure {
@@ -825,7 +1029,7 @@ mod tests {
 
     #[test]
     fn only_one_run_can_own_workload_agents_at_a_time() {
-        let engine = Engine::new();
+        let engine = Engine::new_manual();
         let handle = engine.handle();
         let first = handle
             .execute(EngineCommand::Configure {
@@ -865,7 +1069,7 @@ mod tests {
 
     #[test]
     fn invalid_frontend_command_does_not_publish_an_event() {
-        let engine = Engine::new();
+        let engine = Engine::new_manual();
         let handle = engine.handle();
         let events = handle.subscribe();
 
@@ -879,7 +1083,7 @@ mod tests {
 
     #[test]
     fn a_configured_run_can_be_adjusted_but_a_started_run_cannot() {
-        let engine = Engine::new();
+        let engine = Engine::new_manual();
         let handle = engine.handle();
         let events = handle.subscribe();
         let run = handle
@@ -918,7 +1122,7 @@ mod tests {
 
     #[test]
     fn phase_stats_are_broadcast_to_frontends() {
-        let engine = Engine::new();
+        let engine = Engine::new_manual();
         let handle = engine.handle();
         let events = handle.subscribe();
         let run = handle
@@ -954,7 +1158,7 @@ mod tests {
     #[test]
     fn preparation_queries_agents_and_retains_the_initialized_cohort() {
         let (endpoint, server) = tcp_ready_server();
-        let engine = Engine::new();
+        let engine = Engine::new_manual();
         let handle = engine.handle();
         let events = handle.subscribe();
         let configured = handle
@@ -1022,7 +1226,7 @@ mod tests {
     #[test]
     fn prepared_catalog_validates_required_types_and_duplicate_variants() {
         let (endpoint, server) = tcp_ready_server();
-        let engine = Engine::new();
+        let engine = Engine::new_manual();
         let handle = engine.handle();
         let configured = handle
             .execute(EngineCommand::Configure {
@@ -1100,7 +1304,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = listener.local_addr().unwrap().to_string();
         drop(listener);
-        let engine = Engine::new();
+        let engine = Engine::new_manual();
         let handle = engine.handle();
         let configured = handle
             .execute(EngineCommand::Configure {

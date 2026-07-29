@@ -131,6 +131,19 @@ cargo run -- run \
   --print-config
 ```
 
+Remove `--print-config` and put a colocated adapter command after `--` to
+execute the resolved plan. The CLI prepares the adapter, streams one progress
+line per measured phase, and prints the terminal run snapshot as JSON:
+
+```console
+cargo run -- run \
+  --strategy sweep \
+  --levels 100,200,400 \
+  --measurement 10s \
+  --operation 'read:key=0@1' \
+  -- ./adapter
+```
+
 A run may combine the colocated `-- ./adapter` mode with explicitly addressed
 remote agents:
 
@@ -234,9 +247,12 @@ workload editor. The queue demo exercises both the colocated path and a
 two-agent TCP cohort, including a Docker/Podman Compose deployment with the web
 coordinator in a third container and the preparation flow in its live
 dashboard. That demo can execute repeated browser-configured runs and gracefully
-stop an active run while retaining its agents. The production generic executor
-that turns a prepared cohort and `RunConfig` into an arbitrary measured run is
-the next major piece; until then, use the queue demo for the complete measured
-flows.
+stop an active run while retaining its agents. The production engine now turns
+prepared cohorts and `RunConfig` values into bounded, deterministic scheduled
+operation batches for CLI and browser runs, including warmup, measurement,
+recovery, repetitions, sweep/up-down traversal, per-phase statistics, and
+cooperative stop. Adaptive bracketing, statistical knee fitting, and durable
+run artifacts remain roadmap work, so completed generic runs do not yet report
+a target knee.
 
 See [docs/design.md](docs/design.md) for the measurement and knee-finding design.

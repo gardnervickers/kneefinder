@@ -1,14 +1,15 @@
 # Multi-agent dashboard friction log
 
 This log records usability problems found while exercising the containerized
-queue demo as an operator would. It is intentionally scoped to the demo; the
-production generic executor remains tracked by GitHub issue #2.
+queue demo as an operator would. The demo now runs through the production
+generic executor; its remaining cancellation work is tracked by GitHub issue
+#2.
 
 | Friction | Resolution |
 | --- | --- |
-| A browser-started second run stayed in `Starting` because the demo executed only its initial hard-coded sweep. | The dashboard coordinator now consumes every `Starting` event and executes the prepared cohort repeatedly. |
-| Stop moved a run to `Stopping` but no runtime acknowledged it. | The executor checks for Stop between one-second scheduling buckets, disconnects the run session, and records `AdapterStopped`. |
-| The initial sweep ignored edited phase timings, load levels, cycles, strategy, repetitions, and workload variants. | The demo executor builds its plan from the prepared run's `RunConfig` and schedules its concrete weighted variants. |
+| A browser-started second run stayed in `Starting` because the demo executed only its initial hard-coded sweep. | The engine now owns every execution and can run each newly prepared cohort. |
+| Stop moved a run to `Stopping` but no runtime acknowledged it. | The generic executor checks for Stop between bounded scheduling batches, disconnects the run session, and records `AdapterStopped`. |
+| The initial sweep ignored edited phase timings, load levels, cycles, strategy, repetitions, and workload variants. | The generic executor builds its plan from the prepared run's `RunConfig` and schedules its concrete weighted variants. |
 | Starting or preparing another run while one owned the agents could fail later as an opaque connection timeout. | The engine rejects concurrent Start and agent preparation with a stable `run_already_active` conflict, and the browser disables Start while another run is active. |
 | Normal run completion could terminate remote agents, preventing reruns. | Normal completion and Stop disconnect sessions. Only the explicit protocol `Shutdown` command terminates an agent. |
 | Instructions assumed Docker even when a Docker-compatible Podman setup was available. | The README now gives both Docker Compose and Podman Compose commands, plus a container-free colocated smoke test. |

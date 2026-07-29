@@ -210,14 +210,14 @@ At the time this handoff was written, these pieces exist:
 - runnable queue demonstrations using the colocated path and two TCP clients,
   including repeated browser-configured runs and graceful stop/rerun
 
-The main missing vertical slice is the generic executor that turns a prepared
-cohort and `RunConfig` into an arbitrary measured run. `kneefinder run` and the
-browser can prepare/query configured agents, but Start does not yet drive an
-arbitrary adapter through the full measurement strategy. The queue demo remains
-the complete measured flow and now has its own configuration-driven web
-executor for repeated demo runs; do not mistake that fixture for the production
-generic executor. Keep README's Current status section honest as work
-progresses.
+The generic executor now turns a prepared cohort and `RunConfig` into bounded,
+deterministic scheduled-operation batches for CLI and browser runs. It supports
+warmup, measured intervals, recovery, repetitions, fixed sweep/up-down plans,
+per-phase statistics, generator-saturation invalidation, and cooperative stop.
+The queue demo exercises this production path for both colocated and
+multi-client web runs. Adaptive bracketing/refinement, statistical knee fitting,
+durable artifacts, and an in-flight transport cancellation deadline remain
+roadmap work. Keep README's Current status section honest as work progresses.
 
 `docs/design.md` is the contract and direction, not proof of implementation.
 Inspect source and current GitHub issue state before relying on a described
