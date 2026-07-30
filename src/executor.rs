@@ -11,6 +11,7 @@ use std::{
 };
 
 use crate::{
+    adapter_session::ScheduleCompletion,
     agent::{AgentCohort, CohortError, CohortReady},
     config::{OperationSelection, RunConfig, Strategy, WeightedOperation},
     measurement::{RunClassification, RunEvent, RunOutcome},
@@ -245,9 +246,18 @@ impl RunExecutor {
                 *next_wire_phase_id = next_wire_phase_id
                     .checked_add(1)
                     .ok_or(ExecutorError::PhaseIdExhausted)?;
-                let batch_results = cohort
-                    .execute_schedule(phase_id, phase_start, scheduled)?
-                    .into_operations();
+                let batch = cohort.execute_schedule(phase_id, phase_start, scheduled, stop)?;
+                let interrupted = matches!(batch.completion, ScheduleCompletion::Cancelled { .. });
+                let batch_results = batch.into_operations();
+                let completed_offset_ns = batch_results
+                    .iter()
+                    .map(|result| {
+                        result
+                            .actual_start_offset_ns
+                            .saturating_add(result.client_latency_ns)
+                    })
+                    .max()
+                    .unwrap_or(0);
                 if retain_results {
                     successful_in_window = successful_in_window.saturating_add(
                         batch_results
@@ -256,6 +266,15 @@ impl RunExecutor {
                             .count() as u64,
                     );
                     results.extend(batch_results);
+                }
+                if interrupted {
+                    elapsed_ns = elapsed_ns.max(
+                        unix_now_ns()
+                            .saturating_sub(phase_start)
+                            .max(completed_offset_ns)
+                            .min(duration.as_nanos().min(u64::MAX as u128) as u64),
+                    );
+                    break;
                 }
             }
             elapsed_ns = elapsed_ns.saturating_add(chunk_ns);
@@ -578,6 +597,7 @@ mod tests {
     struct FakeAgent {
         descriptor: AgentDescriptor,
         assignments: Arc<Mutex<Vec<Vec<ScheduledOperation>>>>,
+        interrupt_after_first: bool,
     }
 
     impl WorkloadAgent for FakeAgent {
@@ -601,20 +621,35 @@ mod tests {
             _phase_id: PhaseId,
             _phase_start_unix_ns: u64,
             operations: Vec<ScheduledOperation>,
-        ) -> Result<Vec<OperationResult>, AgentError> {
+            stop: &AtomicBool,
+        ) -> Result<crate::adapter_session::ScheduleOutcome, AgentError> {
             self.assignments.lock().unwrap().push(operations.clone());
-            Ok(operations
-                .into_iter()
-                .map(|operation| OperationResult {
-                    id: operation.id,
-                    operation: operation.operation,
-                    arguments: operation.arguments,
-                    intended_start_offset_ns: operation.start_offset_ns,
-                    actual_start_offset_ns: operation.start_offset_ns,
-                    client_latency_ns: 1,
-                    status: OperationStatus::Ok,
-                })
-                .collect())
+            let completion = if self.interrupt_after_first {
+                stop.store(true, Ordering::Release);
+                ScheduleCompletion::Cancelled { forced: false }
+            } else {
+                ScheduleCompletion::Completed
+            };
+            Ok(crate::adapter_session::ScheduleOutcome {
+                operations: operations
+                    .into_iter()
+                    .take(if self.interrupt_after_first {
+                        1
+                    } else {
+                        usize::MAX
+                    })
+                    .map(|operation| OperationResult {
+                        id: operation.id,
+                        operation: operation.operation,
+                        arguments: operation.arguments,
+                        intended_start_offset_ns: operation.start_offset_ns,
+                        actual_start_offset_ns: operation.start_offset_ns,
+                        client_latency_ns: 1,
+                        status: OperationStatus::Ok,
+                    })
+                    .collect(),
+                completion,
+            })
         }
 
         fn cancel(&mut self, _phase_id: PhaseId) -> Result<(), AgentError> {
@@ -718,6 +753,13 @@ mod tests {
     }
 
     fn cohort(assignments: Arc<Mutex<Vec<Vec<ScheduledOperation>>>>) -> (AgentCohort, CohortReady) {
+        cohort_with_interrupt(assignments, false)
+    }
+
+    fn cohort_with_interrupt(
+        assignments: Arc<Mutex<Vec<Vec<ScheduledOperation>>>>,
+        interrupt_after_first: bool,
+    ) -> (AgentCohort, CohortReady) {
         let descriptor = AgentDescriptor {
             id: AgentId("fake-0".into()),
             instance_id: AgentInstanceId("fake-0-instance".into()),
@@ -726,6 +768,7 @@ mod tests {
         let mut cohort = AgentCohort::new(vec![Box::new(FakeAgent {
             descriptor,
             assignments,
+            interrupt_after_first,
         })])
         .unwrap();
         let catalog = cohort
@@ -819,6 +862,23 @@ mod tests {
             ]
         );
         assert_eq!(sink.phases[0].1.goodput_rate, 500.0);
+    }
+
+    #[test]
+    fn interrupted_measurement_publishes_the_results_received_before_stop() {
+        let assignments = Arc::new(Mutex::new(Vec::new()));
+        let (mut cohort, catalog) = cohort_with_interrupt(Arc::clone(&assignments), true);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut sink = RecordingSink::default();
+
+        let completion = RunExecutor::default()
+            .execute(&config(), &catalog, &mut cohort, &stop, &mut sink)
+            .unwrap();
+
+        assert_eq!(completion, ExecutorCompletion::Stopped);
+        assert_eq!(sink.phases.len(), 1);
+        assert_eq!(sink.phases[0].1.stats.overall.attempts, 1);
+        assert_eq!(sink.phases[0].1.stats.overall.successful, 1);
     }
 
     #[test]

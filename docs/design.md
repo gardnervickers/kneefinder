@@ -417,10 +417,12 @@ validation -> completed
 any nonterminal state -> failed
 ```
 
-Stopping is cooperative first: stop scheduling operations, allow bounded
-in-flight work to finish, ask the adapter to shut down, and finalize a partial
-artifact. After a deadline, kneefinder forcefully terminates the adapter. A
-stopped run remains inspectable but is never presented as a completed result.
+Stopping is cooperative first: stop scheduling operations, retain results
+already received, send `CancelPhase` for in-flight work, and finalize a partial
+artifact. After a deadline, kneefinder kills a colocated adapter subprocess or
+drops an unresponsive remote session. Normal Stop never sends the explicit
+`Shutdown` command to a remote agent process. A stopped run remains inspectable
+but is never presented as a completed result.
 
 ## Frontends and UI
 

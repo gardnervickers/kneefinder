@@ -145,6 +145,7 @@ pub fn run_tcp_multi_client() -> Result<(), Box<dyn Error>> {
         PhaseId(1),
         unix_now_ns().saturating_add(150_000_000),
         operations,
+        &std::sync::atomic::AtomicBool::new(false),
     )?;
     if phase.agents.len() != 2 {
         return Err(format!("expected two per-agent results, got {}", phase.agents.len()).into());

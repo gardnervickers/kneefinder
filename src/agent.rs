@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fmt,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     thread,
 };
 
@@ -12,8 +12,8 @@ use serde_json::Value;
 
 use crate::{
     adapter_session::{
-        AdapterReady, AdapterSession, AdapterTransport, SessionError, SessionOptions,
-        SubprocessTransport, TcpTransport,
+        AdapterReady, AdapterSession, AdapterTransport, ScheduleCompletion, ScheduleOutcome,
+        SessionError, SessionOptions, SubprocessTransport, TcpTransport,
     },
     config::{AdapterCommand, AgentEndpointConfig, AgentTransportConfig},
     protocol::{
@@ -86,7 +86,8 @@ pub trait WorkloadAgent: Send {
         phase_id: PhaseId,
         phase_start_unix_ns: u64,
         operations: Vec<ScheduledOperation>,
-    ) -> Result<Vec<OperationResult>, AgentError>;
+        stop: &AtomicBool,
+    ) -> Result<ScheduleOutcome, AgentError>;
 
     fn cancel(&mut self, phase_id: PhaseId) -> Result<(), AgentError>;
 
@@ -168,9 +169,10 @@ impl<T: AdapterTransport> WorkloadAgent for SessionAgent<T> {
         phase_id: PhaseId,
         phase_start_unix_ns: u64,
         operations: Vec<ScheduledOperation>,
-    ) -> Result<Vec<OperationResult>, AgentError> {
+        stop: &AtomicBool,
+    ) -> Result<ScheduleOutcome, AgentError> {
         self.session
-            .schedule(phase_id, phase_start_unix_ns, operations)
+            .schedule_interruptible(phase_id, phase_start_unix_ns, operations, stop)
             .map_err(Into::into)
     }
 
@@ -208,6 +210,7 @@ pub struct AgentPhaseResult {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CohortPhaseResult {
     pub agents: Vec<AgentPhaseResult>,
+    pub completion: ScheduleCompletion,
 }
 
 impl CohortPhaseResult {
@@ -339,6 +342,7 @@ impl AgentCohort {
         phase_id: PhaseId,
         phase_start_unix_ns: u64,
         operations: Vec<ScheduledOperation>,
+        stop: &AtomicBool,
     ) -> Result<CohortPhaseResult, CohortError> {
         if !self.initialized {
             return Err(CohortError::NotInitialized);
@@ -365,10 +369,15 @@ impl AgentCohort {
                 let descriptor = agent.descriptor().clone();
                 let call = scope.spawn(move || {
                     agent
-                        .execute_schedule(phase_id, phase_start_unix_ns, assignment)
-                        .map(|operations| AgentPhaseResult {
-                            agent: descriptor.clone(),
-                            operations,
+                        .execute_schedule(phase_id, phase_start_unix_ns, assignment, stop)
+                        .map(|outcome| {
+                            (
+                                AgentPhaseResult {
+                                    agent: descriptor.clone(),
+                                    operations: outcome.operations,
+                                },
+                                outcome.completion,
+                            )
                         })
                         .map_err(|source| CohortError::AgentFailed {
                             id: descriptor.id,
@@ -383,7 +392,23 @@ impl AgentCohort {
                 .collect::<Result<Vec<_>, CohortError>>()
         })?;
 
-        Ok(CohortPhaseResult { agents: results })
+        let completion = results.iter().fold(
+            ScheduleCompletion::Completed,
+            |aggregate, (_, completion)| match (aggregate, completion) {
+                (_, ScheduleCompletion::Cancelled { forced: true }) => {
+                    ScheduleCompletion::Cancelled { forced: true }
+                }
+                (
+                    ScheduleCompletion::Completed,
+                    ScheduleCompletion::Cancelled { forced: false },
+                ) => ScheduleCompletion::Cancelled { forced: false },
+                (aggregate, _) => aggregate,
+            },
+        );
+        Ok(CohortPhaseResult {
+            agents: results.into_iter().map(|(result, _)| result).collect(),
+            completion,
+        })
     }
 
     pub fn cancel(&mut self, phase_id: PhaseId) -> Result<(), CohortError> {
@@ -566,7 +591,8 @@ mod tests {
             _phase_id: PhaseId,
             _phase_start_unix_ns: u64,
             operations: Vec<ScheduledOperation>,
-        ) -> Result<Vec<OperationResult>, AgentError> {
+            _stop: &AtomicBool,
+        ) -> Result<ScheduleOutcome, AgentError> {
             self.assignments
                 .lock()
                 .unwrap()
@@ -574,18 +600,21 @@ mod tests {
             if self.fail_phase {
                 return Err(AgentError::Unavailable("lost worker".into()));
             }
-            Ok(operations
-                .into_iter()
-                .map(|operation| OperationResult {
-                    id: operation.id,
-                    operation: operation.operation,
-                    arguments: operation.arguments,
-                    intended_start_offset_ns: operation.start_offset_ns,
-                    actual_start_offset_ns: operation.start_offset_ns,
-                    client_latency_ns: 1,
-                    status: OperationStatus::Ok,
-                })
-                .collect())
+            Ok(ScheduleOutcome {
+                operations: operations
+                    .into_iter()
+                    .map(|operation| OperationResult {
+                        id: operation.id,
+                        operation: operation.operation,
+                        arguments: operation.arguments,
+                        intended_start_offset_ns: operation.start_offset_ns,
+                        actual_start_offset_ns: operation.start_offset_ns,
+                        client_latency_ns: 1,
+                        status: OperationStatus::Ok,
+                    })
+                    .collect(),
+                completion: ScheduleCompletion::Completed,
+            })
         }
 
         fn cancel(&mut self, _phase_id: PhaseId) -> Result<(), AgentError> {
@@ -666,7 +695,12 @@ mod tests {
         cohort.initialize(RunId(1), Value::Null).unwrap();
 
         let result = cohort
-            .execute_schedule(PhaseId(1), 100, (0..6).map(scheduled).collect::<Vec<_>>())
+            .execute_schedule(
+                PhaseId(1),
+                100,
+                (0..6).map(scheduled).collect::<Vec<_>>(),
+                &AtomicBool::new(false),
+            )
             .unwrap();
 
         assert_eq!(first.lock().unwrap().as_slice(), &[vec![0, 2, 4]]);
@@ -697,7 +731,7 @@ mod tests {
             .collect();
 
         cohort
-            .execute_schedule(PhaseId(1), 100, operations)
+            .execute_schedule(PhaseId(1), 100, operations, &AtomicBool::new(false))
             .unwrap();
 
         assert_eq!(first.lock().unwrap().as_slice(), &[vec![0, 1]]);
@@ -820,7 +854,12 @@ mod tests {
         cohort.initialize(RunId(1), Value::Null).unwrap();
 
         assert!(matches!(
-            cohort.execute_schedule(PhaseId(1), 100, vec![scheduled(7), scheduled(7)]),
+            cohort.execute_schedule(
+                PhaseId(1),
+                100,
+                vec![scheduled(7), scheduled(7)],
+                &AtomicBool::new(false),
+            ),
             Err(CohortError::DuplicateOperation(7))
         ));
         assert!(assignments.lock().unwrap().is_empty());
@@ -851,7 +890,8 @@ mod tests {
             cohort.execute_schedule(
                 PhaseId(1),
                 100,
-                (0..4).map(scheduled).collect::<Vec<_>>()
+                (0..4).map(scheduled).collect::<Vec<_>>(),
+                &AtomicBool::new(false),
             ),
             Err(CohortError::AgentFailed {
                 id: AgentId(id),

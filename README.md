@@ -251,8 +251,10 @@ stop an active run while retaining its agents. The production engine now turns
 prepared cohorts and `RunConfig` values into bounded, deterministic scheduled
 operation batches for CLI and browser runs, including warmup, measurement,
 recovery, repetitions, sweep/up-down traversal, per-phase statistics, and
-cooperative stop. Adaptive bracketing, statistical knee fitting, and durable
-run artifacts remain roadmap work, so completed generic runs do not yet report
-a target knee.
+bounded interruptible stop. Stop preserves results already received, sends
+`CancelPhase` to active agents, and force-closes an unresponsive session after
+the cancellation deadline. Adaptive bracketing, statistical knee fitting, and
+durable run artifacts remain roadmap work, so completed generic runs do not yet
+report a target knee.
 
 See [docs/design.md](docs/design.md) for the measurement and knee-finding design.

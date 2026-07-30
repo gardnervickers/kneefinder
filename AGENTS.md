@@ -215,9 +215,12 @@ deterministic scheduled-operation batches for CLI and browser runs. It supports
 warmup, measured intervals, recovery, repetitions, fixed sweep/up-down plans,
 per-phase statistics, generator-saturation invalidation, and cooperative stop.
 The queue demo exercises this production path for both colocated and
-multi-client web runs. Adaptive bracketing/refinement, statistical knee fitting,
-durable artifacts, and an in-flight transport cancellation deadline remain
-roadmap work. Keep README's Current status section honest as work progresses.
+multi-client web runs. In-flight schedules are interruptible: Stop preserves
+partial results, sends `CancelPhase`, and force-closes the session after a
+deadline, killing only a colocated subprocess while leaving a remote agent
+process available. Adaptive bracketing/refinement, statistical knee fitting,
+and durable artifacts remain roadmap work. Keep README's Current status section
+honest as work progresses.
 
 `docs/design.md` is the contract and direction, not proof of implementation.
 Inspect source and current GitHub issue state before relying on a described

@@ -20,6 +20,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match command.as_str() {
         "adapter" => adapter::run(),
+        "adapter-hang" => adapter::run_hanging(),
         "adapter-tcp" => {
             let address = arguments
                 .next()

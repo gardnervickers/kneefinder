@@ -8,6 +8,7 @@ use std::{
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
     },
     thread,
@@ -28,12 +29,14 @@ const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_DIAGNOSTIC_LINES: usize = 1_024;
 const BUFFERED_ADAPTER_MESSAGES: usize = 8;
+const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone)]
 pub struct SessionOptions {
     pub connection_timeout: Duration,
     pub handshake_timeout: Duration,
     pub response_timeout: Duration,
+    pub cancellation_timeout: Duration,
     pub shutdown_timeout: Duration,
     pub maximum_frame_bytes: usize,
     pub maximum_diagnostic_lines: usize,
@@ -45,6 +48,7 @@ impl Default for SessionOptions {
             connection_timeout: Duration::from_secs(5),
             handshake_timeout: Duration::from_secs(10),
             response_timeout: Duration::from_secs(60),
+            cancellation_timeout: Duration::from_secs(1),
             shutdown_timeout: Duration::from_secs(5),
             maximum_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             maximum_diagnostic_lines: DEFAULT_MAX_DIAGNOSTIC_LINES,
@@ -59,6 +63,7 @@ pub trait AdapterTransport: Send {
     fn receive(&mut self, timeout: Duration) -> Result<AdapterMessage, TransportError>;
     fn diagnostics(&self) -> Vec<String>;
     fn close(&mut self, timeout: Duration) -> Result<(), TransportError>;
+    fn abort(&mut self) -> Result<(), TransportError>;
 }
 
 /// Default zero-setup transport: one supervised adapter child using NDJSON on
@@ -200,6 +205,15 @@ impl AdapterTransport for SubprocessTransport {
             }
         }
     }
+
+    fn abort(&mut self) -> Result<(), TransportError> {
+        self.input.take();
+        if self.child.try_wait().map_err(TransportError::io)?.is_none() {
+            self.child.kill().map_err(TransportError::io)?;
+            self.child.wait().map_err(TransportError::io)?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for SubprocessTransport {
@@ -312,6 +326,10 @@ impl AdapterTransport for TcpTransport {
             Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
             Err(error) => Err(TransportError::io(error)),
         }
+    }
+
+    fn abort(&mut self) -> Result<(), TransportError> {
+        self.close(Duration::ZERO)
     }
 }
 
@@ -452,6 +470,18 @@ pub enum SessionState {
     Closed,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScheduleOutcome {
+    pub operations: Vec<OperationResult>,
+    pub completion: ScheduleCompletion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleCompletion {
+    Completed,
+    Cancelled { forced: bool },
+}
+
 /// Owns adapter protocol state and validation independently of how frames are
 /// transported.
 pub struct AdapterSession<T> {
@@ -539,6 +569,18 @@ impl<T: AdapterTransport> AdapterSession<T> {
         phase_start_unix_ns: u64,
         operations: Vec<ScheduledOperation>,
     ) -> Result<Vec<OperationResult>, SessionError> {
+        let stop = AtomicBool::new(false);
+        self.schedule_interruptible(phase_id, phase_start_unix_ns, operations, &stop)
+            .map(|outcome| outcome.operations)
+    }
+
+    pub fn schedule_interruptible(
+        &mut self,
+        phase_id: PhaseId,
+        phase_start_unix_ns: u64,
+        operations: Vec<ScheduledOperation>,
+        stop: &AtomicBool,
+    ) -> Result<ScheduleOutcome, SessionError> {
         self.require_state(SessionState::Ready)?;
         if let Some(maximum) = self
             .capabilities
@@ -559,7 +601,16 @@ impl<T: AdapterTransport> AdapterSession<T> {
             }
         }
         if operations.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ScheduleOutcome {
+                operations: Vec::new(),
+                completion: ScheduleCompletion::Completed,
+            });
+        }
+        if stop.load(Ordering::Acquire) {
+            return Ok(ScheduleOutcome {
+                operations: Vec::new(),
+                completion: ScheduleCompletion::Cancelled { forced: false },
+            });
         }
 
         self.send(&ControllerMessage::Schedule {
@@ -569,15 +620,55 @@ impl<T: AdapterTransport> AdapterSession<T> {
         })?;
         self.state = SessionState::PhaseActive(phase_id);
 
-        let deadline = Instant::now() + self.options.response_timeout;
+        let response_deadline = Instant::now() + self.options.response_timeout;
+        let mut cancellation_deadline = None;
         let mut received = HashMap::with_capacity(expected.len());
         while received.len() < expected.len() {
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            if stop.load(Ordering::Acquire) && cancellation_deadline.is_none() {
+                if self
+                    .transport
+                    .send(&ControllerMessage::CancelPhase { phase_id })
+                    .is_err()
+                {
+                    let _ = self.transport.abort();
+                    self.state = SessionState::Closed;
+                    return Ok(schedule_outcome(
+                        &operations,
+                        received,
+                        ScheduleCompletion::Cancelled { forced: true },
+                    ));
+                }
+                cancellation_deadline = Some(Instant::now() + self.options.cancellation_timeout);
+            }
+
+            let now = Instant::now();
+            if cancellation_deadline.is_some_and(|deadline| now >= deadline) {
+                let _ = self.transport.abort();
+                self.state = SessionState::Closed;
+                return Ok(schedule_outcome(
+                    &operations,
+                    received,
+                    ScheduleCompletion::Cancelled { forced: true },
+                ));
+            }
+            if cancellation_deadline.is_none() && now >= response_deadline {
                 return self.fail(SessionError::Transport(TransportError::ReceiveTimeout(
                     self.options.response_timeout,
                 )));
+            }
+
+            let active_deadline = cancellation_deadline.unwrap_or(response_deadline);
+            let wait = active_deadline
+                .saturating_duration_since(now)
+                .min(INTERRUPT_POLL_INTERVAL);
+            let message = match self.transport.receive(wait) {
+                Ok(message) => message,
+                Err(TransportError::ReceiveTimeout(_)) => continue,
+                Err(error) => {
+                    self.state = SessionState::Failed;
+                    return Err(SessionError::Transport(error));
+                }
             };
-            let message = self.receive(remaining)?;
             match message {
                 AdapterMessage::Results {
                     phase_id: actual_phase,
@@ -610,14 +701,55 @@ impl<T: AdapterTransport> AdapterSession<T> {
                         actual,
                     });
                 }
+                AdapterMessage::PhaseComplete {
+                    phase_id: actual_phase,
+                    ..
+                } if actual_phase == phase_id && cancellation_deadline.is_some() => {
+                    self.state = SessionState::Ready;
+                    return Ok(schedule_outcome(
+                        &operations,
+                        received,
+                        ScheduleCompletion::Cancelled { forced: false },
+                    ));
+                }
+                AdapterMessage::PhaseComplete {
+                    phase_id: actual, ..
+                } if actual != phase_id => {
+                    return self.fail(SessionError::UnexpectedPhase {
+                        expected: phase_id,
+                        actual,
+                    });
+                }
+                AdapterMessage::PhaseComplete {
+                    phase_id: actual, ..
+                } => {
+                    debug_assert_eq!(actual, phase_id);
+                    return self.fail(SessionError::UnexpectedMessage {
+                        state: self.state,
+                        message: "phase_complete",
+                    });
+                }
                 AdapterMessage::Error {
                     phase_id: error_phase,
+                    ..
+                } if cancellation_deadline.is_some()
+                    && error_phase.is_none_or(|actual| actual == phase_id) =>
+                {
+                    self.state = SessionState::Ready;
+                    return Ok(schedule_outcome(
+                        &operations,
+                        received,
+                        ScheduleCompletion::Cancelled { forced: false },
+                    ));
+                }
+                AdapterMessage::Error {
+                    phase_id,
                     code,
                     message,
                     retryable,
                 } => {
                     return self.fail(SessionError::Adapter {
-                        phase_id: error_phase,
+                        phase_id,
                         code,
                         message,
                         retryable,
@@ -633,14 +765,12 @@ impl<T: AdapterTransport> AdapterSession<T> {
         }
 
         self.state = SessionState::Ready;
-        Ok(operations
-            .iter()
-            .map(|operation| {
-                received
-                    .remove(&operation.id)
-                    .expect("every scheduled operation was validated")
-            })
-            .collect())
+        let completion = if cancellation_deadline.is_some() {
+            ScheduleCompletion::Cancelled { forced: false }
+        } else {
+            ScheduleCompletion::Completed
+        };
+        Ok(schedule_outcome(&operations, received, completion))
     }
 
     pub fn cancel(&mut self, phase_id: PhaseId) -> Result<(), SessionError> {
@@ -706,6 +836,20 @@ impl<T: AdapterTransport> AdapterSession<T> {
     fn fail<R>(&mut self, error: SessionError) -> Result<R, SessionError> {
         self.state = SessionState::Failed;
         Err(error)
+    }
+}
+
+fn schedule_outcome(
+    scheduled: &[ScheduledOperation],
+    mut received: HashMap<OperationId, OperationResult>,
+    completion: ScheduleCompletion,
+) -> ScheduleOutcome {
+    ScheduleOutcome {
+        operations: scheduled
+            .iter()
+            .filter_map(|operation| received.remove(&operation.id))
+            .collect(),
+        completion,
     }
 }
 
@@ -905,6 +1049,8 @@ mod tests {
     struct FakeTransport {
         sent: Arc<Mutex<Vec<ControllerMessage>>>,
         received: VecDeque<Result<AdapterMessage, TransportError>>,
+        timeout_when_empty: bool,
+        aborted: Arc<AtomicBool>,
     }
 
     impl FakeTransport {
@@ -914,9 +1060,20 @@ mod tests {
                 Self {
                     sent: Arc::clone(&sent),
                     received: messages.into_iter().map(Ok).collect(),
+                    timeout_when_empty: false,
+                    aborted: Arc::new(AtomicBool::new(false)),
                 },
                 sent,
             )
+        }
+
+        fn interruptible(
+            messages: Vec<AdapterMessage>,
+        ) -> (Self, Arc<Mutex<Vec<ControllerMessage>>>, Arc<AtomicBool>) {
+            let (mut transport, sent) = Self::new(messages);
+            let aborted = Arc::clone(&transport.aborted);
+            transport.timeout_when_empty = true;
+            (transport, sent, aborted)
         }
     }
 
@@ -927,9 +1084,15 @@ mod tests {
         }
 
         fn receive(&mut self, _timeout: Duration) -> Result<AdapterMessage, TransportError> {
-            self.received
-                .pop_front()
-                .unwrap_or(Err(TransportError::Closed))
+            if let Some(message) = self.received.pop_front() {
+                return message;
+            }
+            if self.timeout_when_empty {
+                thread::sleep(_timeout);
+                Err(TransportError::ReceiveTimeout(_timeout))
+            } else {
+                Err(TransportError::Closed)
+            }
         }
 
         fn diagnostics(&self) -> Vec<String> {
@@ -937,6 +1100,11 @@ mod tests {
         }
 
         fn close(&mut self, _timeout: Duration) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn abort(&mut self) -> Result<(), TransportError> {
+            self.aborted.store(true, Ordering::Release);
             Ok(())
         }
     }
@@ -1115,6 +1283,52 @@ mod tests {
     }
 
     #[test]
+    fn interruptible_schedule_preserves_partial_results_and_forces_a_deadline() {
+        let responses = vec![
+            ready(PROTOCOL_VERSION),
+            AdapterMessage::Results {
+                phase_id: PhaseId(9),
+                operations: vec![result(1)],
+            },
+        ];
+        let (transport, sent, aborted) = FakeTransport::interruptible(responses);
+        let options = SessionOptions {
+            cancellation_timeout: Duration::from_millis(30),
+            response_timeout: Duration::from_secs(1),
+            ..SessionOptions::default()
+        };
+        let mut session = AdapterSession::new(transport, options);
+        session.initialize(RunId(1), Value::Null).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let request_stop = Arc::clone(&stop);
+        let interrupter = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            request_stop.store(true, Ordering::Release);
+        });
+
+        let started = Instant::now();
+        let outcome = session
+            .schedule_interruptible(PhaseId(9), 42, vec![scheduled(1), scheduled(2)], &stop)
+            .unwrap();
+        interrupter.join().unwrap();
+
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(outcome.operations, [result(1)]);
+        assert_eq!(
+            outcome.completion,
+            ScheduleCompletion::Cancelled { forced: true }
+        );
+        assert!(aborted.load(Ordering::Acquire));
+        assert_eq!(session.state(), SessionState::Closed);
+        assert!(sent.lock().unwrap().iter().any(|message| matches!(
+            message,
+            ControllerMessage::CancelPhase {
+                phase_id: PhaseId(9)
+            }
+        )));
+    }
+
+    #[test]
     fn frame_reader_enforces_bounds_and_newlines() {
         let mut valid = BufReader::new(&b"{}\n"[..]);
         assert_eq!(read_frame(&mut valid, 3).unwrap(), Some(b"{}\n".to_vec()));
@@ -1162,6 +1376,92 @@ mod tests {
         let mut session = AdapterSession::new(transport, options);
         session.initialize(RunId(7), Value::Null).unwrap();
         session.shutdown().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn interrupt_deadline_drops_only_the_remote_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut input = BufReader::new(stream.try_clone().unwrap());
+            let mut output = BufWriter::new(stream);
+            assert!(matches!(
+                read_controller_message(&mut input),
+                ControllerMessage::Initialize {
+                    run_id: RunId(7),
+                    ..
+                }
+            ));
+            serde_json::to_writer(&mut output, &ready(PROTOCOL_VERSION)).unwrap();
+            output.write_all(b"\n").unwrap();
+            output.flush().unwrap();
+            assert!(matches!(
+                read_controller_message(&mut input),
+                ControllerMessage::Schedule {
+                    phase_id: PhaseId(4),
+                    ..
+                }
+            ));
+            assert!(matches!(
+                read_controller_message(&mut input),
+                ControllerMessage::CancelPhase {
+                    phase_id: PhaseId(4)
+                }
+            ));
+            let mut trailing = String::new();
+            assert_eq!(input.read_line(&mut trailing).unwrap(), 0);
+
+            let (stream, _) = listener.accept().unwrap();
+            let mut input = BufReader::new(stream.try_clone().unwrap());
+            let mut output = BufWriter::new(stream);
+            assert!(matches!(
+                read_controller_message(&mut input),
+                ControllerMessage::Initialize {
+                    run_id: RunId(8),
+                    ..
+                }
+            ));
+            serde_json::to_writer(&mut output, &ready(PROTOCOL_VERSION)).unwrap();
+            output.write_all(b"\n").unwrap();
+            output.flush().unwrap();
+            assert!(matches!(
+                read_controller_message(&mut input),
+                ControllerMessage::Shutdown
+            ));
+        });
+
+        let options = SessionOptions {
+            cancellation_timeout: Duration::from_millis(40),
+            response_timeout: Duration::from_secs(1),
+            ..SessionOptions::default()
+        };
+        let transport = TcpTransport::connect(&endpoint.to_string(), &options).unwrap();
+        let mut session = AdapterSession::new(transport, options);
+        session.initialize(RunId(7), Value::Null).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let request_stop = Arc::clone(&stop);
+        let interrupter = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            request_stop.store(true, Ordering::Release);
+        });
+
+        let outcome = session
+            .schedule_interruptible(PhaseId(4), 100, vec![scheduled(1)], &stop)
+            .unwrap();
+        interrupter.join().unwrap();
+
+        assert_eq!(
+            outcome.completion,
+            ScheduleCompletion::Cancelled { forced: true }
+        );
+        assert_eq!(session.state(), SessionState::Closed);
+        let options = SessionOptions::default();
+        let transport = TcpTransport::connect(&endpoint.to_string(), &options).unwrap();
+        let mut second_session = AdapterSession::new(transport, options);
+        second_session.initialize(RunId(8), Value::Null).unwrap();
+        second_session.shutdown().unwrap();
         server.join().unwrap();
     }
 

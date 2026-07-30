@@ -58,6 +58,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     run_session(stdin.lock(), BufWriter::new(stdout.lock())).map(|_| ())
 }
 
+pub fn run_hanging() -> Result<(), Box<dyn Error>> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    run_session_mode(stdin.lock(), BufWriter::new(stdout.lock()), true).map(|_| ())
+}
+
 pub fn run_tcp(address: &str) -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(address)?;
     let address = listener.local_addr()?;
@@ -70,16 +76,29 @@ pub fn run_tcp(address: &str) -> Result<(), Box<dyn Error>> {
         eprintln!("demo TCP agent accepted coordinator connection from {peer}");
         let input = BufReader::new(stream.try_clone()?);
         let output = BufWriter::new(stream);
-        match run_session(input, output)? {
-            SessionExit::EndOfStream => {
+        match run_session(input, output) {
+            Ok(SessionExit::EndOfStream) => {
                 eprintln!("demo TCP agent connection closed; waiting for a coordinator");
             }
-            SessionExit::Shutdown => return Ok(()),
+            Ok(SessionExit::Shutdown) => return Ok(()),
+            Err(error) => {
+                eprintln!(
+                    "demo TCP agent session failed ({error}); waiting for another coordinator"
+                );
+            }
         }
     }
 }
 
 fn run_session(input: impl BufRead, mut output: impl Write) -> Result<SessionExit, Box<dyn Error>> {
+    run_session_mode(input, &mut output, false)
+}
+
+fn run_session_mode(
+    input: impl BufRead,
+    mut output: impl Write,
+    hang_on_schedule: bool,
+) -> Result<SessionExit, Box<dyn Error>> {
     let mut service: Option<QueueService> = None;
 
     for line in input.lines() {
@@ -172,6 +191,11 @@ fn run_session(input: impl BufRead, mut output: impl Write) -> Result<SessionExi
                 phase_start_unix_ns,
                 mut operations,
             } => {
+                if hang_on_schedule {
+                    loop {
+                        thread::park();
+                    }
+                }
                 let Some(service) = &service else {
                     write_message(
                         &mut output,
