@@ -9,4 +9,5 @@ pub mod frontends;
 pub mod measurement;
 pub mod protocol;
 pub mod stats;
+pub mod strategy;
 pub mod workload;

@@ -22,6 +22,7 @@ use crate::{
     measurement::{RunEvent, RunState, TransitionError},
     protocol::{PhaseId, RunId},
     stats::PhaseReport,
+    strategy::StrategyDecision,
     workload::{WorkloadError, normalize_operation_mix, resolve_operation_mix},
 };
 
@@ -92,6 +93,10 @@ pub enum EngineEvent {
         run_id: RunId,
         phase_id: PhaseId,
         report: PhaseReport,
+    },
+    StrategyDecision {
+        run_id: RunId,
+        decision: StrategyDecision,
     },
 }
 
@@ -705,6 +710,28 @@ impl EngineInner {
         });
         Ok(())
     }
+
+    fn strategy_decision(
+        &self,
+        run_id: RunId,
+        decision: StrategyDecision,
+    ) -> Result<(), EngineError> {
+        let _mutation = self
+            .mutation
+            .lock()
+            .expect("engine mutation mutex poisoned");
+        if !self
+            .registry
+            .lock()
+            .expect("engine registry mutex poisoned")
+            .runs
+            .contains_key(&run_id)
+        {
+            return Err(EngineError::RunNotFound(run_id));
+        }
+        self.publish(EngineEvent::StrategyDecision { run_id, decision });
+        Ok(())
+    }
 }
 
 struct ExecutionControl {
@@ -727,6 +754,12 @@ impl ExecutionSink for EngineExecutionSink {
     fn record_phase_stats(&mut self, phase_id: PhaseId, report: PhaseReport) -> Result<(), String> {
         self.inner
             .phase_stats(self.run_id, phase_id, report)
+            .map_err(|error| error.to_string())
+    }
+
+    fn record_strategy_decision(&mut self, decision: StrategyDecision) -> Result<(), String> {
+        self.inner
+            .strategy_decision(self.run_id, decision)
             .map_err(|error| error.to_string())
     }
 }
@@ -1140,6 +1173,7 @@ mod tests {
             goodput_rate: 99.0,
             elapsed_ns: 1_000_000_000,
             stats: summarize_results(&[]).unwrap(),
+            quality: Default::default(),
         };
         engine
             .record_phase_stats(run.run_id, PhaseId(7), report.clone())

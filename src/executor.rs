@@ -16,7 +16,10 @@ use crate::{
     config::{OperationSelection, RunConfig, Strategy, WeightedOperation},
     measurement::{RunClassification, RunEvent, RunOutcome},
     protocol::{OperationId, OperationResult, OperationStatus, PhaseId, ScheduledOperation},
-    stats::{PhaseReport, StatsError, summarize_results},
+    stats::{MeasurementBucket, PhaseQuality, PhaseReport, StatsError, summarize_results},
+    strategy::{
+        AdaptiveStrategy, ObservationOutcome, StrategyAction, StrategyDecision, fixed_stage,
+    },
 };
 
 const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
@@ -37,6 +40,12 @@ pub struct ExecutorOptions {
     pub dispatch_lag_fraction: f64,
     /// Absolute floor for generator-saturation dispatch lag.
     pub minimum_dispatch_lag: Duration,
+    /// Number of equal measurement buckets used for stationarity decisions.
+    pub stationarity_buckets: usize,
+    /// Maximum relative deviation in bucket goodput before a phase is unstable.
+    pub stationarity_tolerance: f64,
+    /// Minimum attempts required before bucket stationarity is meaningful.
+    pub minimum_stationarity_samples: u64,
 }
 
 impl Default for ExecutorOptions {
@@ -49,6 +58,9 @@ impl Default for ExecutorOptions {
             schedule_lead_time: Duration::from_millis(25),
             dispatch_lag_fraction: 0.10,
             minimum_dispatch_lag: Duration::from_millis(10),
+            stationarity_buckets: 5,
+            stationarity_tolerance: 0.30,
+            minimum_stationarity_samples: 20,
         }
     }
 }
@@ -56,6 +68,7 @@ impl Default for ExecutorOptions {
 pub trait ExecutionSink {
     fn record_run_event(&mut self, event: RunEvent) -> Result<(), String>;
     fn record_phase_stats(&mut self, phase_id: PhaseId, report: PhaseReport) -> Result<(), String>;
+    fn record_strategy_decision(&mut self, decision: StrategyDecision) -> Result<(), String>;
 }
 
 pub struct RunExecutor {
@@ -95,66 +108,110 @@ impl RunExecutor {
             .map_err(ExecutorError::Sink)?;
         let mut next_wire_phase_id = 1_u64;
         let mut next_operation_id = 1_u64;
-        let mut generator_saturated = false;
-
-        for (index, rate) in rates.iter().copied().enumerate() {
-            if stop.load(Ordering::Acquire) {
-                return Ok(ExecutorCompletion::Stopped);
-            }
-
-            if config.phases.warmup_ms > 0 {
-                self.run_interval(
-                    cohort,
-                    stop,
-                    &mut next_wire_phase_id,
-                    &mut next_operation_id,
-                    rate,
-                    Duration::from_millis(config.phases.warmup_ms),
-                    operations,
-                    batch_limit,
-                    false,
-                )?;
-                if stop.load(Ordering::Acquire) {
-                    return Ok(ExecutorCompletion::Stopped);
-                }
-            }
-
-            let measured = self.run_interval(
+        if config.strategy == Strategy::Adaptive {
+            self.execute_adaptive(
+                config,
                 cohort,
                 stop,
-                &mut next_wire_phase_id,
-                &mut next_operation_id,
-                rate,
-                Duration::from_millis(config.phases.measurement_ms),
+                sink,
                 operations,
                 batch_limit,
-                true,
-            )?;
-            if measured.elapsed_ns > 0 {
-                let stats = summarize_results(&measured.results)?;
-                let report = PhaseReport {
-                    offered_rate: rate,
-                    goodput_rate: measured.successful_in_window as f64 * NANOS_PER_SECOND
-                        / measured.elapsed_ns as f64,
-                    elapsed_ns: measured.elapsed_ns,
-                    stats,
-                };
-                generator_saturated |=
-                    dispatch_lag_invalid(&report, config.phases.measurement_ms, &self.options);
-                sink.record_phase_stats(PhaseId(index as u64 + 1), report)
-                    .map_err(ExecutorError::Sink)?;
-            }
-            if stop.load(Ordering::Acquire) {
-                return Ok(ExecutorCompletion::Stopped);
-            }
+                &mut next_wire_phase_id,
+                &mut next_operation_id,
+            )
+        } else {
+            self.execute_fixed(
+                config,
+                &rates,
+                cohort,
+                stop,
+                sink,
+                operations,
+                batch_limit,
+                &mut next_wire_phase_id,
+                &mut next_operation_id,
+            )
+        }
+    }
 
-            if config.phases.recovery_ms > 0
-                && sleep_until_or_stop(stop, Duration::from_millis(config.phases.recovery_ms))
-            {
+    #[allow(clippy::too_many_arguments)]
+    fn execute_fixed(
+        &self,
+        config: &RunConfig,
+        rates: &[f64],
+        cohort: &mut AgentCohort,
+        stop: &Arc<AtomicBool>,
+        sink: &mut impl ExecutionSink,
+        operations: &[WeightedOperation],
+        batch_limit: usize,
+        next_wire_phase_id: &mut u64,
+        next_operation_id: &mut u64,
+    ) -> Result<ExecutorCompletion, ExecutorError> {
+        let mut generator_saturated = false;
+        let mut unstable_measurement = false;
+        let mut sequence = 1_u64;
+        let mut measured_phases = 0_u64;
+        for rate in rates.iter().copied() {
+            publish_decision(
+                sink,
+                &mut sequence,
+                fixed_stage(config.strategy),
+                StrategyAction::Select,
+                rate,
+                Some(rate),
+                "selected by the configured fixed traversal",
+            )?;
+            let Some(report) = self.measure_phase(
+                config,
+                cohort,
+                stop,
+                operations,
+                batch_limit,
+                next_wire_phase_id,
+                next_operation_id,
+                rate,
+            )?
+            else {
+                return Ok(ExecutorCompletion::Stopped);
+            };
+            generator_saturated |=
+                dispatch_lag_invalid(&report, config.phases.measurement_ms, &self.options);
+            unstable_measurement |= !report.quality.stationary;
+            measured_phases += 1;
+            let phase_id = PhaseId(measured_phases);
+            sink.record_phase_stats(phase_id, report.clone())
+                .map_err(ExecutorError::Sink)?;
+            publish_decision(
+                sink,
+                &mut sequence,
+                fixed_stage(config.strategy),
+                if report.quality.stationary {
+                    StrategyAction::Accept
+                } else {
+                    StrategyAction::Reject
+                },
+                rate,
+                None,
+                report.quality.reason.as_deref().unwrap_or("phase accepted"),
+            )?;
+            if config.phases.recovery_ms > 0 {
+                publish_decision(
+                    sink,
+                    &mut sequence,
+                    fixed_stage(config.strategy),
+                    StrategyAction::Recover,
+                    rate,
+                    None,
+                    &format!(
+                        "waiting {} ms for recovery before the next phase",
+                        config.phases.recovery_ms
+                    ),
+                )?;
+            }
+            if recover_or_stop(config, stop) {
                 return Ok(ExecutorCompletion::Stopped);
             }
         }
-
         let outcome = if generator_saturated {
             RunOutcome {
                 classification: RunClassification::GeneratorSaturated,
@@ -163,6 +220,15 @@ impl RunExecutor {
                 warnings: vec![
                     "dispatch lag exceeded the executor validity threshold; no target knee was reported"
                         .into(),
+                ],
+            }
+        } else if unstable_measurement {
+            RunOutcome {
+                classification: RunClassification::UnstableMeasurement,
+                knee: None,
+                slo_maximum_rate: None,
+                warnings: vec![
+                    "one or more fixed phases failed the bucket stationarity check".into(),
                 ],
             }
         } else {
@@ -177,6 +243,200 @@ impl RunExecutor {
             }
         };
         Ok(ExecutorCompletion::Completed(outcome))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_adaptive(
+        &self,
+        config: &RunConfig,
+        cohort: &mut AgentCohort,
+        stop: &Arc<AtomicBool>,
+        sink: &mut impl ExecutionSink,
+        operations: &[WeightedOperation],
+        batch_limit: usize,
+        next_wire_phase_id: &mut u64,
+        next_operation_id: &mut u64,
+    ) -> Result<ExecutorCompletion, ExecutorError> {
+        let mut strategy = AdaptiveStrategy::new(config);
+        let mut request = strategy.initial_request();
+        let mut sequence = 1_u64;
+        let mut measured_phases = 0_usize;
+        loop {
+            if measured_phases >= self.options.maximum_phases {
+                return Ok(ExecutorCompletion::Completed(RunOutcome {
+                    classification: RunClassification::UnstableMeasurement,
+                    knee: None,
+                    slo_maximum_rate: None,
+                    warnings: vec!["adaptive phase budget was exhausted".into()],
+                }));
+            }
+            publish_decision(
+                sink,
+                &mut sequence,
+                request.stage,
+                StrategyAction::Select,
+                request.rate,
+                Some(request.rate),
+                "selected by adaptive traversal",
+            )?;
+            let Some(report) = self.measure_phase(
+                config,
+                cohort,
+                stop,
+                operations,
+                batch_limit,
+                next_wire_phase_id,
+                next_operation_id,
+                request.rate,
+            )?
+            else {
+                return Ok(ExecutorCompletion::Stopped);
+            };
+            measured_phases += 1;
+            let generator_saturated =
+                dispatch_lag_invalid(&report, config.phases.measurement_ms, &self.options);
+            sink.record_phase_stats(PhaseId(measured_phases as u64), report.clone())
+                .map_err(ExecutorError::Sink)?;
+            let completed_request = request;
+            let observation = strategy.observe(&report, generator_saturated);
+            match observation {
+                ObservationOutcome::Continue {
+                    request: next,
+                    lifecycle_event,
+                } => {
+                    let repeating = next == request;
+                    publish_decision(
+                        sink,
+                        &mut sequence,
+                        request.stage,
+                        if repeating {
+                            StrategyAction::Repeat
+                        } else {
+                            StrategyAction::Accept
+                        },
+                        request.rate,
+                        Some(next.rate),
+                        if repeating {
+                            report
+                                .quality
+                                .reason
+                                .as_deref()
+                                .unwrap_or("phase was non-stationary")
+                        } else {
+                            "phase accepted and traversal advanced"
+                        },
+                    )?;
+                    if let Some(event) = lifecycle_event {
+                        sink.record_run_event(event).map_err(ExecutorError::Sink)?;
+                    }
+                    request = next;
+                }
+                ObservationOutcome::Complete {
+                    outcome,
+                    lifecycle_events,
+                } => {
+                    let action = if matches!(
+                        outcome.classification,
+                        RunClassification::GeneratorSaturated
+                            | RunClassification::UnstableMeasurement
+                    ) {
+                        StrategyAction::Reject
+                    } else {
+                        StrategyAction::Complete
+                    };
+                    publish_decision(
+                        sink,
+                        &mut sequence,
+                        request.stage,
+                        action,
+                        request.rate,
+                        None,
+                        outcome
+                            .warnings
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("adaptive traversal completed"),
+                    )?;
+                    for event in lifecycle_events {
+                        sink.record_run_event(event).map_err(ExecutorError::Sink)?;
+                    }
+                    return Ok(ExecutorCompletion::Completed(outcome));
+                }
+            }
+            if config.phases.recovery_ms > 0 {
+                publish_decision(
+                    sink,
+                    &mut sequence,
+                    completed_request.stage,
+                    StrategyAction::Recover,
+                    completed_request.rate,
+                    None,
+                    &format!(
+                        "waiting {} ms for recovery before the next phase",
+                        config.phases.recovery_ms
+                    ),
+                )?;
+            }
+            if recover_or_stop(config, stop) {
+                return Ok(ExecutorCompletion::Stopped);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn measure_phase(
+        &self,
+        config: &RunConfig,
+        cohort: &mut AgentCohort,
+        stop: &Arc<AtomicBool>,
+        operations: &[WeightedOperation],
+        batch_limit: usize,
+        next_wire_phase_id: &mut u64,
+        next_operation_id: &mut u64,
+        rate: f64,
+    ) -> Result<Option<PhaseReport>, ExecutorError> {
+        if stop.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if config.phases.warmup_ms > 0 {
+            self.run_interval(
+                cohort,
+                stop,
+                next_wire_phase_id,
+                next_operation_id,
+                rate,
+                Duration::from_millis(config.phases.warmup_ms),
+                operations,
+                batch_limit,
+                false,
+            )?;
+            if stop.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+        }
+        let measured = self.run_interval(
+            cohort,
+            stop,
+            next_wire_phase_id,
+            next_operation_id,
+            rate,
+            Duration::from_millis(config.phases.measurement_ms),
+            operations,
+            batch_limit,
+            true,
+        )?;
+        if measured.elapsed_ns == 0 {
+            return Ok(None);
+        }
+        let quality = phase_quality(&measured, &self.options);
+        Ok(Some(PhaseReport {
+            offered_rate: rate,
+            goodput_rate: measured.successful_in_window as f64 * NANOS_PER_SECOND
+                / measured.elapsed_ns as f64,
+            elapsed_ns: measured.elapsed_ns,
+            stats: summarize_results(&measured.results)?,
+            quality,
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -362,6 +622,16 @@ pub fn configured_rates(
             "load cycles must be greater than zero".into(),
         ));
     }
+    if config.strategy == Strategy::Adaptive && !config.load.explicit_levels.is_empty() {
+        return Err(ExecutorError::InvalidConfiguration(
+            "explicit load levels cannot be used with adaptive traversal".into(),
+        ));
+    }
+    if config.strategy == Strategy::Adaptive && config.load.cycles != 1 {
+        return Err(ExecutorError::InvalidConfiguration(
+            "adaptive traversal uses one discovery/refinement cycle".into(),
+        ));
+    }
     if !config.load.initial_rate.is_finite() || config.load.initial_rate <= 0.0 {
         return Err(ExecutorError::InvalidConfiguration(
             "initial rate must be a positive finite number".into(),
@@ -407,6 +677,10 @@ pub fn configured_rates(
         config.load.explicit_levels.clone()
     };
 
+    if config.strategy == Strategy::Adaptive {
+        return Ok(ascending);
+    }
+
     let mut cycle = ascending.clone();
     if config.strategy == Strategy::UpDown && ascending.len() > 1 {
         cycle.extend(ascending.iter().rev().skip(1).copied());
@@ -444,6 +718,124 @@ fn dispatch_lag_invalid(
         .dispatch_lag_ns
         .p99
         .is_some_and(|lag| lag > threshold.max(fractional))
+}
+
+fn phase_quality(measured: &MeasuredInterval, options: &ExecutorOptions) -> PhaseQuality {
+    let bucket_count = options.stationarity_buckets.max(1);
+    let bucket_duration = measured.elapsed_ns.div_ceil(bucket_count as u64).max(1);
+    let mut buckets = (0..bucket_count)
+        .map(|index| MeasurementBucket {
+            start_offset_ns: index as u64 * bucket_duration,
+            duration_ns: bucket_duration.min(
+                measured
+                    .elapsed_ns
+                    .saturating_sub(index as u64 * bucket_duration),
+            ),
+            attempts: 0,
+            successful: 0,
+            failed: 0,
+            timed_out: 0,
+            goodput_rate: 0.0,
+        })
+        .filter(|bucket| bucket.duration_ns > 0)
+        .collect::<Vec<_>>();
+
+    for result in &measured.results {
+        let last_bucket = buckets.len().saturating_sub(1);
+        let attempt_index = (result.intended_start_offset_ns / bucket_duration) as usize;
+        let Some(attempt_bucket) = buckets.get_mut(attempt_index.min(last_bucket)) else {
+            continue;
+        };
+        attempt_bucket.attempts += 1;
+        let completion_offset = result
+            .actual_start_offset_ns
+            .saturating_add(result.client_latency_ns);
+        if completion_offset > measured.elapsed_ns {
+            continue;
+        }
+        let completion_index = (completion_offset / bucket_duration) as usize;
+        let Some(completion_bucket) = buckets.get_mut(completion_index.min(last_bucket)) else {
+            continue;
+        };
+        match result.status {
+            OperationStatus::Ok => completion_bucket.successful += 1,
+            OperationStatus::Error { .. } => completion_bucket.failed += 1,
+            OperationStatus::Timeout => completion_bucket.timed_out += 1,
+        }
+    }
+    for bucket in &mut buckets {
+        bucket.goodput_rate =
+            bucket.successful as f64 * NANOS_PER_SECOND / bucket.duration_ns as f64;
+    }
+
+    if (measured.results.len() as u64) < options.minimum_stationarity_samples || buckets.len() < 2 {
+        return PhaseQuality {
+            stationary: true,
+            reason: Some("too few samples for a stationarity rejection".into()),
+            buckets,
+        };
+    }
+
+    let mean = buckets
+        .iter()
+        .map(|bucket| bucket.goodput_rate)
+        .sum::<f64>()
+        / buckets.len() as f64;
+    let maximum_deviation = buckets
+        .iter()
+        .map(|bucket| (bucket.goodput_rate - mean).abs())
+        .fold(0.0_f64, f64::max);
+    let relative_deviation = if mean > 0.0 {
+        maximum_deviation / mean
+    } else {
+        f64::INFINITY
+    };
+    let stationary = relative_deviation <= options.stationarity_tolerance;
+    PhaseQuality {
+        stationary,
+        reason: Some(if stationary {
+            format!(
+                "bucket goodput deviation {:.1}% was within the {:.1}% limit",
+                relative_deviation * 100.0,
+                options.stationarity_tolerance * 100.0
+            )
+        } else {
+            format!(
+                "bucket goodput deviation {:.1}% exceeded the {:.1}% limit",
+                relative_deviation * 100.0,
+                options.stationarity_tolerance * 100.0
+            )
+        }),
+        buckets,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_decision(
+    sink: &mut impl ExecutionSink,
+    sequence: &mut u64,
+    stage: crate::measurement::MeasurementStage,
+    action: StrategyAction,
+    offered_rate: f64,
+    next_rate: Option<f64>,
+    reason: &str,
+) -> Result<(), ExecutorError> {
+    sink.record_strategy_decision(StrategyDecision {
+        sequence: *sequence,
+        stage,
+        action,
+        offered_rate,
+        next_rate,
+        reason: reason.into(),
+    })
+    .map_err(ExecutorError::Sink)?;
+    *sequence = sequence.saturating_add(1);
+    Ok(())
+}
+
+fn recover_or_stop(config: &RunConfig, stop: &Arc<AtomicBool>) -> bool {
+    config.phases.recovery_ms > 0
+        && sleep_until_or_stop(stop, Duration::from_millis(config.phases.recovery_ms))
 }
 
 fn successful_within(result: &OperationResult, interval_duration: Duration) -> bool {
@@ -673,6 +1065,7 @@ mod tests {
     struct RecordingSink {
         events: Vec<RunEvent>,
         phases: Vec<(PhaseId, PhaseReport)>,
+        decisions: Vec<StrategyDecision>,
     }
 
     impl ExecutionSink for RecordingSink {
@@ -687,6 +1080,11 @@ mod tests {
             report: PhaseReport,
         ) -> Result<(), String> {
             self.phases.push((phase_id, report));
+            Ok(())
+        }
+
+        fn record_strategy_decision(&mut self, decision: StrategyDecision) -> Result<(), String> {
+            self.decisions.push(decision);
             Ok(())
         }
     }
@@ -893,5 +1291,37 @@ mod tests {
 
         assert!(assignments.lock().unwrap().is_empty());
         assert_eq!(completion, ExecutorCompletion::Stopped);
+    }
+
+    #[test]
+    fn bucket_drift_marks_a_phase_non_stationary() {
+        let results = (0..20)
+            .map(|id| OperationResult {
+                id: OperationId(id + 1),
+                operation: "read".into(),
+                arguments: BTreeMap::new(),
+                intended_start_offset_ns: id,
+                actual_start_offset_ns: id,
+                client_latency_ns: 1,
+                status: OperationStatus::Ok,
+            })
+            .collect();
+        let quality = phase_quality(
+            &MeasuredInterval {
+                elapsed_ns: 1_000,
+                successful_in_window: 20,
+                results,
+            },
+            &ExecutorOptions::default(),
+        );
+
+        assert!(!quality.stationary);
+        assert_eq!(quality.buckets.len(), 5);
+        assert!(
+            quality
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("exceeded"))
+        );
     }
 }

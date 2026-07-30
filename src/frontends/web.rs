@@ -1,7 +1,7 @@
 //! Browser GUI and versioned HTTP/WebSocket control API.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -26,6 +26,7 @@ use crate::{
     engine::{EngineCommand, EngineError, EngineEvent, EngineHandle, RunSnapshot},
     protocol::{PhaseId, RunId},
     stats::PhaseReport,
+    strategy::StrategyDecision,
 };
 
 use super::Frontend;
@@ -50,6 +51,8 @@ pub struct ApiSnapshot {
 pub struct RunResults {
     pub run_id: RunId,
     pub phases: Vec<PhaseObservation>,
+    #[serde(default)]
+    pub decisions: Vec<StrategyDecision>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -122,42 +125,56 @@ impl WebState {
 #[derive(Default)]
 struct ResultStore {
     phases: BTreeMap<RunId, Vec<PhaseObservation>>,
+    decisions: BTreeMap<RunId, Vec<StrategyDecision>>,
 }
 
 impl ResultStore {
     fn observe(&mut self, event: &EngineEvent) {
-        let EngineEvent::PhaseStats {
-            run_id,
-            phase_id,
-            report,
-        } = event
-        else {
-            return;
-        };
-        let phases = self.phases.entry(*run_id).or_default();
-        let observation = PhaseObservation {
-            phase_id: *phase_id,
-            report: report.clone(),
-        };
-        if let Some(existing) = phases
-            .iter_mut()
-            .find(|existing| existing.phase_id == *phase_id)
-        {
-            *existing = observation;
-        } else {
-            phases.push(observation);
-            if phases.len() > MAX_PHASES_PER_RUN {
-                phases.remove(0);
+        match event {
+            EngineEvent::PhaseStats {
+                run_id,
+                phase_id,
+                report,
+            } => {
+                let phases = self.phases.entry(*run_id).or_default();
+                let observation = PhaseObservation {
+                    phase_id: *phase_id,
+                    report: report.clone(),
+                };
+                if let Some(existing) = phases
+                    .iter_mut()
+                    .find(|existing| existing.phase_id == *phase_id)
+                {
+                    *existing = observation;
+                } else {
+                    phases.push(observation);
+                    if phases.len() > MAX_PHASES_PER_RUN {
+                        phases.remove(0);
+                    }
+                }
             }
+            EngineEvent::StrategyDecision { run_id, decision } => {
+                let decisions = self.decisions.entry(*run_id).or_default();
+                decisions.push(decision.clone());
+                if decisions.len() > MAX_PHASES_PER_RUN * 3 {
+                    decisions.remove(0);
+                }
+            }
+            _ => {}
         }
     }
 
     fn snapshot(&self) -> Vec<RunResults> {
         self.phases
-            .iter()
-            .map(|(run_id, phases)| RunResults {
-                run_id: *run_id,
-                phases: phases.clone(),
+            .keys()
+            .chain(self.decisions.keys())
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|run_id| RunResults {
+                run_id,
+                phases: self.phases.get(&run_id).cloned().unwrap_or_default(),
+                decisions: self.decisions.get(&run_id).cloned().unwrap_or_default(),
             })
             .collect()
     }
@@ -523,7 +540,11 @@ impl From<std::io::Error> for WebFrontendError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stats::{PhaseReport, summarize_results};
+    use crate::{
+        measurement::MeasurementStage,
+        stats::{PhaseReport, summarize_results},
+        strategy::{StrategyAction, StrategyDecision},
+    };
 
     #[test]
     fn remote_binding_requires_an_explicit_opt_in() {
@@ -551,6 +572,7 @@ mod tests {
                     goodput_rate,
                     elapsed_ns: 1_000_000_000,
                     stats: summarize_results(&[]).unwrap(),
+                    quality: Default::default(),
                 },
             });
         }
@@ -559,6 +581,19 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].phases.len(), 1);
         assert_eq!(snapshot[0].phases[0].report.goodput_rate, 95.0);
+
+        store.observe(&EngineEvent::StrategyDecision {
+            run_id: RunId(1),
+            decision: StrategyDecision {
+                sequence: 1,
+                stage: MeasurementStage::Discovery,
+                action: StrategyAction::Select,
+                offered_rate: 100.0,
+                next_rate: Some(100.0),
+                reason: "test".into(),
+            },
+        });
+        assert_eq!(store.snapshot()[0].decisions.len(), 1);
     }
 
     #[test]
@@ -607,6 +642,7 @@ mod tests {
         assert!(APP_JS.contains(r#""Add explicitly""#));
         assert!(APP_JS.contains("strategyDescriptions"));
         assert!(APP_JS.contains("updateStrategyHelp"));
+        assert!(APP_JS.contains("geometric midpoints"));
         assert!(APP_JS.contains("renderRunProgress"));
         assert!(APP_JS.contains("plannedPhaseCount"));
         assert!(APP_JS.contains("scheduleConfigurationSync"));

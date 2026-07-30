@@ -28,6 +28,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             adapter::run_tcp(&address)
         }
         "e2e" => e2e::run(),
+        "e2e-adaptive" => e2e::run_adaptive(),
         "e2e-tcp" => e2e::run_tcp_multi_client(),
         "e2e-tcp-web" => {
             #[cfg(feature = "web")]
@@ -84,6 +85,7 @@ fn print_help() {
         "kneefinder queue demo\n\n\
          Usage:\n  \
            kneefinder-queue-demo e2e\n  \
+           kneefinder-queue-demo e2e-adaptive\n  \
            kneefinder-queue-demo e2e-tcp\n  \
            kneefinder-queue-demo e2e-tcp-web [HOST:PORT]\n  \
            kneefinder-queue-demo e2e-tcp-web-external HOST:PORT ID=tcp://HOST:PORT...\n  \

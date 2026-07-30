@@ -85,6 +85,12 @@ available:
 cargo run --release --manifest-path demo/queue-demo/Cargo.toml -- e2e
 ```
 
+The same queue also provides a release-mode adaptive traversal check:
+
+```console
+cargo run --release --manifest-path demo/queue-demo/Cargo.toml -- e2e-adaptive
+```
+
 ## Browser UI and API
 
 Build and serve the optional web frontend:
@@ -251,10 +257,16 @@ stop an active run while retaining its agents. The production engine now turns
 prepared cohorts and `RunConfig` values into bounded, deterministic scheduled
 operation batches for CLI and browser runs, including warmup, measurement,
 recovery, repetitions, sweep/up-down traversal, per-phase statistics, and
-bounded interruptible stop. Stop preserves results already received, sends
+bounded interruptible stop. Adaptive runs now establish a stable baseline,
+discover a healthy/saturated bracket geometrically, and refine it with
+geometric midpoints. Fixed time buckets can reject non-stationary phases;
+adaptive runs repeat them within the configured repetition budget. Every load
+selection, acceptance, repetition, rejection, and recovery interval is emitted
+through the shared engine API and retained in browser run results. Stop
+preserves results already received, sends
 `CancelPhase` to active agents, and force-closes an unresponsive session after
-the cancellation deadline. Adaptive bracketing, statistical knee fitting, and
-durable run artifacts remain roadmap work, so completed generic runs do not yet
-report a target knee.
+the cancellation deadline. Statistical knee fitting and durable run artifacts
+remain roadmap work. Adaptive traversal can report a refined saturation
+bracket, but deliberately does not manufacture a numerical knee estimate.
 
 See [docs/design.md](docs/design.md) for the measurement and knee-finding design.

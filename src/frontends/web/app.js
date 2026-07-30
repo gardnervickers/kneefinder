@@ -2,6 +2,7 @@
 
 const runs = new Map();
 const results = new Map();
+const decisions = new Map();
 const pending = new Map();
 let selectedRunId = null;
 let socket = null;
@@ -16,7 +17,7 @@ let selectedPreset = "quick";
 const $ = (id) => document.getElementById(id);
 const svgNs = "http://www.w3.org/2000/svg";
 const strategyDescriptions = Object.freeze({
-  adaptive: "Currently increases load geometrically through the configured bounds. Automatic knee bracketing and refinement are planned next.",
+  adaptive: "Establishes a stable baseline, grows load geometrically until saturation is bracketed, then refines with geometric midpoints.",
   sweep: "Runs each configured load level from low to high for a predictable capacity curve.",
   "up-down": "Runs load upward and then downward to reveal hysteresis: different behavior while load is falling.",
 });
@@ -77,8 +78,12 @@ function handleMessage(message) {
 function applySnapshot(snapshot) {
   runs.clear();
   results.clear();
+  decisions.clear();
   for (const run of snapshot.runs) runs.set(run.run_id, run);
-  for (const result of snapshot.results) results.set(result.run_id, result.phases);
+  for (const result of snapshot.results) {
+    results.set(result.run_id, result.phases);
+    decisions.set(result.run_id, result.decisions || []);
+  }
   let selectionChanged = false;
   if (selectedRunId === null || !runs.has(selectedRunId)) {
     selectedRunId = latestRunId();
@@ -101,6 +106,10 @@ function applyEvent(event) {
     const index = phases.findIndex((phase) => phase.phase_id === event.phase_id);
     if (index >= 0) phases[index] = observation; else phases.push(observation);
     results.set(event.run_id, phases);
+  } else if (event.event === "strategy_decision") {
+    const runDecisions = decisions.get(event.run_id) || [];
+    runDecisions.push(event.decision);
+    decisions.set(event.run_id, runDecisions);
   }
 }
 
@@ -145,27 +154,34 @@ function readConfig() {
     });
   }
   if (new Set(agents.map((agent) => agent.id)).size !== agents.length) throw new Error("Agent IDs must be unique.");
+  const strategy = $("strategy").value;
   const config = {
     preset: selectedPreset,
-    strategy: $("strategy").value,
+    strategy,
     phases: {
       warmup_ms: numberValue("warmup"),
       measurement_ms: numberValue("measurement"),
       recovery_ms: numberValue("recovery"),
-      repetitions: 1,
+      repetitions: numberValue("repetitions"),
     },
     load: {
       initial_rate: numberValue("initial-rate"),
       maximum_rate: numberValue("maximum-rate"),
       growth_factor: numberValue("growth-factor"),
-      explicit_levels: levels,
-      cycles: numberValue("cycles"),
+      explicit_levels: strategy === "adaptive" ? [] : levels,
+      cycles: strategy === "adaptive" ? 1 : numberValue("cycles"),
     },
     workload: { operations },
     output_directory: $("output-directory").value.trim() || "results",
     agents,
   };
   if (config.phases.measurement_ms < 1) throw new Error("Measurement time must be positive.");
+  if (!Number.isSafeInteger(config.phases.repetitions) || config.phases.repetitions < 1) {
+    throw new Error("Attempts must be a positive integer.");
+  }
+  if (!Number.isSafeInteger(config.load.cycles) || config.load.cycles < 1) {
+    throw new Error("Cycles must be a positive integer.");
+  }
   if (config.load.initial_rate <= 0 || config.load.maximum_rate < config.load.initial_rate) throw new Error("Check the initial and maximum rates.");
   if (config.load.growth_factor <= 1) throw new Error("Growth factor must exceed one.");
   return config;
@@ -365,6 +381,7 @@ function loadForm(run) {
   $("maximum-rate").value = config.load.maximum_rate;
   $("growth-factor").value = config.load.growth_factor;
   $("cycles").value = config.load.cycles;
+  $("repetitions").value = config.phases.repetitions;
   $("levels").value = config.load.explicit_levels.join(", ");
   $("warmup").value = config.phases.warmup_ms;
   $("measurement").value = config.phases.measurement_ms;
@@ -389,9 +406,12 @@ function loadConfiguredVariants(config) {
 }
 
 function updateStrategyHelp() {
+  const adaptive = $("strategy").value === "adaptive";
   const description = strategyDescriptions[$("strategy").value] || "";
   $("strategy-help").textContent = description;
   $("strategy").title = description;
+  $("levels").disabled = adaptive;
+  $("cycles").disabled = adaptive;
 }
 
 function selectedCatalog() {
@@ -665,6 +685,7 @@ function progressForRun(run) {
 }
 
 function plannedPhaseCount(config) {
+  if (config.strategy === "adaptive") return 0;
   let levels = config.load.explicit_levels.length;
   if (!levels) {
     let rate = config.load.initial_rate;
@@ -710,7 +731,12 @@ function renderMetrics() {
 
 function stateName(state) { return state.state.replaceAll("_", " "); }
 function stageName(state) {
-  if (state.state === "measuring") return `Stage: ${state.stage}`;
+  if (state.state === "measuring") {
+    const latest = selectedRunId === null ? null : (decisions.get(selectedRunId) || []).at(-1);
+    return latest
+      ? `${latest.stage}: ${latest.action} ${formatRate(latest.offered_rate)} ops/s`
+      : `Stage: ${state.stage}`;
+  }
   if (state.state === "completed") return state.outcome.classification.replaceAll("_", " ");
   if (state.state === "configured") {
     return selectedRun()?.preparation?.status === "ready" ? "Agents ready" : "Connecting to agents";

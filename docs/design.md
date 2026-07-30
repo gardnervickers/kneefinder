@@ -242,9 +242,12 @@ broken workload or client is visible alongside the throughput and latency
 curves rather than being mistaken for a target knee.
 
 Each completed phase wraps those statistics with offered rate, successful
-goodput, and elapsed time. This shared `PhaseReport` is the graph point consumed
-by artifact writers and streaming frontends, keeping graph semantics out of the
-HTTP/WebSocket layer.
+goodput, elapsed time, fixed measurement buckets, and a stationarity decision.
+This shared `PhaseReport` is the graph point consumed by artifact writers and
+streaming frontends, keeping graph semantics out of the HTTP/WebSocket layer.
+Traversal choices are separate `StrategyDecision` events, including their
+stage, action, selected and next rate, and reason. Browser run results retain
+those decisions so reconnecting clients do not lose provenance.
 
 CLI examples:
 
@@ -340,9 +343,14 @@ Each phase records:
 Timeouts are never discarded. They remain explicit counts and contribute at
 least the timeout duration to censored latency statistics.
 
-A phase has a warm-up interval followed by a measurement interval. It must meet
-both a minimum duration and a minimum observation count. Trends across time
-buckets can mark a phase unstable and cause it to be extended or repeated.
+A phase has a warm-up interval followed by a measurement interval. Warm-up
+results are intentionally discarded. Fixed-duration measurement buckets compare
+goodput over the phase; material drift marks the phase non-stationary. Adaptive
+runs repeat a rejected phase within the configured repetition budget and
+terminate as `unstable_measurement` when that budget is exhausted. Fixed
+traversals retain rejected points but classify the run as unstable. Configured
+recovery intervals execute between visits and are emitted as strategy
+provenance.
 
 ## Knee-finding algorithm
 
@@ -498,6 +506,13 @@ CLI presets whose only purpose is to select starting values. Strategy help
 distinguishes the up/down traversal from the hysteresis it is intended to
 detect. Run progress is based on completed planned phases for fixed traversals
 and lifecycle stages for adaptive runs.
+
+The current traversal engine implements baseline, geometric discovery, and
+geometric midpoint refinement using conservative throughput-efficiency,
+latency, and unsuccessful-rate evidence. It keeps generator saturation and
+phase instability as separate terminal classifications. The statistical model
+comparison, confidence interval, and numerical knee estimate described below
+remain the fitter's responsibility; traversal alone reports no fabricated knee.
 
 ## Events and persistence
 

@@ -213,14 +213,15 @@ At the time this handoff was written, these pieces exist:
 The generic executor now turns a prepared cohort and `RunConfig` into bounded,
 deterministic scheduled-operation batches for CLI and browser runs. It supports
 warmup, measured intervals, recovery, repetitions, fixed sweep/up-down plans,
-per-phase statistics, generator-saturation invalidation, and cooperative stop.
+adaptive baseline/discovery/geometric refinement, fixed-bucket stationarity
+checks with bounded repeats, strategy-decision provenance, per-phase statistics,
+generator-saturation invalidation, and cooperative stop.
 The queue demo exercises this production path for both colocated and
 multi-client web runs. In-flight schedules are interruptible: Stop preserves
 partial results, sends `CancelPhase`, and force-closes the session after a
 deadline, killing only a colocated subprocess while leaving a remote agent
-process available. Adaptive bracketing/refinement, statistical knee fitting,
-and durable artifacts remain roadmap work. Keep README's Current status section
-honest as work progresses.
+process available. Statistical knee fitting and durable artifacts remain
+roadmap work. Keep README's Current status section honest as work progresses.
 
 `docs/design.md` is the contract and direction, not proof of implementation.
 Inspect source and current GitHub issue state before relying on a described
@@ -249,6 +250,12 @@ Run it with:
 
 ```console
 cargo run --release --manifest-path demo/queue-demo/Cargo.toml -- e2e
+```
+
+Run the adaptive baseline/discovery/refinement E2E with:
+
+```console
+cargo run --release --manifest-path demo/queue-demo/Cargo.toml -- e2e-adaptive
 ```
 
 Run the two-client TCP transport E2E with:

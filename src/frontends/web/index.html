@@ -37,9 +37,10 @@
               <label>Initial rate<input id="initial-rate" type="number" min="0.001" step="any" value="100"></label>
               <label>Maximum rate<input id="maximum-rate" type="number" min="0.001" step="any" value="10000"></label>
             </div>
-            <div class="field-pair">
+            <div class="field-triple">
               <label>Growth factor<input id="growth-factor" type="number" min="1.001" step="any" value="1.5"></label>
               <label>Cycles<input id="cycles" type="number" min="1" step="1" value="1"></label>
+              <label>Attempts<input id="repetitions" type="number" min="1" step="1" value="1" title="Fixed phase repetitions; in adaptive mode, maximum stability attempts per load."></label>
             </div>
             <label>Explicit levels <span class="hint">comma-separated, optional</span><input id="levels" placeholder="100, 200, 300"></label>
             <div class="field-triple">

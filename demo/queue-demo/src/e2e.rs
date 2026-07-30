@@ -23,9 +23,10 @@ use kneefinder::{
         PhaseConfig, Preset, RunConfig, Strategy, WeightedOperation, WorkloadConfig,
     },
     engine::{Engine, EngineCommand, EngineEvent},
-    measurement::RunState,
+    measurement::{MeasurementStage, RunClassification, RunState},
     protocol::{ArgumentValue, OperationId, PhaseId, RunId, ScheduledOperation},
     stats::{OperationVariant, StatsReport, summarize_results},
+    strategy::{StrategyAction, StrategyDecision},
 };
 
 #[cfg(feature = "web")]
@@ -122,6 +123,85 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     }
     print_rows(&rows, expected_knee);
     print_variant_stats(&rows);
+    Ok(())
+}
+
+pub fn run_adaptive() -> Result<(), Box<dyn Error>> {
+    let executable = env::current_exe()?;
+    let endpoints = vec![AgentEndpointConfig {
+        id: "colocated-0".into(),
+        transport: AgentTransportConfig::Subprocess {
+            command: AdapterCommand {
+                program: executable.to_string_lossy().into_owned(),
+                arguments: vec!["adapter".into()],
+            },
+        },
+    }];
+    let mut config = demo_config(endpoints, &[100.0, 550.0]);
+    config.strategy = Strategy::Adaptive;
+    config.load.explicit_levels.clear();
+    config.load.growth_factor = 2.0;
+    config.phases.warmup_ms = 200;
+    config.phases.measurement_ms = 1_000;
+    config.phases.recovery_ms = 1_000;
+    config.phases.repetitions = 3;
+
+    let engine = Engine::new();
+    let handle = engine.handle();
+    let events = handle.subscribe();
+    let configured = handle.execute(EngineCommand::Configure {
+        config: Box::new(config),
+    })?;
+    handle.execute(EngineCommand::PrepareAgents {
+        run_id: configured.run_id,
+    })?;
+    handle.execute(EngineCommand::Start {
+        run_id: configured.run_id,
+    })?;
+
+    let mut reports = 0;
+    let mut decisions = Vec::<StrategyDecision>::new();
+    let classification = loop {
+        match events.recv()? {
+            EngineEvent::PhaseStats { run_id, report, .. } if run_id == configured.run_id => {
+                reports += 1;
+                eprintln!(
+                    "adaptive measured {:.1} req/s: {:.1} goodput, stationary={}",
+                    report.offered_rate, report.goodput_rate, report.quality.stationary
+                );
+            }
+            EngineEvent::StrategyDecision { run_id, decision } if run_id == configured.run_id => {
+                decisions.push(decision);
+            }
+            EngineEvent::RunStateChanged { snapshot, .. }
+                if snapshot.run_id == configured.run_id && snapshot.state.is_terminal() =>
+            {
+                match snapshot.state {
+                    RunState::Completed { outcome } => break outcome.classification,
+                    state => return Err(format!("adaptive run ended in {state:?}").into()),
+                }
+            }
+            _ => {}
+        }
+    };
+
+    if classification != RunClassification::TargetSaturated {
+        return Err(format!("adaptive run classified as {classification:?}").into());
+    }
+    if reports < 5
+        || !decisions.iter().any(|decision| {
+            decision.stage == MeasurementStage::Refinement
+                && decision.action == StrategyAction::Select
+        })
+    {
+        return Err(format!(
+            "adaptive run did not exercise refinement: {reports} reports, decisions={decisions:?}"
+        )
+        .into());
+    }
+    println!(
+        "adaptive E2E passed: {reports} measured phases, target saturation bracket refined without a fabricated knee"
+    );
     Ok(())
 }
 

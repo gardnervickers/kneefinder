@@ -77,6 +77,13 @@ The colocated mode remains available as a quick smoke test without Docker:
 cargo run --manifest-path demo/queue-demo/Cargo.toml --release -- e2e
 ```
 
+Exercise adaptive baseline, geometric discovery, bucket-stability decisions,
+and midpoint refinement against the same deterministic queue:
+
+```console
+cargo run --manifest-path demo/queue-demo/Cargo.toml --release -- e2e-adaptive
+```
+
 The command creates a coordinator-owned colocated agent, launches the combined
 adapter/service as its supervised child, drives a range of offered loads, and
 prints the overall curve followed by counts and p50/p95/p99 latency for every

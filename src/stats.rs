@@ -15,6 +15,38 @@ pub struct PhaseReport {
     pub goodput_rate: f64,
     pub elapsed_ns: u64,
     pub stats: StatsReport,
+    #[serde(default)]
+    pub quality: PhaseQuality,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PhaseQuality {
+    pub stationary: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub buckets: Vec<MeasurementBucket>,
+}
+
+impl Default for PhaseQuality {
+    fn default() -> Self {
+        Self {
+            stationary: true,
+            reason: None,
+            buckets: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeasurementBucket {
+    pub start_offset_ns: u64,
+    pub duration_ns: u64,
+    pub attempts: u64,
+    pub successful: u64,
+    pub failed: u64,
+    pub timed_out: u64,
+    pub goodput_rate: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
