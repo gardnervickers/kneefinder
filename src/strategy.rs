@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    analysis::AnalysisTermination,
     config::{RunConfig, Strategy},
     measurement::{MeasurementStage, RunClassification, RunEvent, RunOutcome},
     stats::PhaseReport,
@@ -47,6 +48,10 @@ pub enum ObservationOutcome {
     },
     Complete {
         outcome: RunOutcome,
+        lifecycle_events: Vec<RunEvent>,
+    },
+    Analyze {
+        termination: AnalysisTermination,
         lifecycle_events: Vec<RunEvent>,
     },
 }
@@ -131,12 +136,12 @@ impl AdaptiveStrategy {
                 self.last_healthy_rate = Some(self.current.rate);
                 let next = (self.current.rate * self.growth_factor).min(self.maximum_rate);
                 if next <= self.current.rate {
-                    return ObservationOutcome::Complete {
-                        outcome: outcome(
-                            RunClassification::MaximumLoadReached,
-                            "maximum load was reached before a saturation bracket was found",
-                        ),
-                        lifecycle_events: vec![RunEvent::BaselineEstablished],
+                    return ObservationOutcome::Analyze {
+                        termination: AnalysisTermination::MaximumLoadReached,
+                        lifecycle_events: vec![
+                            RunEvent::BaselineEstablished,
+                            RunEvent::AnalysisStarted,
+                        ],
                     };
                 }
                 self.current = PhaseRequest {
@@ -155,12 +160,9 @@ impl AdaptiveStrategy {
                 } else {
                     self.last_healthy_rate = Some(self.current.rate);
                     if self.current.rate >= self.maximum_rate {
-                        ObservationOutcome::Complete {
-                            outcome: outcome(
-                                RunClassification::MaximumLoadReached,
-                                "maximum load was reached without evidence of target saturation",
-                            ),
-                            lifecycle_events: Vec::new(),
+                        ObservationOutcome::Analyze {
+                            termination: AnalysisTermination::MaximumLoadReached,
+                            lifecycle_events: vec![RunEvent::AnalysisStarted],
                         }
                     } else {
                         self.current.rate =
@@ -188,18 +190,9 @@ impl AdaptiveStrategy {
                 if upper / lower <= self.refinement_ratio
                     || self.refinements >= self.maximum_refinements
                 {
-                    let outcome = outcome(
-                        RunClassification::TargetSaturated,
-                        "saturation was bracketed and refined; statistical fitting is tracked by issue #4",
-                    );
-                    ObservationOutcome::Complete {
-                        lifecycle_events: vec![
-                            RunEvent::BracketRefined,
-                            RunEvent::CandidateValidated {
-                                outcome: outcome.clone(),
-                            },
-                        ],
-                        outcome,
+                    ObservationOutcome::Analyze {
+                        termination: AnalysisTermination::BracketRefined,
+                        lifecycle_events: vec![RunEvent::BracketRefined],
                     }
                 } else {
                     self.current.rate = geometric_midpoint(lower, upper);
@@ -257,6 +250,7 @@ fn outcome(classification: RunClassification, warning: &str) -> RunOutcome {
         classification,
         knee: None,
         slo_maximum_rate: None,
+        analysis: None,
         warnings: vec![warning.into()],
     }
 }
@@ -290,6 +284,7 @@ mod tests {
                 explicit_levels: Vec::new(),
                 cycles: 1,
             },
+            analysis: Default::default(),
             workload: WorkloadConfig {
                 operations: OperationSelection::Selected {
                     operations: vec![WeightedOperation {
@@ -317,6 +312,7 @@ mod tests {
             offered_rate: rate,
             goodput_rate: goodput,
             elapsed_ns: 1_000_000_000,
+            in_flight_high_water: 1,
             stats: StatsReport {
                 overall: SampleStats {
                     attempts: rate as u64,
@@ -362,11 +358,8 @@ mod tests {
         ));
         assert!(matches!(
             strategy.observe(&report(400.0, 400.0, 10, true), false),
-            ObservationOutcome::Complete {
-                outcome: RunOutcome {
-                    classification: RunClassification::MaximumLoadReached,
-                    ..
-                },
+            ObservationOutcome::Analyze {
+                termination: AnalysisTermination::MaximumLoadReached,
                 ..
             }
         ));
@@ -395,12 +388,8 @@ mod tests {
         }
         assert!(matches!(
             outcome,
-            ObservationOutcome::Complete {
-                outcome: RunOutcome {
-                    classification: RunClassification::TargetSaturated,
-                    knee: None,
-                    ..
-                },
+            ObservationOutcome::Analyze {
+                termination: AnalysisTermination::BracketRefined,
                 ..
             }
         ));

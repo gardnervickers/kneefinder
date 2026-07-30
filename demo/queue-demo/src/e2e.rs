@@ -91,7 +91,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     })?;
 
     let mut rows = Vec::new();
-    loop {
+    let outcome = loop {
         match events.recv()? {
             EngineEvent::PhaseStats { run_id, report, .. } if run_id == configured.run_id => {
                 let row = DemoRow::from_report(report);
@@ -105,13 +105,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 if snapshot.run_id == configured.run_id && snapshot.state.is_terminal() =>
             {
                 match snapshot.state {
-                    RunState::Completed { .. } => break,
+                    RunState::Completed { outcome } => break outcome,
                     state => return Err(format!("generic colocated run ended in {state:?}").into()),
                 }
             }
             _ => {}
         }
-    }
+    };
 
     if rows.len() != rates.len() {
         return Err(format!(
@@ -121,6 +121,23 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
+    let knee = outcome
+        .knee
+        .as_ref()
+        .ok_or_else(|| format!("fixed sweep did not produce a knee: {outcome:?}"))?;
+    if outcome.classification != RunClassification::TargetSaturated
+        || !(250.0..=350.0).contains(&knee.offered_rate)
+        || outcome.analysis.is_none()
+    {
+        return Err(format!("unexpected fixed-sweep knee result: {outcome:?}").into());
+    }
+    eprintln!(
+        "fitted knee {:.1} req/s ({:.1}–{:.1}), recommended {:.1}\n",
+        knee.offered_rate,
+        knee.lower_bound,
+        knee.upper_bound,
+        knee.recommended_operating_rate
+    );
     print_rows(&rows, expected_knee);
     print_variant_stats(&rows);
     Ok(())
@@ -161,7 +178,7 @@ pub fn run_adaptive() -> Result<(), Box<dyn Error>> {
 
     let mut reports = 0;
     let mut decisions = Vec::<StrategyDecision>::new();
-    let classification = loop {
+    let outcome = loop {
         match events.recv()? {
             EngineEvent::PhaseStats { run_id, report, .. } if run_id == configured.run_id => {
                 reports += 1;
@@ -177,7 +194,7 @@ pub fn run_adaptive() -> Result<(), Box<dyn Error>> {
                 if snapshot.run_id == configured.run_id && snapshot.state.is_terminal() =>
             {
                 match snapshot.state {
-                    RunState::Completed { outcome } => break outcome.classification,
+                    RunState::Completed { outcome } => break outcome,
                     state => return Err(format!("adaptive run ended in {state:?}").into()),
                 }
             }
@@ -185,8 +202,20 @@ pub fn run_adaptive() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    if classification != RunClassification::TargetSaturated {
-        return Err(format!("adaptive run classified as {classification:?}").into());
+    if outcome.classification != RunClassification::TargetSaturated {
+        return Err(format!("adaptive run completed as {outcome:?}").into());
+    }
+    let knee = outcome
+        .knee
+        .as_ref()
+        .ok_or("adaptive run did not produce a knee estimate")?;
+    if !(250.0..=350.0).contains(&knee.offered_rate)
+        || knee.lower_bound > knee.offered_rate
+        || knee.upper_bound < knee.offered_rate
+        || knee.recommended_operating_rate > knee.lower_bound
+        || outcome.analysis.is_none()
+    {
+        return Err(format!("unexpected adaptive knee result: {outcome:?}").into());
     }
     if reports < 5
         || !decisions.iter().any(|decision| {
@@ -200,7 +229,11 @@ pub fn run_adaptive() -> Result<(), Box<dyn Error>> {
         .into());
     }
     println!(
-        "adaptive E2E passed: {reports} measured phases, target saturation bracket refined without a fabricated knee"
+        "adaptive E2E passed: {reports} phases, knee {:.1} req/s ({:.1}–{:.1}), recommended {:.1}",
+        knee.offered_rate,
+        knee.lower_bound,
+        knee.upper_bound,
+        knee.recommended_operating_rate
     );
     Ok(())
 }
@@ -425,6 +458,7 @@ fn demo_config(endpoints: Vec<AgentEndpointConfig>, rates: &[f64]) -> RunConfig 
             explicit_levels: rates.to_vec(),
             cycles: 1,
         },
+        analysis: Default::default(),
         workload: WorkloadConfig {
             operations: OperationSelection::Selected {
                 operations: vec![

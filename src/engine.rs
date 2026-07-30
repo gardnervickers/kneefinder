@@ -928,6 +928,7 @@ mod tests {
                 explicit_levels: Vec::new(),
                 cycles: 1,
             },
+            analysis: Default::default(),
             workload: WorkloadConfig {
                 operations: OperationSelection::AdapterDefaults,
             },
@@ -1172,6 +1173,7 @@ mod tests {
             offered_rate: 100.0,
             goodput_rate: 99.0,
             elapsed_ns: 1_000_000_000,
+            in_flight_high_water: 1,
             stats: summarize_results(&[]).unwrap(),
             quality: Default::default(),
         };

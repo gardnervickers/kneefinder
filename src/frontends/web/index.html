@@ -48,6 +48,15 @@
               <label>Measure ms<input id="measurement" type="number" min="1" value="10000"></label>
               <label>Recover ms<input id="recovery" type="number" min="0" value="2000"></label>
             </div>
+            <div class="field-triple">
+              <label>p95 SLO ms <span class="hint">optional</span><input id="latency-slo" type="number" min="0.001" step="any"></label>
+              <label>Max bad rate <span class="hint">0–1, optional</span><input id="unsuccessful-slo" type="number" min="0" max="1" step="any"></label>
+              <label>Safety factor<input id="safety-factor" type="number" min="0.001" max="1" step="any" value="0.8"></label>
+            </div>
+            <div class="field-pair">
+              <label>Bootstrap samples<input id="bootstrap-samples" type="number" min="1" step="1" value="400"></label>
+              <label>Bootstrap seed<input id="bootstrap-seed" type="number" min="1" step="1" value="1263420741"></label>
+            </div>
             <label>Adapter executable<input id="adapter-program" placeholder="./my-adapter"></label>
             <label>Adapter arguments <span class="hint">one per line</span><textarea id="adapter-args" rows="2" placeholder="--endpoint&#10;localhost:9000"></textarea></label>
             <label>Remote agents <span class="hint">one ID=tcp://HOST:PORT per line</span><textarea id="agent-endpoints" rows="2" placeholder="client-a=tcp://10.0.0.10:9000&#10;client-b=tcp://10.0.0.11:9000"></textarea></label>
@@ -113,8 +122,8 @@
 
         <div class="metrics">
           <article class="metric"><p>Run state</p><strong id="metric-state">—</strong><span id="metric-stage">Waiting for a run</span></article>
-          <article class="metric accent"><p>Knee</p><strong id="metric-knee">—</strong><span>offered operations / sec</span></article>
-          <article class="metric"><p>Recommended</p><strong id="metric-recommended">—</strong><span>operating rate</span></article>
+          <article class="metric accent"><p>Knee</p><strong id="metric-knee">—</strong><span id="metric-knee-detail">offered operations / sec</span></article>
+          <article class="metric"><p>Recommended</p><strong id="metric-recommended">—</strong><span id="metric-recommended-detail">operating rate</span></article>
           <article class="metric"><p>Agents</p><strong id="metric-agents">—</strong><span id="metric-agent-detail">workload clients</span></article>
           <article id="metric-errors" class="metric"><p>Unsuccessful</p><strong id="metric-error-rate">—</strong><span id="metric-error-detail">errors + timeouts</span></article>
           <article class="metric"><p>Measurements</p><strong id="metric-phases">0</strong><span>completed phases</span></article>

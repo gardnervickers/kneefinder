@@ -14,6 +14,8 @@ pub struct PhaseReport {
     pub offered_rate: f64,
     pub goodput_rate: f64,
     pub elapsed_ns: u64,
+    #[serde(default)]
+    pub in_flight_high_water: u64,
     pub stats: StatsReport,
     #[serde(default)]
     pub quality: PhaseQuality,

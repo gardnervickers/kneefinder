@@ -146,6 +146,9 @@ cargo run -- run \
   --strategy sweep \
   --levels 100,200,400 \
   --measurement 10s \
+  --latency-slo-ms 25 \
+  --maximum-unsuccessful-rate 0.01 \
+  --safety-factor 0.8 \
   --operation 'read:key=0@1' \
   -- ./adapter
 ```
@@ -262,11 +265,16 @@ discover a healthy/saturated bracket geometrically, and refine it with
 geometric midpoints. Fixed time buckets can reject non-stationary phases;
 adaptive runs repeat them within the configured repetition budget. Every load
 selection, acceptance, repetition, rejection, and recovery interval is emitted
-through the shared engine API and retained in browser run results. Stop
-preserves results already received, sends
+through the shared engine API and retained in browser run results. Completed
+runs fit a continuous two-segment goodput model, compare it with a single-line
+null model, validate the candidate using latency, reliability, in-flight
+growth, and dispatch lag, and estimate deterministic confidence bounds from
+measurement buckets. Resolved configuration records optional latency/error
+SLOs, the safety factor, bootstrap count, and seed. The terminal result retains
+both model parameters, every validity signal, the SLO capacity, the knee
+interval, and the conservative operating recommendation. Stop preserves
+results already received, sends
 `CancelPhase` to active agents, and force-closes an unresponsive session after
-the cancellation deadline. Statistical knee fitting and durable run artifacts
-remain roadmap work. Adaptive traversal can report a refined saturation
-bracket, but deliberately does not manufacture a numerical knee estimate.
+the cancellation deadline. Durable run artifacts remain roadmap work.
 
 See [docs/design.md](docs/design.md) for the measurement and knee-finding design.

@@ -37,6 +37,7 @@ fn stop_forces_a_hung_colocated_adapter_after_the_cancellation_deadline() {
                     explicit_levels: vec![100.0],
                     cycles: 1,
                 },
+                analysis: Default::default(),
                 workload: WorkloadConfig {
                     operations: OperationSelection::Selected {
                         operations: vec![WeightedOperation {

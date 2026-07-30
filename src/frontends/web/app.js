@@ -171,6 +171,13 @@ function readConfig() {
       explicit_levels: strategy === "adaptive" ? [] : levels,
       cycles: strategy === "adaptive" ? 1 : numberValue("cycles"),
     },
+    analysis: {
+      latency_slo_ms: optionalNumberValue("latency-slo"),
+      maximum_unsuccessful_rate: optionalNumberValue("unsuccessful-slo"),
+      safety_factor: numberValue("safety-factor"),
+      bootstrap_samples: numberValue("bootstrap-samples"),
+      bootstrap_seed: numberValue("bootstrap-seed"),
+    },
     workload: { operations },
     output_directory: $("output-directory").value.trim() || "results",
     agents,
@@ -181,6 +188,22 @@ function readConfig() {
   }
   if (!Number.isSafeInteger(config.load.cycles) || config.load.cycles < 1) {
     throw new Error("Cycles must be a positive integer.");
+  }
+  if (!(config.analysis.safety_factor > 0 && config.analysis.safety_factor <= 1)) {
+    throw new Error("Safety factor must be in (0, 1].");
+  }
+  if (!Number.isSafeInteger(config.analysis.bootstrap_samples)
+      || config.analysis.bootstrap_samples < 1) {
+    throw new Error("Bootstrap samples must be a positive integer.");
+  }
+  if (!Number.isSafeInteger(config.analysis.bootstrap_seed)
+      || config.analysis.bootstrap_seed < 1) {
+    throw new Error("Bootstrap seed must be a positive safe integer.");
+  }
+  if (config.analysis.maximum_unsuccessful_rate !== null
+      && !(config.analysis.maximum_unsuccessful_rate >= 0
+        && config.analysis.maximum_unsuccessful_rate <= 1)) {
+    throw new Error("Maximum bad rate must be in [0, 1].");
   }
   if (config.load.initial_rate <= 0 || config.load.maximum_rate < config.load.initial_rate) throw new Error("Check the initial and maximum rates.");
   if (config.load.growth_factor <= 1) throw new Error("Growth factor must exceed one.");
@@ -239,6 +262,11 @@ function readStructuredOperations() {
     seen.add(key);
     return { name: variant.name, weight, arguments: arguments_ };
   });
+}
+
+function optionalNumberValue(id) {
+  const value = $(id).value.trim();
+  return value === "" ? null : Number(value);
 }
 
 function parseAgentEndpoint(value) {
@@ -386,6 +414,12 @@ function loadForm(run) {
   $("warmup").value = config.phases.warmup_ms;
   $("measurement").value = config.phases.measurement_ms;
   $("recovery").value = config.phases.recovery_ms;
+  const analysis = config.analysis || {};
+  $("latency-slo").value = analysis.latency_slo_ms ?? "";
+  $("unsuccessful-slo").value = analysis.maximum_unsuccessful_rate ?? "";
+  $("safety-factor").value = analysis.safety_factor ?? 0.8;
+  $("bootstrap-samples").value = analysis.bootstrap_samples ?? 400;
+  $("bootstrap-seed").value = analysis.bootstrap_seed ?? 1263420741;
   loadConfiguredVariants(config);
   const subprocess = config.agents.find((agent) => agent.transport.kind === "subprocess");
   $("adapter-program").value = subprocess?.transport.command.program || "";
@@ -712,6 +746,13 @@ function renderMetrics() {
   $("metric-stage").textContent = run ? stageName(run.state) : "Waiting for a run";
   $("metric-knee").textContent = knee ? formatRate(knee.offered_rate) : "—";
   $("metric-recommended").textContent = knee ? formatRate(knee.recommended_operating_rate) : "—";
+  $("metric-knee-detail").textContent = knee
+    ? `${formatRate(knee.lower_bound)}–${formatRate(knee.upper_bound)} confidence interval`
+    : "offered operations / sec";
+  const sloMaximum = run?.state?.state === "completed" ? run.state.outcome.slo_maximum_rate : null;
+  $("metric-recommended-detail").textContent = sloMaximum == null
+    ? "safety-adjusted lower bound"
+    : `SLO maximum ${formatRate(sloMaximum)}`;
   const agents = run?.config.agents || [];
   const tcpAgents = agents.filter((agent) => agent.transport.kind === "tcp").length;
   const colocatedAgents = agents.length - tcpAgents;

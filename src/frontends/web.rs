@@ -571,6 +571,7 @@ mod tests {
                     offered_rate: 100.0,
                     goodput_rate,
                     elapsed_ns: 1_000_000_000,
+                    in_flight_high_water: 1,
                     stats: summarize_results(&[]).unwrap(),
                     quality: Default::default(),
                 },
@@ -631,6 +632,9 @@ mod tests {
         assert!(INDEX_HTML.contains(r#"id="strategy-help""#));
         assert!(INDEX_HTML.contains("Up/down (detect hysteresis)"));
         assert!(INDEX_HTML.contains(r#"id="run-progress-track""#));
+        assert!(INDEX_HTML.contains(r#"id="latency-slo""#));
+        assert!(INDEX_HTML.contains(r#"id="bootstrap-seed""#));
+        assert!(INDEX_HTML.contains(r#"id="metric-knee-detail""#));
         assert!(INDEX_HTML.contains(r#"role="progressbar""#));
         assert!(INDEX_HTML.contains(r#"id="operation-catalog""#));
         assert!(INDEX_HTML.contains(r#"id="configured-workload""#));
@@ -643,8 +647,11 @@ mod tests {
         assert!(APP_JS.contains("strategyDescriptions"));
         assert!(APP_JS.contains("updateStrategyHelp"));
         assert!(APP_JS.contains("geometric midpoints"));
+        assert!(APP_JS.contains("maximum_unsuccessful_rate"));
+        assert!(APP_JS.contains("confidence interval"));
         assert!(APP_JS.contains("renderRunProgress"));
         assert!(APP_JS.contains("plannedPhaseCount"));
+        assert!(APP_JS.contains(r#"if (state === "completed") return { percent: 100"#));
         assert!(APP_JS.contains("scheduleConfigurationSync"));
         assert!(APP_JS.contains("Could not prepare agents"));
     }

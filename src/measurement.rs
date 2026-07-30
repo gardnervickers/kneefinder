@@ -58,6 +58,7 @@ impl RunState {
             (Self::Measuring { stage: Refinement }, BracketRefined) => {
                 Self::Measuring { stage: Validation }
             }
+            (Self::Measuring { .. }, AnalysisStarted) => Self::Measuring { stage: Validation },
             (Self::Measuring { stage: Validation }, CandidateValidated { outcome }) => {
                 Self::Completed {
                     outcome: outcome.clone(),
@@ -96,6 +97,7 @@ pub enum RunEvent {
     BaselineEstablished,
     SaturationBracketed,
     BracketRefined,
+    AnalysisStarted,
     CandidateValidated {
         outcome: RunOutcome,
     },
@@ -116,6 +118,8 @@ pub struct RunOutcome {
     pub classification: RunClassification,
     pub knee: Option<KneeEstimate>,
     pub slo_maximum_rate: Option<f64>,
+    #[serde(default)]
+    pub analysis: Option<Box<crate::analysis::KneeAnalysis>>,
     pub warnings: Vec<String>,
 }
 
@@ -170,6 +174,7 @@ mod tests {
                 recommended_operating_rate: 15_900.0,
             }),
             slo_maximum_rate: None,
+            analysis: None,
             warnings: Vec::new(),
         }
     }
@@ -194,6 +199,31 @@ mod tests {
 
         assert!(matches!(state, RunState::Completed { .. }));
         assert!(state.is_terminal());
+    }
+
+    #[test]
+    fn fixed_plan_enters_validation_before_completion() {
+        let state = RunState::Configured
+            .transition(RunEvent::StartRequested)
+            .unwrap()
+            .transition(RunEvent::AdapterReady)
+            .unwrap()
+            .transition(RunEvent::AnalysisStarted)
+            .unwrap();
+        assert_eq!(
+            state,
+            RunState::Measuring {
+                stage: MeasurementStage::Validation
+            }
+        );
+        assert!(matches!(
+            state
+                .transition(RunEvent::CandidateValidated {
+                    outcome: validated_outcome(),
+                })
+                .unwrap(),
+            RunState::Completed { .. }
+        ));
     }
 
     #[test]

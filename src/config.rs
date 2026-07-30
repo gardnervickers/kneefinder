@@ -28,9 +28,63 @@ pub struct RunConfig {
     pub strategy: Strategy,
     pub phases: PhaseConfig,
     pub load: LoadConfig,
+    #[serde(default)]
+    pub analysis: AnalysisConfig,
     pub workload: WorkloadConfig,
     pub output_directory: PathBuf,
     pub agents: Vec<AgentEndpointConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnalysisConfig {
+    /// Optional p95 client-latency service-level objective.
+    pub latency_slo_ms: Option<f64>,
+    /// Optional maximum combined error and timeout rate in the range `[0, 1]`.
+    pub maximum_unsuccessful_rate: Option<f64>,
+    /// Multiplier applied to the conservative knee lower bound.
+    pub safety_factor: f64,
+    /// Deterministic time-bucket bootstrap iterations.
+    pub bootstrap_samples: u32,
+    /// Seed recorded with the fit for reproducibility.
+    pub bootstrap_seed: u64,
+}
+
+impl Default for AnalysisConfig {
+    fn default() -> Self {
+        Self {
+            latency_slo_ms: None,
+            maximum_unsuccessful_rate: None,
+            safety_factor: 0.80,
+            bootstrap_samples: 400,
+            bootstrap_seed: 0x4b4e_4545,
+        }
+    }
+}
+
+impl AnalysisConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.safety_factor.is_finite() || self.safety_factor <= 0.0 || self.safety_factor > 1.0
+        {
+            return Err("analysis safety factor must be finite and in (0, 1]".into());
+        }
+        if self.bootstrap_samples == 0 {
+            return Err("analysis bootstrap sample count must be greater than zero".into());
+        }
+        if self
+            .latency_slo_ms
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            return Err("latency SLO must be a positive finite number".into());
+        }
+        if self
+            .maximum_unsuccessful_rate
+            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err("maximum unsuccessful rate must be finite and in [0, 1]".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

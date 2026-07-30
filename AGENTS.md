@@ -175,6 +175,8 @@ time buckets should support stationarity checks, repeats, and uncertainty.
 - `src/agent.rs`: fixed cohorts and generic transport-backed session agents
 - `src/workload.rs`: operation discovery validation and flat variant resolution
 - `src/stats.rs`: overall/per-variant counts, error codes, and distributions
+- `src/analysis.rs`: segmented/null fits, deterministic bootstrap, SLOs, and
+  candidate validation
 - `src/measurement.rs`: pure run lifecycle and outcome types
 - `src/engine.rs`: shared commands, snapshots, revisions, and event broadcast
 - `src/config.rs`: resolved frontend-independent run configuration
@@ -215,13 +217,15 @@ deterministic scheduled-operation batches for CLI and browser runs. It supports
 warmup, measured intervals, recovery, repetitions, fixed sweep/up-down plans,
 adaptive baseline/discovery/geometric refinement, fixed-bucket stationarity
 checks with bounded repeats, strategy-decision provenance, per-phase statistics,
-generator-saturation invalidation, and cooperative stop.
+generator-saturation invalidation, statistical knee fitting, deterministic
+confidence bounds, SLO capacity, conservative recommendations, and cooperative
+stop.
 The queue demo exercises this production path for both colocated and
 multi-client web runs. In-flight schedules are interruptible: Stop preserves
 partial results, sends `CancelPhase`, and force-closes the session after a
 deadline, killing only a colocated subprocess while leaving a remote agent
-process available. Statistical knee fitting and durable artifacts remain
-roadmap work. Keep README's Current status section honest as work progresses.
+process available. Durable artifacts remain roadmap work. Keep README's Current
+status section honest as work progresses.
 
 `docs/design.md` is the contract and direction, not proof of implementation.
 Inspect source and current GitHub issue state before relying on a described

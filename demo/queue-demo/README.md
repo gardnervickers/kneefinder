@@ -78,7 +78,8 @@ cargo run --manifest-path demo/queue-demo/Cargo.toml --release -- e2e
 ```
 
 Exercise adaptive baseline, geometric discovery, bucket-stability decisions,
-and midpoint refinement against the same deterministic queue:
+midpoint refinement, segmented fitting, deterministic confidence bounds, and
+candidate validation against the same deterministic queue:
 
 ```console
 cargo run --manifest-path demo/queue-demo/Cargo.toml --release -- e2e-adaptive

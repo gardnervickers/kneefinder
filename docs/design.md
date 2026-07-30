@@ -396,10 +396,14 @@ knee is the breakpoint at which the second slope becomes meaningfully smaller
 than the first. Compare this model with a single straight line; if the segmented
 model is not a meaningful improvement, report that no knee was observed.
 
-Validate the candidate using latency, errors, in-flight accumulation, and
-dispatch lag. Estimate an interval for the breakpoint using time-bucket block
-bootstrap or repeated phases. Store the exact fitting method and parameters in
-the result for reproducibility.
+The implemented fitter uses an ordinary-least-squares continuous hinge model
+and compares its residual error with a single-line null model. It requires both
+a material model improvement and a material reduction in post-knee slope.
+Candidate validation independently checks client and total latency, error and
+timeout rates, in-flight accumulation, and dispatch lag. A deterministic
+time-bucket block bootstrap estimates the breakpoint interval; the result stores
+the method, thresholds, fit coefficients, requested and valid sample counts,
+confidence level, and seed.
 
 The result distinguishes:
 
@@ -507,12 +511,13 @@ distinguishes the up/down traversal from the hysteresis it is intended to
 detect. Run progress is based on completed planned phases for fixed traversals
 and lifecycle stages for adaptive runs.
 
-The current traversal engine implements baseline, geometric discovery, and
-geometric midpoint refinement using conservative throughput-efficiency,
-latency, and unsuccessful-rate evidence. It keeps generator saturation and
-phase instability as separate terminal classifications. The statistical model
-comparison, confidence interval, and numerical knee estimate described below
-remain the fitter's responsibility; traversal alone reports no fabricated knee.
+The traversal engine implements baseline, geometric discovery, and geometric
+midpoint refinement using conservative throughput-efficiency, latency, and
+unsuccessful-rate evidence. The shared analysis stage then performs the
+segmented/null comparison, deterministic bootstrap, SLO evaluation, and
+candidate validation. Generator saturation, phase instability, exhausted
+maximum load, and an unsupported segmented model remain explicit terminal
+classifications rather than fabricated knees.
 
 ## Events and persistence
 
@@ -559,7 +564,7 @@ and terminal classification.
 3. Fixed agent cohort, colocated/remote session agents, deterministic schedule
    fan-out, phase aggregation, and generator-lag checks.
 4. Baseline, geometric discovery, and bracket refinement.
-5. Segmented fit, confidence interval, and JSON artifacts.
+5. Reproducible JSON/NDJSON artifacts and inspect/render commands.
 6. Terminal progress and static SVG report.
 7. Interactive TUI.
 8. Browser UI and run comparison.

@@ -13,6 +13,7 @@ use std::{
 use crate::{
     adapter_session::ScheduleCompletion,
     agent::{AgentCohort, CohortError, CohortReady},
+    analysis::{AnalysisTermination, analyze},
     config::{OperationSelection, RunConfig, Strategy, WeightedOperation},
     measurement::{RunClassification, RunEvent, RunOutcome},
     protocol::{OperationId, OperationResult, OperationStatus, PhaseId, ScheduledOperation},
@@ -147,10 +148,9 @@ impl RunExecutor {
         next_wire_phase_id: &mut u64,
         next_operation_id: &mut u64,
     ) -> Result<ExecutorCompletion, ExecutorError> {
-        let mut generator_saturated = false;
-        let mut unstable_measurement = false;
         let mut sequence = 1_u64;
         let mut measured_phases = 0_u64;
+        let mut reports = Vec::with_capacity(rates.len());
         for rate in rates.iter().copied() {
             publish_decision(
                 sink,
@@ -174,13 +174,11 @@ impl RunExecutor {
             else {
                 return Ok(ExecutorCompletion::Stopped);
             };
-            generator_saturated |=
-                dispatch_lag_invalid(&report, config.phases.measurement_ms, &self.options);
-            unstable_measurement |= !report.quality.stationary;
             measured_phases += 1;
             let phase_id = PhaseId(measured_phases);
             sink.record_phase_stats(phase_id, report.clone())
                 .map_err(ExecutorError::Sink)?;
+            reports.push(report.clone());
             publish_decision(
                 sink,
                 &mut sequence,
@@ -212,36 +210,17 @@ impl RunExecutor {
                 return Ok(ExecutorCompletion::Stopped);
             }
         }
-        let outcome = if generator_saturated {
-            RunOutcome {
-                classification: RunClassification::GeneratorSaturated,
-                knee: None,
-                slo_maximum_rate: None,
-                warnings: vec![
-                    "dispatch lag exceeded the executor validity threshold; no target knee was reported"
-                        .into(),
-                ],
-            }
-        } else if unstable_measurement {
-            RunOutcome {
-                classification: RunClassification::UnstableMeasurement,
-                knee: None,
-                slo_maximum_rate: None,
-                warnings: vec![
-                    "one or more fixed phases failed the bucket stationarity check".into(),
-                ],
-            }
-        } else {
-            RunOutcome {
-                classification: RunClassification::MaximumLoadReached,
-                knee: None,
-                slo_maximum_rate: None,
-                warnings: vec![
-                    "fixed execution completed; statistical knee fitting is tracked by issue #4"
-                        .into(),
-                ],
-            }
-        };
+        sink.record_run_event(RunEvent::AnalysisStarted)
+            .map_err(ExecutorError::Sink)?;
+        let outcome = analyze(
+            &reports,
+            &config.analysis,
+            AnalysisTermination::CompletedPlan,
+        );
+        sink.record_run_event(RunEvent::CandidateValidated {
+            outcome: outcome.clone(),
+        })
+        .map_err(ExecutorError::Sink)?;
         Ok(ExecutorCompletion::Completed(outcome))
     }
 
@@ -261,12 +240,14 @@ impl RunExecutor {
         let mut request = strategy.initial_request();
         let mut sequence = 1_u64;
         let mut measured_phases = 0_usize;
+        let mut reports = Vec::new();
         loop {
             if measured_phases >= self.options.maximum_phases {
                 return Ok(ExecutorCompletion::Completed(RunOutcome {
                     classification: RunClassification::UnstableMeasurement,
                     knee: None,
                     slo_maximum_rate: None,
+                    analysis: None,
                     warnings: vec!["adaptive phase budget was exhausted".into()],
                 }));
             }
@@ -297,6 +278,7 @@ impl RunExecutor {
                 dispatch_lag_invalid(&report, config.phases.measurement_ms, &self.options);
             sink.record_phase_stats(PhaseId(measured_phases as u64), report.clone())
                 .map_err(ExecutorError::Sink)?;
+            reports.push(report.clone());
             let completed_request = request;
             let observation = strategy.observe(&report, generator_saturated);
             match observation {
@@ -360,6 +342,33 @@ impl RunExecutor {
                     for event in lifecycle_events {
                         sink.record_run_event(event).map_err(ExecutorError::Sink)?;
                     }
+                    return Ok(ExecutorCompletion::Completed(outcome));
+                }
+                ObservationOutcome::Analyze {
+                    termination,
+                    lifecycle_events,
+                } => {
+                    for event in lifecycle_events {
+                        sink.record_run_event(event).map_err(ExecutorError::Sink)?;
+                    }
+                    let outcome = analyze(&reports, &config.analysis, termination);
+                    publish_decision(
+                        sink,
+                        &mut sequence,
+                        request.stage,
+                        StrategyAction::Complete,
+                        request.rate,
+                        None,
+                        outcome
+                            .warnings
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("statistical analysis completed"),
+                    )?;
+                    sink.record_run_event(RunEvent::CandidateValidated {
+                        outcome: outcome.clone(),
+                    })
+                    .map_err(ExecutorError::Sink)?;
                     return Ok(ExecutorCompletion::Completed(outcome));
                 }
             }
@@ -434,6 +443,7 @@ impl RunExecutor {
             goodput_rate: measured.successful_in_window as f64 * NANOS_PER_SECOND
                 / measured.elapsed_ns as f64,
             elapsed_ns: measured.elapsed_ns,
+            in_flight_high_water: maximum_in_flight(&measured.results, measured.elapsed_ns),
             stats: summarize_results(&measured.results)?,
             quality,
         }))
@@ -847,6 +857,32 @@ fn successful_within(result: &OperationResult, interval_duration: Duration) -> b
             <= interval_ns
 }
 
+fn maximum_in_flight(results: &[OperationResult], elapsed_ns: u64) -> u64 {
+    let mut events = Vec::with_capacity(results.len() * 2);
+    for result in results {
+        if result.actual_start_offset_ns > elapsed_ns {
+            continue;
+        }
+        events.push((result.actual_start_offset_ns, 1_i8));
+        let completion = result
+            .actual_start_offset_ns
+            .saturating_add(result.client_latency_ns);
+        events.push((completion, -1_i8));
+    }
+    events.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let mut current = 0_u64;
+    let mut maximum = 0_u64;
+    for (_, delta) in events {
+        if delta > 0 {
+            current += 1;
+            maximum = maximum.max(current);
+        } else {
+            current = current.saturating_sub(1);
+        }
+    }
+    maximum
+}
+
 fn sleep_until_or_stop(stop: &Arc<AtomicBool>, duration: Duration) -> bool {
     let deadline = std::time::Instant::now() + duration;
     loop {
@@ -1129,6 +1165,7 @@ mod tests {
                 explicit_levels: vec![100.0, 200.0],
                 cycles: 1,
             },
+            analysis: Default::default(),
             workload: WorkloadConfig {
                 operations: OperationSelection::Selected {
                     operations: vec![
@@ -1202,7 +1239,7 @@ mod tests {
         assert!(matches!(
             completion,
             ExecutorCompletion::Completed(RunOutcome {
-                classification: RunClassification::MaximumLoadReached,
+                classification: RunClassification::NoKneeObserved,
                 ..
             })
         ));
@@ -1323,5 +1360,40 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("exceeded"))
         );
+    }
+
+    #[test]
+    fn in_flight_high_water_counts_overlapping_client_calls() {
+        let results = vec![
+            OperationResult {
+                id: OperationId(1),
+                operation: "read".into(),
+                arguments: BTreeMap::new(),
+                intended_start_offset_ns: 0,
+                actual_start_offset_ns: 0,
+                client_latency_ns: 30,
+                status: OperationStatus::Ok,
+            },
+            OperationResult {
+                id: OperationId(2),
+                operation: "read".into(),
+                arguments: BTreeMap::new(),
+                intended_start_offset_ns: 10,
+                actual_start_offset_ns: 10,
+                client_latency_ns: 30,
+                status: OperationStatus::Ok,
+            },
+            OperationResult {
+                id: OperationId(3),
+                operation: "read".into(),
+                arguments: BTreeMap::new(),
+                intended_start_offset_ns: 20,
+                actual_start_offset_ns: 20,
+                client_latency_ns: 30,
+                status: OperationStatus::Ok,
+            },
+        ];
+
+        assert_eq!(maximum_in_flight(&results, 100), 3);
     }
 }

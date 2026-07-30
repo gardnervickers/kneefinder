@@ -13,9 +13,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::{
     config::{
-        AdapterCommand, AgentEndpointConfig, AgentTransportConfig, HumanDuration, LoadConfig,
-        OperationSelection, PhaseConfig, Preset, RunConfig, Strategy, WeightedOperation,
-        WorkloadConfig,
+        AdapterCommand, AgentEndpointConfig, AgentTransportConfig, AnalysisConfig, HumanDuration,
+        LoadConfig, OperationSelection, PhaseConfig, Preset, RunConfig, Strategy,
+        WeightedOperation, WorkloadConfig,
     },
     engine::{EngineCommand, EngineError, EngineEvent, EngineHandle},
     measurement::RunState,
@@ -41,7 +41,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Run an experiment using a user-provided adapter process.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Serve the browser GUI and versioned control API.
     #[cfg(feature = "web")]
     Serve(ServeArgs),
@@ -105,6 +105,26 @@ pub struct RunArgs {
     #[arg(long)]
     cycles: Option<NonZeroU32>,
 
+    /// Optional p95 client-latency SLO in milliseconds.
+    #[arg(long, value_name = "MILLISECONDS")]
+    latency_slo_ms: Option<f64>,
+
+    /// Optional maximum combined error and timeout rate in [0, 1].
+    #[arg(long, value_name = "RATE")]
+    maximum_unsuccessful_rate: Option<f64>,
+
+    /// Safety multiplier applied to the conservative knee lower bound.
+    #[arg(long, default_value_t = 0.8)]
+    safety_factor: f64,
+
+    /// Number of deterministic time-bucket bootstrap samples.
+    #[arg(long, default_value_t = 400)]
+    bootstrap_samples: u32,
+
+    /// Deterministic bootstrap seed recorded in the result.
+    #[arg(long, default_value_t = 0x4b4e_4545)]
+    bootstrap_seed: u64,
+
     /// Add a weighted operation variant as NAME[:ARG=VALUE,...][@WEIGHT].
     #[arg(long = "operation", value_name = "VARIANT")]
     operations: Vec<String>,
@@ -148,6 +168,14 @@ impl RunArgs {
         let initial_rate = self.initial_rate.unwrap_or(100.0);
         let maximum_rate = self.maximum_rate.unwrap_or(10_000.0);
         let growth_factor = self.growth_factor.unwrap_or(1.5);
+        let analysis = AnalysisConfig {
+            latency_slo_ms: self.latency_slo_ms,
+            maximum_unsuccessful_rate: self.maximum_unsuccessful_rate,
+            safety_factor: self.safety_factor,
+            bootstrap_samples: self.bootstrap_samples,
+            bootstrap_seed: self.bootstrap_seed,
+        };
+        analysis.validate()?;
 
         if measurement_ms == 0 {
             return Err("measurement duration must be greater than zero".into());
@@ -232,6 +260,7 @@ impl RunArgs {
                 explicit_levels: self.levels.clone(),
                 cycles,
             },
+            analysis,
             workload: WorkloadConfig { operations },
             output_directory: self.output.clone(),
             agents,
@@ -566,7 +595,7 @@ mod tests {
 
     fn parse(arguments: &[&str]) -> RunArgs {
         match Cli::try_parse_from(arguments).unwrap().command {
-            Command::Run(arguments) => arguments,
+            Command::Run(arguments) => *arguments,
             #[cfg(feature = "web")]
             Command::Serve(_) => panic!("test helper expected the run command"),
         }
@@ -580,6 +609,7 @@ mod tests {
         assert_eq!(config.strategy, Strategy::Adaptive);
         assert_eq!(config.phases.warmup_ms, 2_000);
         assert_eq!(config.phases.measurement_ms, 10_000);
+        assert_eq!(config.analysis, AnalysisConfig::default());
         assert_eq!(config.agents.len(), 1);
         assert_eq!(config.agents[0].id, "local-0");
         assert_eq!(
@@ -675,6 +705,32 @@ mod tests {
             "--print-config",
         ]);
         assert!(arguments.resolve().is_err());
+    }
+
+    #[test]
+    fn analysis_slos_and_bootstrap_are_resolved() {
+        let arguments = parse(&[
+            "kneefinder",
+            "run",
+            "--latency-slo-ms",
+            "25",
+            "--maximum-unsuccessful-rate",
+            "0.01",
+            "--safety-factor",
+            "0.75",
+            "--bootstrap-samples",
+            "200",
+            "--bootstrap-seed",
+            "42",
+            "--print-config",
+        ]);
+        let config = arguments.resolve().unwrap();
+
+        assert_eq!(config.analysis.latency_slo_ms, Some(25.0));
+        assert_eq!(config.analysis.maximum_unsuccessful_rate, Some(0.01));
+        assert_eq!(config.analysis.safety_factor, 0.75);
+        assert_eq!(config.analysis.bootstrap_samples, 200);
+        assert_eq!(config.analysis.bootstrap_seed, 42);
     }
 
     #[test]
