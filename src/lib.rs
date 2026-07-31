@@ -3,6 +3,7 @@
 pub mod adapter_session;
 pub mod agent;
 pub mod analysis;
+pub mod artifact;
 pub mod config;
 pub mod engine;
 pub mod executor;

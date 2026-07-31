@@ -451,16 +451,16 @@ stale updates.
 ### Headless CLI
 
 `kneefinder run` works without a terminal and uses exit status plus machine-
-readable artifacts. While attached to a terminal it shows progress and a live
-compact chart; redirected output remains stable and script-friendly.
+readable artifacts. It currently prints one stable progress line per phase and
+a terminal JSON snapshot; richer terminal charting remains a later slice.
 
 Suggested commands:
 
 ```console
-kneefinder run --config run.toml -- ./adapter
+kneefinder run --strategy adaptive -- ./adapter
 kneefinder inspect results/run-id/summary.json
-kneefinder render results/run-id/summary.json --format terminal
-kneefinder render results/run-id/summary.json --format svg
+kneefinder inspect results/run-id/summary.json --json
+kneefinder render results/run-id/summary.json --output report-copy.svg
 ```
 
 Run configuration is CLI-first and does not use YAML. The initial interface
@@ -530,7 +530,6 @@ Useful engine events include:
 - bracket changed
 - candidate knee changed
 - warning or failure recorded
-- artifacts finalized
 
 High-frequency operation results need not be broadcast to every frontend. The
 engine aggregates them into bounded-rate snapshots while the artifact writer
@@ -547,14 +546,20 @@ report.svg            portable graph and result summary
 adapter.log           captured adapter diagnostics
 ```
 
-Optional `report.png` and raw operation samples may be enabled. Artifacts are
-written incrementally and finalized atomically so a crash or manual stop still
-leaves recoverable measurements.
+The implemented writer appends and synchronizes each phase report and strategy
+decision to `measurements.ndjson`. It atomically replaces the redacted resolved
+configuration, summary, adapter diagnostics, and SVG report. Inspection merges
+incremental records newer than the last summary sequence and ignores a
+truncated final line, so a crash or manual stop still leaves recoverable
+measurements. Subprocess command lines are never copied into persisted config.
 
 The JSON summary contains schema and protocol versions, timestamps, tool and
-adapter identity, configuration, environment metadata, all measured load
-points, validity warnings, fitting parameters, knee interval, SLO capacity,
-and terminal classification.
+adapter identity, safe environment metadata, all measured load points,
+validity warnings, fitting parameters, knee interval, SLO capacity, and
+terminal classification. `kneefinder inspect` emits either a concise textual
+view or the recovered JSON summary; `kneefinder render` regenerates
+`report.svg`. Exit statuses distinguish completed (`0`), stopped (`2`),
+invalid or generator-limited (`3`), failed (`4`), and command/read errors (`1`).
 
 ## Initial implementation slices
 
@@ -564,8 +569,8 @@ and terminal classification.
 3. Fixed agent cohort, colocated/remote session agents, deterministic schedule
    fan-out, phase aggregation, and generator-lag checks.
 4. Baseline, geometric discovery, and bracket refinement.
-5. Reproducible JSON/NDJSON artifacts and inspect/render commands.
-6. Terminal progress and static SVG report.
+5. Reproducible JSON/NDJSON artifacts and inspect/render commands (implemented).
+6. Richer terminal progress and SVG report presentation.
 7. Interactive TUI.
 8. Browser UI and run comparison.
 

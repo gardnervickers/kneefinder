@@ -113,7 +113,10 @@ sweep completes. Before every run, the engine itself connects to both agents,
 queries their shared operation catalog, retains the initialized cohort, and
 exposes the typed workload in the browser editor. Browser-edited load levels,
 phase timings, traversal strategy, cycles, and bound operation weights drive
-the next run.
+the next run. Each started run also leaves a unique, inspectable directory under
+`results/queue-demo-multi-client` containing its redacted config, incremental
+measurements, summary, SVG report, and adapter log. The Compose deployment
+mounts `/demo/results` from the persistent `queue-demo-results` named volume.
 
 The adapter/service can also be run directly:
 

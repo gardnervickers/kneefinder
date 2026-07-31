@@ -2,6 +2,8 @@
 
 #[cfg(feature = "web")]
 use std::net::SocketAddr;
+#[cfg(test)]
+use std::path::Path;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -12,13 +14,16 @@ use std::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::{
+    artifact::{
+        ArtifactError, ArtifactExitStatus, exit_status, human_summary, load_artifact,
+        render_artifact,
+    },
     config::{
         AdapterCommand, AgentEndpointConfig, AgentTransportConfig, AnalysisConfig, HumanDuration,
         LoadConfig, OperationSelection, PhaseConfig, Preset, RunConfig, Strategy,
         WeightedOperation, WorkloadConfig,
     },
     engine::{EngineCommand, EngineError, EngineEvent, EngineHandle},
-    measurement::RunState,
     protocol::ArgumentValue,
 };
 
@@ -42,9 +47,33 @@ pub struct Cli {
 pub enum Command {
     /// Run an experiment using a user-provided adapter process.
     Run(Box<RunArgs>),
+    /// Inspect a completed or partial run artifact.
+    Inspect(InspectArgs),
+    /// Regenerate the SVG report for a run artifact.
+    Render(RenderArgs),
     /// Serve the browser GUI and versioned control API.
     #[cfg(feature = "web")]
     Serve(ServeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct InspectArgs {
+    /// Run directory or summary.json path.
+    path: PathBuf,
+
+    /// Emit the recovered summary as JSON instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RenderArgs {
+    /// Run directory or summary.json path.
+    path: PathBuf,
+
+    /// SVG destination. Defaults to report.svg in the run directory.
+    #[arg(long, short)]
+    output: Option<PathBuf>,
 }
 
 #[cfg(feature = "web")]
@@ -456,77 +485,98 @@ impl CliFrontend {
     pub fn new(cli: Cli) -> Self {
         Self { cli }
     }
+
+    pub fn run_with_status(
+        self,
+        engine: EngineHandle,
+    ) -> Result<ArtifactExitStatus, CliFrontendError> {
+        match self.cli.command {
+            Command::Run(arguments) => run_command(*arguments, engine),
+            Command::Inspect(arguments) => {
+                let summary = load_artifact(&arguments.path)?;
+                if arguments.json {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                } else {
+                    println!("{}", human_summary(&summary));
+                }
+                Ok(exit_status(&summary.state))
+            }
+            Command::Render(arguments) => {
+                let summary = load_artifact(&arguments.path)?;
+                let output = render_artifact(&arguments.path, arguments.output.as_deref())?;
+                println!("{}", output.display());
+                Ok(exit_status(&summary.state))
+            }
+            #[cfg(feature = "web")]
+            Command::Serve(arguments) => {
+                WebFrontend::new(arguments.bind, arguments.allow_remote).run(engine)?;
+                Ok(ArtifactExitStatus::Completed)
+            }
+        }
+    }
 }
 
 impl Frontend for CliFrontend {
     type Error = CliFrontendError;
 
     fn run(self, engine: EngineHandle) -> Result<(), Self::Error> {
-        match self.cli.command {
-            Command::Run(arguments) => {
-                let config = arguments.resolve().map_err(CliFrontendError::Config)?;
-                let events = engine.subscribe();
-                let snapshot = engine.execute(EngineCommand::Configure {
-                    config: Box::new(config),
-                })?;
+        self.run_with_status(engine).map(|_| ())
+    }
+}
 
-                if arguments.print_config {
-                    println!("{}", serde_json::to_string_pretty(&snapshot.config)?);
-                    return Ok(());
-                }
+fn run_command(
+    arguments: RunArgs,
+    engine: EngineHandle,
+) -> Result<ArtifactExitStatus, CliFrontendError> {
+    let config = arguments.resolve().map_err(CliFrontendError::Config)?;
+    let events = engine.subscribe();
+    let snapshot = engine.execute(EngineCommand::Configure {
+        config: Box::new(config),
+    })?;
 
-                engine.execute(EngineCommand::PrepareAgents {
-                    run_id: snapshot.run_id,
-                })?;
-                engine.execute(EngineCommand::Start {
-                    run_id: snapshot.run_id,
-                })?;
-                loop {
-                    match events
-                        .recv()
-                        .map_err(|_| CliFrontendError::EventStreamClosed)?
-                    {
-                        EngineEvent::PhaseStats {
-                            run_id,
-                            phase_id,
-                            report,
-                        } if run_id == snapshot.run_id => {
-                            eprintln!(
-                                "phase {}: offered {:.1} ops/s, goodput {:.1} ops/s, p95 {}",
-                                phase_id.0,
-                                report.offered_rate,
-                                report.goodput_rate,
-                                report.stats.overall.client_latency_ns.p95.map_or_else(
-                                    || "n/a".into(),
-                                    |value| format!("{:.2} ms", value as f64 / 1_000_000.0)
-                                )
-                            );
-                        }
-                        EngineEvent::RunStateChanged {
-                            snapshot: completed,
-                            ..
-                        } if completed.run_id == snapshot.run_id
-                            && completed.state.is_terminal() =>
-                        {
-                            match &completed.state {
-                                RunState::Failed { message } => {
-                                    return Err(CliFrontendError::RunFailed(message.clone()));
-                                }
-                                _ => {
-                                    println!("{}", serde_json::to_string_pretty(&completed)?);
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+    if arguments.print_config {
+        println!("{}", serde_json::to_string_pretty(&snapshot.config)?);
+        return Ok(ArtifactExitStatus::Completed);
+    }
+
+    engine.execute(EngineCommand::PrepareAgents {
+        run_id: snapshot.run_id,
+    })?;
+    let started = engine.execute(EngineCommand::Start {
+        run_id: snapshot.run_id,
+    })?;
+    if let Some(directory) = &started.artifact_directory {
+        eprintln!("artifacts: {}", directory.display());
+    }
+    loop {
+        match events
+            .recv()
+            .map_err(|_| CliFrontendError::EventStreamClosed)?
+        {
+            EngineEvent::PhaseStats {
+                run_id,
+                phase_id,
+                report,
+            } if run_id == snapshot.run_id => {
+                eprintln!(
+                    "phase {}: offered {:.1} ops/s, goodput {:.1} ops/s, p95 {}",
+                    phase_id.0,
+                    report.offered_rate,
+                    report.goodput_rate,
+                    report.stats.overall.client_latency_ns.p95.map_or_else(
+                        || "n/a".into(),
+                        |value| format!("{:.2} ms", value as f64 / 1_000_000.0)
+                    )
+                );
             }
-            #[cfg(feature = "web")]
-            Command::Serve(arguments) => {
-                WebFrontend::new(arguments.bind, arguments.allow_remote).run(engine)?;
-                Ok(())
+            EngineEvent::RunStateChanged {
+                snapshot: completed,
+                ..
+            } if completed.run_id == snapshot.run_id && completed.state.is_terminal() => {
+                println!("{}", serde_json::to_string_pretty(&completed)?);
+                return Ok(exit_status(&completed.state));
             }
+            _ => {}
         }
     }
 }
@@ -536,10 +586,10 @@ pub enum CliFrontendError {
     Config(String),
     Engine(EngineError),
     Serialization(serde_json::Error),
+    Artifact(ArtifactError),
     #[cfg(feature = "web")]
     Web(WebFrontendError),
     EventStreamClosed,
-    RunFailed(String),
 }
 
 impl fmt::Display for CliFrontendError {
@@ -548,12 +598,12 @@ impl fmt::Display for CliFrontendError {
             Self::Config(message) => formatter.write_str(message),
             Self::Engine(error) => error.fmt(formatter),
             Self::Serialization(error) => error.fmt(formatter),
+            Self::Artifact(error) => error.fmt(formatter),
             #[cfg(feature = "web")]
             Self::Web(error) => error.fmt(formatter),
             Self::EventStreamClosed => {
                 formatter.write_str("the engine event stream closed before the run completed")
             }
-            Self::RunFailed(message) => write!(formatter, "run failed: {message}"),
         }
     }
 }
@@ -563,6 +613,7 @@ impl std::error::Error for CliFrontendError {
         match self {
             Self::Engine(error) => Some(error),
             Self::Serialization(error) => Some(error),
+            Self::Artifact(error) => Some(error),
             #[cfg(feature = "web")]
             Self::Web(error) => Some(error),
             _ => None,
@@ -582,6 +633,12 @@ impl From<serde_json::Error> for CliFrontendError {
     }
 }
 
+impl From<ArtifactError> for CliFrontendError {
+    fn from(value: ArtifactError) -> Self {
+        Self::Artifact(value)
+    }
+}
+
 #[cfg(feature = "web")]
 impl From<WebFrontendError> for CliFrontendError {
     fn from(value: WebFrontendError) -> Self {
@@ -596,9 +653,38 @@ mod tests {
     fn parse(arguments: &[&str]) -> RunArgs {
         match Cli::try_parse_from(arguments).unwrap().command {
             Command::Run(arguments) => *arguments,
+            Command::Inspect(_) | Command::Render(_) => {
+                panic!("test helper expected the run command")
+            }
             #[cfg(feature = "web")]
             Command::Serve(_) => panic!("test helper expected the run command"),
         }
+    }
+
+    #[test]
+    fn inspect_and_render_accept_directories_or_summary_paths() {
+        let inspect =
+            Cli::try_parse_from(["kneefinder", "inspect", "results/run-1", "--json"]).unwrap();
+        assert!(matches!(
+            inspect.command,
+            Command::Inspect(InspectArgs { path, json: true })
+                if path == Path::new("results/run-1")
+        ));
+
+        let render = Cli::try_parse_from([
+            "kneefinder",
+            "render",
+            "results/run-1/summary.json",
+            "--output",
+            "report-copy.svg",
+        ])
+        .unwrap();
+        assert!(matches!(
+            render.command,
+            Command::Render(RenderArgs { path, output: Some(output) })
+                if path == Path::new("results/run-1/summary.json")
+                    && output == Path::new("report-copy.svg")
+        ));
     }
 
     #[test]

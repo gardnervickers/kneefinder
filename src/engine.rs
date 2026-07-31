@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     fmt,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -17,6 +18,7 @@ use serde_json::Value;
 
 use crate::{
     agent::{AgentCohort, CohortReady},
+    artifact::{ArtifactError, ArtifactWriter},
     config::RunConfig,
     executor::{ExecutionSink, ExecutorCompletion, RunExecutor},
     measurement::{RunEvent, RunState, TransitionError},
@@ -57,6 +59,8 @@ pub struct RunSnapshot {
     pub state: RunState,
     #[serde(default)]
     pub preparation: AgentPreparation,
+    #[serde(default)]
+    pub artifact_directory: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -216,6 +220,11 @@ impl EngineHandle {
             .cloned()
             .collect()
     }
+
+    pub fn artifact_directory(&self, run_id: RunId) -> Result<Option<PathBuf>, EngineError> {
+        self.snapshot(run_id)
+            .map(|snapshot| snapshot.artifact_directory)
+    }
 }
 
 /// Blocking event receiver deliberately hides the transport implementation.
@@ -244,6 +253,7 @@ struct EngineInner {
     registry: Mutex<Registry>,
     prepared: Mutex<BTreeMap<RunId, AgentCohort>>,
     executions: Mutex<BTreeMap<RunId, ExecutionControl>>,
+    artifacts: Mutex<BTreeMap<RunId, ArtifactWriter>>,
     subscribers: Mutex<Vec<mpsc::Sender<EngineEvent>>>,
 }
 
@@ -255,6 +265,7 @@ impl EngineInner {
             registry: Mutex::new(Registry::default()),
             prepared: Mutex::new(BTreeMap::new()),
             executions: Mutex::new(BTreeMap::new()),
+            artifacts: Mutex::new(BTreeMap::new()),
             subscribers: Mutex::new(Vec::new()),
         }
     }
@@ -280,6 +291,7 @@ impl EngineInner {
                 config,
                 state: RunState::Configured,
                 preparation: AgentPreparation::Unprepared,
+                artifact_directory: None,
             };
             registry.runs.insert(run_id, snapshot.clone());
             snapshot
@@ -328,10 +340,12 @@ impl EngineInner {
             (previous, run.clone())
         };
 
+        let artifact_result = self.update_artifact_state(run_id, snapshot.state.clone());
         self.publish(EngineEvent::RunStateChanged {
             previous,
             snapshot: snapshot.clone(),
         });
+        artifact_result?;
         Ok(snapshot)
     }
 
@@ -531,7 +545,38 @@ impl EngineInner {
             (run.config.clone(), catalog.clone())
         };
 
-        let snapshot = self.transition(run_id, RunEvent::StartRequested)?;
+        let writer = ArtifactWriter::create(&config, run_id, &catalog).map_err(|source| {
+            EngineError::Artifact {
+                run_id,
+                source: Box::new(source),
+            }
+        })?;
+        let artifact_directory = writer.directory().to_path_buf();
+        self.artifacts
+            .lock()
+            .expect("artifact writer mutex poisoned")
+            .insert(run_id, writer);
+        {
+            let mut registry = self
+                .registry
+                .lock()
+                .expect("engine registry mutex poisoned");
+            let run = registry
+                .runs
+                .get_mut(&run_id)
+                .ok_or(EngineError::RunNotFound(run_id))?;
+            run.artifact_directory = Some(artifact_directory);
+        }
+        let snapshot = match self.transition(run_id, RunEvent::StartRequested) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.artifacts
+                    .lock()
+                    .expect("artifact writer mutex poisoned")
+                    .remove(&run_id);
+                return Err(error);
+            }
+        };
         let Some(mut cohort) = self
             .prepared
             .lock()
@@ -572,6 +617,8 @@ impl EngineInner {
                     &mut sink,
                 );
                 let disconnect = cohort.disconnect();
+                let diagnostics = cohort.diagnostics();
+                let _ = inner.write_artifact_diagnostics(run_id, &diagnostics);
                 if let Err(error) = disconnect {
                     let state = inner
                         .registry
@@ -646,6 +693,16 @@ impl EngineInner {
                     .lock()
                     .expect("execution registry mutex poisoned")
                     .remove(&run_id);
+                if let Some(state) = inner
+                    .registry
+                    .lock()
+                    .expect("engine registry mutex poisoned")
+                    .runs
+                    .get(&run_id)
+                    .map(|run| run.state.clone())
+                {
+                    let _ = inner.finalize_artifact(run_id, state);
+                }
             });
         if let Err(source) = spawn {
             self.executions
@@ -653,12 +710,15 @@ impl EngineInner {
                 .expect("execution registry mutex poisoned")
                 .remove(&run_id);
             let message = source.to_string();
-            let _ = self.transition(
+            let failed = self.transition(
                 run_id,
                 RunEvent::Failed {
                     message: message.clone(),
                 },
             );
+            if let Ok(snapshot) = failed {
+                let _ = self.finalize_artifact(run_id, snapshot.state);
+            }
             return Err(EngineError::ExecutionSpawnFailed { run_id, message });
         }
         Ok(snapshot)
@@ -703,6 +763,19 @@ impl EngineInner {
         {
             return Err(EngineError::RunNotFound(run_id));
         }
+        if let Some(writer) = self
+            .artifacts
+            .lock()
+            .expect("artifact writer mutex poisoned")
+            .get_mut(&run_id)
+        {
+            writer
+                .record_phase(phase_id, report.clone())
+                .map_err(|source| EngineError::Artifact {
+                    run_id,
+                    source: Box::new(source),
+                })?;
+        }
         self.publish(EngineEvent::PhaseStats {
             run_id,
             phase_id,
@@ -729,7 +802,75 @@ impl EngineInner {
         {
             return Err(EngineError::RunNotFound(run_id));
         }
+        if let Some(writer) = self
+            .artifacts
+            .lock()
+            .expect("artifact writer mutex poisoned")
+            .get_mut(&run_id)
+        {
+            writer
+                .record_decision(decision.clone())
+                .map_err(|source| EngineError::Artifact {
+                    run_id,
+                    source: Box::new(source),
+                })?;
+        }
         self.publish(EngineEvent::StrategyDecision { run_id, decision });
+        Ok(())
+    }
+
+    fn update_artifact_state(&self, run_id: RunId, state: RunState) -> Result<(), EngineError> {
+        if let Some(writer) = self
+            .artifacts
+            .lock()
+            .expect("artifact writer mutex poisoned")
+            .get_mut(&run_id)
+        {
+            writer
+                .update_state(state)
+                .map_err(|source| EngineError::Artifact {
+                    run_id,
+                    source: Box::new(source),
+                })?;
+        }
+        Ok(())
+    }
+
+    fn write_artifact_diagnostics(
+        &self,
+        run_id: RunId,
+        diagnostics: &BTreeMap<String, Vec<String>>,
+    ) -> Result<(), EngineError> {
+        if let Some(writer) = self
+            .artifacts
+            .lock()
+            .expect("artifact writer mutex poisoned")
+            .get_mut(&run_id)
+        {
+            writer
+                .write_diagnostics(diagnostics)
+                .map_err(|source| EngineError::Artifact {
+                    run_id,
+                    source: Box::new(source),
+                })?;
+        }
+        Ok(())
+    }
+
+    fn finalize_artifact(&self, run_id: RunId, state: RunState) -> Result<(), EngineError> {
+        let mut artifacts = self
+            .artifacts
+            .lock()
+            .expect("artifact writer mutex poisoned");
+        if let Some(writer) = artifacts.get_mut(&run_id) {
+            writer
+                .finalize(state)
+                .map_err(|source| EngineError::Artifact {
+                    run_id,
+                    source: Box::new(source),
+                })?;
+        }
+        artifacts.remove(&run_id);
         Ok(())
     }
 }
@@ -810,6 +951,10 @@ pub enum EngineError {
         run_id: RunId,
         message: String,
     },
+    Artifact {
+        run_id: RunId,
+        source: Box<ArtifactError>,
+    },
     InvalidWorkload {
         run_id: RunId,
         source: WorkloadError,
@@ -865,6 +1010,13 @@ impl fmt::Display for EngineError {
                     run_id.0
                 )
             }
+            Self::Artifact { run_id, source } => {
+                write!(
+                    formatter,
+                    "artifact persistence failed for run {}: {source}",
+                    run_id.0
+                )
+            }
             Self::InvalidWorkload { run_id, source } => {
                 write!(formatter, "invalid workload for run {}: {source}", run_id.0)
             }
@@ -882,6 +1034,7 @@ impl fmt::Display for EngineError {
 impl std::error::Error for EngineError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Artifact { source, .. } => Some(source.as_ref()),
             Self::InvalidWorkload { source, .. } => Some(source),
             Self::InvalidTransition { source, .. } => Some(source.as_ref()),
             _ => None,

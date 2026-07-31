@@ -1,0 +1,6 @@
+{
+  "schema_version": 0,
+  "run_id": 12,
+  "state": { "state": "stopped" },
+  "config": { "strategy": "sweep" }
+}

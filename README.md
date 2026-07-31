@@ -65,6 +65,14 @@ list. The dashboard saves the form and checks agent connectivity automatically;
 press Start when it reports ready. The browser exposes the actual traversal
 strategy directly and explains it in place; CLI-oriented presets are not shown.
 Stop ends the active run while leaving both agents available for the next one.
+Run artifacts are retained in the `queue-demo-results` named volume. To copy
+them into the current directory before tearing the demo down:
+
+```console
+docker compose -f demo/queue-demo/compose.yaml cp web:/demo/results ./results
+```
+
+Use `podman-compose` in the command above when applicable.
 
 The agents only listen on the private Compose network; they never dial or
 register with the coordinator. They remain available for subsequent runs
@@ -166,6 +174,37 @@ cargo run -- run \
 
 The coordinator always initiates these TCP sessions. Agents listen on the
 configured endpoints and never dial or register with the coordinator.
+
+## Inspect and render run artifacts
+
+Every started CLI or browser run creates a unique directory below its resolved
+output directory. The directory remains useful after completion, Stop, a
+frontend disconnect, or an interrupted write:
+
+```text
+summary.json
+config.json
+measurements.ndjson
+report.svg
+adapter.log
+```
+
+`measurements.ndjson` is flushed incrementally. The other files are replaced
+atomically, and inspection recovers records that are newer than a stale
+`summary.json` while ignoring a truncated final NDJSON line. Adapter subprocess
+commands are redacted from persisted configuration.
+
+Inspect a run directory or its `summary.json` directly:
+
+```console
+cargo run -- inspect results/run-123-1
+cargo run -- inspect results/run-123-1/summary.json --json
+cargo run -- render results/run-123-1 --output report-copy.svg
+```
+
+Batch exit statuses are stable: `0` for a completed result, `2` for stopped,
+`3` for invalid or generator-limited measurements, `4` for a failed run, and
+`1` for CLI or artifact-reading errors.
 
 Durations and load traversal are configurable without a YAML file:
 
@@ -275,6 +314,9 @@ both model parameters, every validity signal, the SLO capacity, the knee
 interval, and the conservative operating recommendation. Stop preserves
 results already received, sends
 `CancelPhase` to active agents, and force-closes an unresponsive session after
-the cancellation deadline. Durable run artifacts remain roadmap work.
+the cancellation deadline. Every started run now persists schema-versioned,
+redacted configuration and provenance, incremental phase/decision records,
+terminal analysis, adapter diagnostics, and a regenerable SVG report. The CLI
+can inspect completed or partial runs as text or JSON and regenerate reports.
 
 See [docs/design.md](docs/design.md) for the measurement and knee-finding design.

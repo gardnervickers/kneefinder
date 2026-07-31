@@ -9,6 +9,7 @@ use std::{
 };
 
 use kneefinder::{
+    artifact::load_artifact,
     config::RunConfig,
     engine::{AgentPreparation, EngineCommand, RunSnapshot},
     frontends::web::ApiSnapshot,
@@ -84,6 +85,9 @@ fn dashboard_completes_adjusts_stops_and_reruns_on_persistent_agents() {
     });
     let first_results = run_result(&snapshot(&address), first.run_id);
     assert_eq!(first_results.phases.len(), 7);
+    assert_artifact(&first, 7..=7, |state| {
+        matches!(state, RunState::Completed { .. })
+    });
 
     let mut adjusted = first.config.clone();
     adjusted.load.explicit_levels = vec![120.0, 180.0];
@@ -118,7 +122,7 @@ fn dashboard_completes_adjusts_stops_and_reruns_on_persistent_agents() {
     stoppable.phases.measurement_ms = 5_000;
     stoppable.phases.recovery_ms = 0;
     let stoppable = configure_prepare_start(&address, stoppable);
-    wait_for_run(
+    let stopped = wait_for_run(
         &address,
         stoppable.run_id,
         Duration::from_secs(5),
@@ -141,6 +145,7 @@ fn dashboard_completes_adjusts_stops_and_reruns_on_persistent_agents() {
         stop_started.elapsed() < Duration::from_secs(2),
         "graceful stop should not wait for the five-second measurement"
     );
+    assert_artifact(&stopped, 0..=1, |state| matches!(state, RunState::Stopped));
 
     let mut rerun = adjusted.config;
     rerun.load.explicit_levels = vec![160.0];
@@ -156,6 +161,30 @@ fn dashboard_completes_adjusts_stops_and_reruns_on_persistent_agents() {
     let rerun_results = run_result(&snapshot(&address), rerun.run_id);
     assert_eq!(rerun_results.phases.len(), 1);
     assert_eq!(rerun_results.phases[0].report.offered_rate, 160.0);
+}
+
+fn assert_artifact(
+    run: &RunSnapshot,
+    expected_phases: std::ops::RangeInclusive<usize>,
+    state_matches: impl Fn(&RunState) -> bool,
+) {
+    let directory = run
+        .artifact_directory
+        .as_ref()
+        .expect("started dashboard run should expose its artifact directory");
+    for name in [
+        "summary.json",
+        "config.json",
+        "measurements.ndjson",
+        "report.svg",
+        "adapter.log",
+    ] {
+        assert!(directory.join(name).is_file(), "missing {name}");
+    }
+    let artifact = load_artifact(directory).expect("dashboard artifact should be inspectable");
+    assert!(state_matches(&artifact.state));
+    assert!(expected_phases.contains(&artifact.phases.len()));
+    assert_eq!(artifact.agents.len(), 2);
 }
 
 fn configure_prepare_start(address: &str, config: RunConfig) -> RunSnapshot {

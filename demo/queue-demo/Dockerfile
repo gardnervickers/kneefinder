@@ -16,7 +16,9 @@ COPY --from=builder \
     /src/demo/queue-demo/target/release/kneefinder-queue-demo \
     /usr/local/bin/kneefinder-queue-demo
 
+RUN mkdir -p /demo/results && chown -R 65532:65532 /demo
 WORKDIR /demo
 USER 65532:65532
 EXPOSE 8080 9000
+VOLUME ["/demo/results"]
 ENTRYPOINT ["kneefinder-queue-demo"]

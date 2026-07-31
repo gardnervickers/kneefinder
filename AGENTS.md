@@ -177,6 +177,8 @@ time buckets should support stationarity checks, repeats, and uncertainty.
 - `src/stats.rs`: overall/per-variant counts, error codes, and distributions
 - `src/analysis.rs`: segmented/null fits, deterministic bootstrap, SLOs, and
   candidate validation
+- `src/artifact.rs`: versioned incremental artifacts, recovery, inspection, and
+  SVG rendering
 - `src/measurement.rs`: pure run lifecycle and outcome types
 - `src/engine.rs`: shared commands, snapshots, revisions, and event broadcast
 - `src/config.rs`: resolved frontend-independent run configuration
@@ -211,6 +213,8 @@ At the time this handoff was written, these pieces exist:
   implementations
 - runnable queue demonstrations using the colocated path and two TCP clients,
   including repeated browser-configured runs and graceful stop/rerun
+- schema-versioned incremental artifacts, redacted configuration, recovery,
+  inspect/render commands, and stable batch exit statuses
 
 The generic executor now turns a prepared cohort and `RunConfig` into bounded,
 deterministic scheduled-operation batches for CLI and browser runs. It supports
@@ -224,8 +228,9 @@ The queue demo exercises this production path for both colocated and
 multi-client web runs. In-flight schedules are interruptible: Stop preserves
 partial results, sends `CancelPhase`, and force-closes the session after a
 deadline, killing only a colocated subprocess while leaving a remote agent
-process available. Durable artifacts remain roadmap work. Keep README's Current
-status section honest as work progresses.
+process available. Started runs persist partial and terminal evidence in unique
+run directories shared by every frontend. Keep README's Current status section
+honest as work progresses.
 
 `docs/design.md` is the contract and direction, not proof of implementation.
 Inspect source and current GitHub issue state before relying on a described

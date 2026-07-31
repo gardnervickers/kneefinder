@@ -423,6 +423,13 @@ impl AgentCohort {
         self.for_each_concurrently(|agent| agent.shutdown())
     }
 
+    pub fn diagnostics(&self) -> BTreeMap<String, Vec<String>> {
+        self.agents
+            .iter()
+            .map(|agent| (agent.descriptor().id.0.clone(), agent.diagnostics()))
+            .collect()
+    }
+
     fn for_each_concurrently(
         &mut self,
         action: impl Fn(&mut dyn WorkloadAgent) -> Result<(), AgentError> + Copy + Send + Sync,
