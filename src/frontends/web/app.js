@@ -925,8 +925,10 @@ function failureRate(phase, field) {
 
 function renderCharts() {
   const run = selectedRun();
-  const phases = run ? [...(results.get(run.run_id) || [])].sort((a, b) => a.report.offered_rate - b.report.offered_rate) : [];
+  const timeline = run ? [...(results.get(run.run_id) || [])].sort((a, b) => a.phase_id - b.phase_id) : [];
+  const phases = [...timeline].sort((a, b) => a.report.offered_rate - b.report.offered_rate);
   const knee = run?.state?.state === "completed" ? run.state.outcome.knee?.offered_rate : null;
+  drawTimeline("timeline-chart", timeline);
   drawChart("throughput-chart", phases, [
     { name: "Ideal", color: "#5c8df6", value: (phase) => phase.report.offered_rate },
     { name: "Goodput", color: "#55d9d2", value: (phase) => phase.report.goodput_rate },
@@ -940,6 +942,67 @@ function renderCharts() {
     { name: "Errors", color: "#f06b75", value: (phase) => failureRate(phase, "failed") * 100 },
     { name: "Timeouts", color: "#f3b562", value: (phase) => failureRate(phase, "timed_out") * 100 },
   ], knee, "%");
+}
+
+function drawTimeline(id, phases) {
+  const container = $(id);
+  container.replaceChildren();
+  if (!phases.length) {
+    container.className = "chart timeline-chart empty-chart";
+    container.textContent = "Completed phases will stream here.";
+    return;
+  }
+  container.className = "chart timeline-chart";
+  const width = 920, height = 270, left = 58, right = 58, top = 18, bottom = 48;
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
+  const goodputMax = Math.max(...phases.map((phase) => phase.report.goodput_rate || 0)) * 1.12 || 1;
+  const latencyMax = Math.max(...phases.map((phase) => nsMs(phase.report.stats.overall.client_latency_ns.p95))) * 1.12 || 1;
+  const x = (index) => phases.length === 1 ? left + plotWidth / 2 : left + index / (phases.length - 1) * plotWidth;
+  const goodputY = (value) => height - bottom - value / goodputMax * plotHeight;
+  const latencyY = (value) => height - bottom - value / latencyMax * plotHeight;
+  const svg = svgElement("svg", {
+    viewBox: `0 0 ${width} ${height}`,
+    role: "img",
+    "aria-label": "Goodput and p95 client latency by completed phase",
+  });
+  for (let tick = 0; tick <= 4; tick++) {
+    const gy = top + tick * plotHeight / 4;
+    svg.append(svgElement("line", { x1: left, y1: gy, x2: width - right, y2: gy, class: "grid" }));
+    const goodputLabel = svgElement("text", { x: left - 8, y: gy + 4, "text-anchor": "end", class: "timeline-goodput-axis" });
+    goodputLabel.textContent = `${formatCompact(goodputMax * (4 - tick) / 4)} ops/s`;
+    svg.append(goodputLabel);
+    const latencyLabel = svgElement("text", { x: width - right + 8, y: gy + 4, "text-anchor": "start", class: "timeline-latency-axis" });
+    latencyLabel.textContent = `${formatCompact(latencyMax * (4 - tick) / 4)} ms`;
+    svg.append(latencyLabel);
+  }
+  svg.append(svgElement("line", { x1: left, y1: height - bottom, x2: width - right, y2: height - bottom, class: "axis" }));
+  const series = [
+    { color: "#55d9d2", value: (phase) => phase.report.goodput_rate || 0, y: goodputY, name: "Goodput", unit: "ops/s" },
+    { color: "#f3b562", value: (phase) => nsMs(phase.report.stats.overall.client_latency_ns.p95), y: latencyY, name: "p95 latency", unit: "ms" },
+  ];
+  for (const line of series) {
+    const path = phases.map((phase, index) => `${index ? "L" : "M"}${x(index)},${line.y(line.value(phase))}`).join(" ");
+    svg.append(svgElement("path", { d: path, fill: "none", stroke: line.color, "stroke-width": 2.2, "stroke-linejoin": "round" }));
+    phases.forEach((phase, index) => {
+      const point = svgElement("circle", { cx: x(index), cy: line.y(line.value(phase)), r: 3.5, fill: line.color });
+      const title = svgElement("title", {});
+      title.textContent = `Phase ${phase.phase_id} · offered ${formatRate(phase.report.offered_rate)} ops/s · ${line.name} ${formatRate(line.value(phase))} ${line.unit}`;
+      point.append(title);
+      svg.append(point);
+    });
+  }
+  const labelEvery = Math.max(1, Math.ceil(phases.length / 8));
+  phases.forEach((phase, index) => {
+    if (index % labelEvery !== 0 && index !== phases.length - 1) return;
+    const phaseLabel = svgElement("text", { x: x(index), y: height - 25, "text-anchor": "middle", class: "timeline-phase-label" });
+    phaseLabel.textContent = `P${phase.phase_id}`;
+    svg.append(phaseLabel);
+    const rateLabel = svgElement("text", { x: x(index), y: height - 10, "text-anchor": "middle", class: "timeline-rate-label" });
+    rateLabel.textContent = `${formatCompact(phase.report.offered_rate)}/s`;
+    svg.append(rateLabel);
+  });
+  container.append(svg);
 }
 
 function drawChart(id, points, series, knee, unit) {

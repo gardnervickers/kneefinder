@@ -642,6 +642,7 @@ mod tests {
         assert!(INDEX_HTML.contains(r#"id="latency-slo""#));
         assert!(INDEX_HTML.contains(r#"id="bootstrap-seed""#));
         assert!(INDEX_HTML.contains(r#"id="metric-knee-detail""#));
+        assert!(INDEX_HTML.contains(r#"id="timeline-chart""#));
         assert!(INDEX_HTML.contains(r#"role="progressbar""#));
         assert!(INDEX_HTML.contains(r#"id="operation-catalog""#));
         assert!(INDEX_HTML.contains(r#"id="configured-workload""#));
@@ -663,6 +664,9 @@ mod tests {
         assert!(APP_JS.contains("confidence interval"));
         assert!(APP_JS.contains("renderRunProgress"));
         assert!(APP_JS.contains("plannedPhaseCount"));
+        assert!(APP_JS.contains("drawTimeline"));
+        assert!(APP_JS.contains("a.phase_id - b.phase_id"));
+        assert!(APP_JS.contains("Goodput and p95 client latency by completed phase"));
         assert!(APP_JS.contains(r#"if (state === "completed") return { percent: 100"#));
         assert!(APP_JS.contains("scheduleConfigurationSync"));
         assert!(APP_JS.contains("Could not prepare agents"));

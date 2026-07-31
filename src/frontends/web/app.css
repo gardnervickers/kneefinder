@@ -128,6 +128,7 @@ button.danger { color: #ffadb4; }
 .chart { min-height: 250px; }
 .empty-chart { display: grid; place-items: center; color: var(--muted); font-size: 12px; border: 1px dashed var(--line); border-radius: 8px; }
 .chart svg { display: block; width: 100%; height: 250px; overflow: visible; }
+.timeline-chart, .timeline-chart svg { min-height: 270px; height: 270px; }
 .chart text { fill: var(--muted); font-size: 10px; }
 .chart .grid { stroke: var(--line); stroke-width: 1; }
 .chart .axis { stroke: #42515e; stroke-width: 1; }
@@ -135,6 +136,11 @@ button.danger { color: #ffadb4; }
 .legend { display: flex; gap: 16px; color: var(--muted); font-size: 10px; }
 .legend span::before { content: ""; display: inline-block; width: 13px; height: 2px; margin: 0 6px 3px 0; background: currentColor; }
 .goodput, .p95 { color: var(--cyan); }
+.timeline-latency { color: var(--amber); }
+.chart .timeline-goodput-axis { fill: var(--cyan); }
+.chart .timeline-latency-axis { fill: var(--amber); }
+.chart .timeline-phase-label { fill: var(--text); font-weight: 700; }
+.chart .timeline-rate-label { font-size: 9px; }
 .offered, .p50 { color: var(--blue); }
 .knee { color: var(--amber); }
 .p99 { color: var(--red); }
