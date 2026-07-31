@@ -4,6 +4,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::protocol::PhaseId;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MeasurementStage {
@@ -11,6 +13,29 @@ pub enum MeasurementStage {
     Discovery,
     Refinement,
     Validation,
+}
+
+/// Fine-grained progress within one offered-load phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhaseSegment {
+    Warmup,
+    Measurement,
+    Recovery,
+}
+
+/// Ephemeral execution progress shared by CLI, web, TUI, and other frontends.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PhaseProgress {
+    pub phase_id: PhaseId,
+    pub planned_phases: Option<u64>,
+    pub offered_rate: f64,
+    pub segment: PhaseSegment,
+    pub elapsed_ms: u64,
+    pub planned_ms: u64,
+    pub scheduled: u64,
+    pub reported: u64,
+    pub awaiting_results: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -15,7 +15,7 @@ use crate::{
     agent::{AgentCohort, CohortError, CohortReady},
     analysis::{AnalysisTermination, analyze},
     config::{OperationSelection, RunConfig, Strategy, WeightedOperation},
-    measurement::{RunClassification, RunEvent, RunOutcome},
+    measurement::{PhaseProgress, PhaseSegment, RunClassification, RunEvent, RunOutcome},
     protocol::{OperationId, OperationResult, OperationStatus, PhaseId, ScheduledOperation},
     stats::{MeasurementBucket, PhaseQuality, PhaseReport, StatsError, summarize_results},
     strategy::{
@@ -70,6 +70,14 @@ pub trait ExecutionSink {
     fn record_run_event(&mut self, event: RunEvent) -> Result<(), String>;
     fn record_phase_stats(&mut self, phase_id: PhaseId, report: PhaseReport) -> Result<(), String>;
     fn record_strategy_decision(&mut self, decision: StrategyDecision) -> Result<(), String>;
+    fn record_phase_progress(&mut self, progress: PhaseProgress) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProgressContext {
+    phase_id: PhaseId,
+    planned_phases: Option<u64>,
+    offered_rate: f64,
 }
 
 pub struct RunExecutor {
@@ -151,7 +159,12 @@ impl RunExecutor {
         let mut sequence = 1_u64;
         let mut measured_phases = 0_u64;
         let mut reports = Vec::with_capacity(rates.len());
-        for rate in rates.iter().copied() {
+        for (index, rate) in rates.iter().copied().enumerate() {
+            let progress = ProgressContext {
+                phase_id: PhaseId(index as u64 + 1),
+                planned_phases: Some(rates.len() as u64),
+                offered_rate: rate,
+            };
             publish_decision(
                 sink,
                 &mut sequence,
@@ -165,11 +178,13 @@ impl RunExecutor {
                 config,
                 cohort,
                 stop,
+                sink,
                 operations,
                 batch_limit,
                 next_wire_phase_id,
                 next_operation_id,
                 rate,
+                progress,
             )?
             else {
                 return Ok(ExecutorCompletion::Stopped);
@@ -206,7 +221,7 @@ impl RunExecutor {
                     ),
                 )?;
             }
-            if recover_or_stop(config, stop) {
+            if recover_or_stop(config, stop, sink, progress)? {
                 return Ok(ExecutorCompletion::Stopped);
             }
         }
@@ -264,11 +279,17 @@ impl RunExecutor {
                 config,
                 cohort,
                 stop,
+                sink,
                 operations,
                 batch_limit,
                 next_wire_phase_id,
                 next_operation_id,
                 request.rate,
+                ProgressContext {
+                    phase_id: PhaseId(measured_phases as u64 + 1),
+                    planned_phases: None,
+                    offered_rate: request.rate,
+                },
             )?
             else {
                 return Ok(ExecutorCompletion::Stopped);
@@ -386,7 +407,16 @@ impl RunExecutor {
                     ),
                 )?;
             }
-            if recover_or_stop(config, stop) {
+            if recover_or_stop(
+                config,
+                stop,
+                sink,
+                ProgressContext {
+                    phase_id: PhaseId(measured_phases as u64),
+                    planned_phases: None,
+                    offered_rate: completed_request.rate,
+                },
+            )? {
                 return Ok(ExecutorCompletion::Stopped);
             }
         }
@@ -398,11 +428,13 @@ impl RunExecutor {
         config: &RunConfig,
         cohort: &mut AgentCohort,
         stop: &Arc<AtomicBool>,
+        sink: &mut impl ExecutionSink,
         operations: &[WeightedOperation],
         batch_limit: usize,
         next_wire_phase_id: &mut u64,
         next_operation_id: &mut u64,
         rate: f64,
+        progress: ProgressContext,
     ) -> Result<Option<PhaseReport>, ExecutorError> {
         if stop.load(Ordering::Acquire) {
             return Ok(None);
@@ -411,6 +443,7 @@ impl RunExecutor {
             self.run_interval(
                 cohort,
                 stop,
+                sink,
                 next_wire_phase_id,
                 next_operation_id,
                 rate,
@@ -418,6 +451,8 @@ impl RunExecutor {
                 operations,
                 batch_limit,
                 false,
+                progress,
+                PhaseSegment::Warmup,
             )?;
             if stop.load(Ordering::Acquire) {
                 return Ok(None);
@@ -426,6 +461,7 @@ impl RunExecutor {
         let measured = self.run_interval(
             cohort,
             stop,
+            sink,
             next_wire_phase_id,
             next_operation_id,
             rate,
@@ -433,6 +469,8 @@ impl RunExecutor {
             operations,
             batch_limit,
             true,
+            progress,
+            PhaseSegment::Measurement,
         )?;
         if measured.elapsed_ns == 0 {
             return Ok(None);
@@ -454,6 +492,7 @@ impl RunExecutor {
         &self,
         cohort: &mut AgentCohort,
         stop: &Arc<AtomicBool>,
+        sink: &mut impl ExecutionSink,
         next_wire_phase_id: &mut u64,
         next_operation_id: &mut u64,
         offered_rate: f64,
@@ -461,11 +500,15 @@ impl RunExecutor {
         operations: &[WeightedOperation],
         batch_limit: usize,
         retain_results: bool,
+        progress: ProgressContext,
+        segment: PhaseSegment,
     ) -> Result<MeasuredInterval, ExecutorError> {
         let mut remaining_ns = duration.as_nanos().min(u64::MAX as u128) as u64;
         let mut elapsed_ns = 0_u64;
         let mut operation_budget = 0.0_f64;
         let mut successful_in_window = 0_u64;
+        let mut scheduled_count = 0_u64;
+        let mut reported = 0_u64;
         let mut results = Vec::new();
         let total_weight = operations.iter().map(|operation| operation.weight).sum();
         let mut scheduler = SmoothWeightedScheduler::new(operations, total_weight);
@@ -475,6 +518,16 @@ impl RunExecutor {
                 .as_nanos()
                 .min(u64::MAX as u128) as u64,
         );
+
+        publish_progress(
+            sink,
+            progress,
+            segment,
+            0,
+            duration,
+            scheduled_count,
+            reported,
+        )?;
 
         while remaining_ns > 0 && !stop.load(Ordering::Acquire) {
             let horizon_ns = self
@@ -512,6 +565,16 @@ impl RunExecutor {
                         arguments: variant.arguments.clone(),
                     });
                 }
+                scheduled_count = scheduled_count.saturating_add(operation_count as u64);
+                publish_progress(
+                    sink,
+                    progress,
+                    segment,
+                    elapsed_ns,
+                    duration,
+                    scheduled_count,
+                    reported,
+                )?;
                 let phase_id = PhaseId(*next_wire_phase_id);
                 *next_wire_phase_id = next_wire_phase_id
                     .checked_add(1)
@@ -519,6 +582,7 @@ impl RunExecutor {
                 let batch = cohort.execute_schedule(phase_id, phase_start, scheduled, stop)?;
                 let interrupted = matches!(batch.completion, ScheduleCompletion::Cancelled { .. });
                 let batch_results = batch.into_operations();
+                reported = reported.saturating_add(batch_results.len() as u64);
                 let completed_offset_ns = batch_results
                     .iter()
                     .map(|result| {
@@ -549,6 +613,15 @@ impl RunExecutor {
             }
             elapsed_ns = elapsed_ns.saturating_add(chunk_ns);
             remaining_ns -= chunk_ns;
+            publish_progress(
+                sink,
+                progress,
+                segment,
+                elapsed_ns,
+                duration,
+                scheduled_count,
+                reported,
+            )?;
         }
 
         Ok(MeasuredInterval {
@@ -843,9 +916,60 @@ fn publish_decision(
     Ok(())
 }
 
-fn recover_or_stop(config: &RunConfig, stop: &Arc<AtomicBool>) -> bool {
-    config.phases.recovery_ms > 0
-        && sleep_until_or_stop(stop, Duration::from_millis(config.phases.recovery_ms))
+fn recover_or_stop(
+    config: &RunConfig,
+    stop: &Arc<AtomicBool>,
+    sink: &mut impl ExecutionSink,
+    progress: ProgressContext,
+) -> Result<bool, ExecutorError> {
+    let duration = Duration::from_millis(config.phases.recovery_ms);
+    if duration.is_zero() {
+        return Ok(false);
+    }
+    let started = std::time::Instant::now();
+    publish_progress(sink, progress, PhaseSegment::Recovery, 0, duration, 0, 0)?;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Ok(true);
+        }
+        let elapsed = started.elapsed().min(duration);
+        publish_progress(
+            sink,
+            progress,
+            PhaseSegment::Recovery,
+            elapsed.as_nanos().min(u64::MAX as u128) as u64,
+            duration,
+            0,
+            0,
+        )?;
+        if elapsed >= duration {
+            return Ok(false);
+        }
+        thread::sleep((duration - elapsed).min(Duration::from_millis(250)));
+    }
+}
+
+fn publish_progress(
+    sink: &mut impl ExecutionSink,
+    context: ProgressContext,
+    segment: PhaseSegment,
+    elapsed_ns: u64,
+    planned: Duration,
+    scheduled: u64,
+    reported: u64,
+) -> Result<(), ExecutorError> {
+    sink.record_phase_progress(PhaseProgress {
+        phase_id: context.phase_id,
+        planned_phases: context.planned_phases,
+        offered_rate: context.offered_rate,
+        segment,
+        elapsed_ms: elapsed_ns / 1_000_000,
+        planned_ms: planned.as_millis().min(u64::MAX as u128) as u64,
+        scheduled,
+        reported,
+        awaiting_results: scheduled.saturating_sub(reported),
+    })
+    .map_err(ExecutorError::Sink)
 }
 
 fn successful_within(result: &OperationResult, interval_duration: Duration) -> bool {
@@ -1102,6 +1226,7 @@ mod tests {
         events: Vec<RunEvent>,
         phases: Vec<(PhaseId, PhaseReport)>,
         decisions: Vec<StrategyDecision>,
+        progress: Vec<PhaseProgress>,
     }
 
     impl ExecutionSink for RecordingSink {
@@ -1121,6 +1246,11 @@ mod tests {
 
         fn record_strategy_decision(&mut self, decision: StrategyDecision) -> Result<(), String> {
             self.decisions.push(decision);
+            Ok(())
+        }
+
+        fn record_phase_progress(&mut self, progress: PhaseProgress) -> Result<(), String> {
+            self.progress.push(progress);
             Ok(())
         }
     }
@@ -1236,6 +1366,12 @@ mod tests {
                 .all(|batch| batch.len() <= 4)
         );
         assert!(matches!(sink.events.first(), Some(RunEvent::AdapterReady)));
+        assert!(sink.progress.iter().any(|progress| {
+            progress.phase_id == PhaseId(1)
+                && progress.planned_phases == Some(2)
+                && progress.segment == PhaseSegment::Measurement
+                && progress.elapsed_ms == progress.planned_ms
+        }));
         assert!(matches!(
             completion,
             ExecutorCompletion::Completed(RunOutcome {
@@ -1243,6 +1379,40 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn progress_reports_warmup_measurement_and_recovery_segments() {
+        let assignments = Arc::new(Mutex::new(Vec::new()));
+        let (mut cohort, catalog) = cohort(assignments);
+        let mut config = config();
+        config.phases.warmup_ms = 5;
+        config.phases.recovery_ms = 5;
+        config.load.maximum_rate = 100.0;
+        config.load.explicit_levels = vec![100.0];
+        let mut sink = RecordingSink::default();
+
+        RunExecutor::default()
+            .execute(
+                &config,
+                &catalog,
+                &mut cohort,
+                &Arc::new(AtomicBool::new(false)),
+                &mut sink,
+            )
+            .unwrap();
+
+        for segment in [
+            PhaseSegment::Warmup,
+            PhaseSegment::Measurement,
+            PhaseSegment::Recovery,
+        ] {
+            assert!(sink.progress.iter().any(|progress| {
+                progress.phase_id == PhaseId(1)
+                    && progress.segment == segment
+                    && progress.elapsed_ms == progress.planned_ms
+            }));
+        }
     }
 
     #[test]

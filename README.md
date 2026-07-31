@@ -60,7 +60,8 @@ start workload traffic automatically. Review or edit the prepared seven-level
 plan, then press Start. The dashboard updates with a live run timeline that
 plots goodput and p95 client latency in completed-phase order, plus throughput
 and latency capacity curves sorted by offered load, reliability, per-variant
-results, and run progress based on completed phases.
+results, and live warmup, measurement, and recovery progress with elapsed time
+and operation activity. Knee estimates remain hidden until final validation.
 Around the knee, goodput flattens while latency rises sharply. After that run,
 edit the load levels, timings, strategy, operation variants, or remote-agent
 list. The dashboard saves the form and checks agent connectivity automatically;

@@ -3,6 +3,7 @@
 const runs = new Map();
 const results = new Map();
 const decisions = new Map();
+const phaseProgress = new Map();
 const pending = new Map();
 let selectedRunId = null;
 let socket = null;
@@ -101,10 +102,12 @@ function applySnapshot(snapshot) {
   runs.clear();
   results.clear();
   decisions.clear();
+  phaseProgress.clear();
   for (const run of snapshot.runs) runs.set(run.run_id, run);
   for (const result of snapshot.results) {
     results.set(result.run_id, result.phases);
     decisions.set(result.run_id, result.decisions || []);
+    if (result.progress) phaseProgress.set(result.run_id, result.progress);
   }
   let selectionChanged = false;
   if (selectedRunId === null || !runs.has(selectedRunId)) {
@@ -132,6 +135,12 @@ function applyEvent(event) {
     const runDecisions = decisions.get(event.run_id) || [];
     runDecisions.push(event.decision);
     decisions.set(event.run_id, runDecisions);
+  } else if (event.event === "phase_progress") {
+    phaseProgress.set(event.run_id, event.progress);
+  }
+  if (event.event === "run_state_changed"
+      && ["completed", "stopped", "failed"].includes(event.snapshot.state.state)) {
+    phaseProgress.delete(event.snapshot.run_id);
   }
 }
 
@@ -809,12 +818,14 @@ function renderRunProgress() {
     fill.style.width = "0%";
     track.setAttribute("aria-valuenow", "0");
     track.setAttribute("aria-valuetext", "No run selected");
+    $("run-progress-detail").textContent = "Phase activity will appear here.";
     return;
   }
 
   const progress = progressForRun(run);
   $("run-progress-title").textContent = `Run ${run.run_id}`;
   $("run-progress-status").textContent = progress.label;
+  $("run-progress-detail").textContent = progress.detail || "Waiting for phase activity.";
   fill.style.width = `${progress.percent}%`;
   track.setAttribute("aria-valuenow", String(Math.round(progress.percent)));
   track.setAttribute("aria-valuetext", progress.label);
@@ -824,29 +835,80 @@ function progressForRun(run) {
   const state = run.state.state;
   const completed = (results.get(run.run_id) || []).length;
   const planned = plannedPhaseCount(run.config);
+  const active = phaseProgress.get(run.run_id);
   const measuredPercent = planned ? Math.min(96, completed / planned * 100) : 0;
-  if (state === "configured") return { percent: 0, label: "Ready to start" };
-  if (state === "starting") return { percent: 3, label: "Starting workload agents" };
-  if (state === "completed") return { percent: 100, label: `Complete · ${completed} measurements` };
-  if (state === "stopped") return { percent: measuredPercent, label: `Stopped · ${completed} measurements` };
-  if (state === "failed") return { percent: measuredPercent, label: `Failed · ${completed} measurements` };
+  if (state === "configured") return { percent: 0, label: "Ready to start", detail: "No workload traffic yet." };
+  if (state === "starting") return { percent: 3, label: "Starting workload agents", detail: "Preparing the execution session." };
+  if (state === "completed") return { percent: 100, label: `Complete · ${completed} measurements`, detail: "Analysis and validation complete." };
+  if (state === "stopped") return { percent: measuredPercent, label: `Stopped · ${completed} measurements`, detail: "Partial results were preserved." };
+  if (state === "failed") return { percent: measuredPercent, label: `Failed · ${completed} measurements`, detail: run.state.message };
 
   if (state === "measuring" || state === "stopping") {
     const stopping = state === "stopping";
+    if (active) {
+      const segmentFraction = active.planned_ms
+        ? Math.min(1, active.elapsed_ms / active.planned_ms)
+        : 0;
+      const phaseFraction = progressWithinPhase(run.config, active.segment, segmentFraction);
+      const percent = active.planned_phases
+        ? Math.min(99, ((active.phase_id - 1) + phaseFraction) / active.planned_phases * 100)
+        : segmentFraction * 100;
+      const phaseCount = active.planned_phases ? ` of ${active.planned_phases}` : "";
+      const segment = active.segment[0].toUpperCase() + active.segment.slice(1);
+      const label = stopping
+        ? `Phase ${active.phase_id}${phaseCount} · stopping`
+        : `Phase ${active.phase_id}${phaseCount} · ${segment} · ${formatRate(active.offered_rate)} ops/s`;
+      const time = `${formatDuration(active.elapsed_ms)} / ${formatDuration(active.planned_ms)}`;
+      const activity = active.segment === "recovery"
+        ? "idle recovery"
+        : `${active.scheduled.toLocaleString()} scheduled · ${active.reported.toLocaleString()} reported · ${active.awaiting_results.toLocaleString()} awaiting results`;
+      const remaining = estimatedRemaining(run.config, active, segmentFraction);
+      const estimate = remaining === null ? "" : ` · ~${formatDuration(remaining)} remaining`;
+      return { percent, label, detail: `${time} · ${activity}${estimate}` };
+    }
     if (planned) {
       const activePhase = Math.min(completed + 1, planned);
       const label = stopping
         ? `${completed} of ${planned} measurements complete · stopping`
         : `Measurement ${activePhase} of ${planned} · ${completed} complete`;
-      return { percent: Math.max(5, measuredPercent), label };
+      return { percent: Math.max(5, measuredPercent), label, detail: "Waiting for phase activity." };
     }
     const stage = state === "measuring" ? run.state.stage : run.state.interrupted_stage;
     const stagePercent = { baseline: 10, discovery: 35, refinement: 65, validation: 88 }[stage] || 5;
     const label = `${completed} measurements complete · ${stopping ? "stopping" : stageName(run.state)}`;
-    return { percent: Math.max(measuredPercent, stagePercent), label };
+    return { percent: Math.max(measuredPercent, stagePercent), label, detail: "Waiting for phase activity." };
   }
 
-  return { percent: measuredPercent, label: stateName(run.state) };
+  return { percent: measuredPercent, label: stateName(run.state), detail: "Waiting for phase activity." };
+}
+
+function progressWithinPhase(config, segment, fraction) {
+  const warmup = config.phases.warmup_ms;
+  const measurement = config.phases.measurement_ms;
+  const recovery = config.phases.recovery_ms;
+  const total = warmup + measurement + recovery;
+  if (!total) return fraction;
+  if (segment === "warmup") return warmup * fraction / total;
+  if (segment === "measurement") return (warmup + measurement * fraction) / total;
+  return (warmup + measurement + recovery * fraction) / total;
+}
+
+function estimatedRemaining(config, active, segmentFraction) {
+  if (!active.planned_phases) return null;
+  const warmup = config.phases.warmup_ms;
+  const measurement = config.phases.measurement_ms;
+  const recovery = config.phases.recovery_ms;
+  const total = warmup + measurement + recovery;
+  const consumed = progressWithinPhase(config, active.segment, segmentFraction) * total;
+  return Math.max(0, (active.planned_phases - active.phase_id) * total + total - consumed);
+}
+
+function formatDuration(milliseconds) {
+  if (milliseconds < 1000) return `${milliseconds}ms`;
+  const seconds = milliseconds / 1000;
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${Math.round(seconds % 60)}s`;
 }
 
 function plannedPhaseCount(config) {
@@ -879,7 +941,9 @@ function renderMetrics() {
   $("metric-recommended").textContent = knee ? formatRate(knee.recommended_operating_rate) : "—";
   $("metric-knee-detail").textContent = knee
     ? `${formatRate(knee.lower_bound)}–${formatRate(knee.upper_bound)} confidence interval`
-    : "offered operations / sec";
+    : (run && ["starting", "measuring", "stopping"].includes(run.state.state)
+      ? "available after final validation"
+      : "offered operations / sec");
   const sloMaximum = run?.state?.state === "completed" ? run.state.outcome.slo_maximum_rate : null;
   $("metric-recommended-detail").textContent = sloMaximum == null
     ? "safety-adjusted lower bound"

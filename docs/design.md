@@ -509,8 +509,12 @@ staged: runner mode first, traversal strategy second, then strategy-relevant
 presets and parameters, followed by discovered operations. Strategy help
 distinguishes the up/down traversal from the hysteresis it is intended to
 detect. Presets remain transparent groups of starting values with descriptions,
-and irrelevant controls remain hidden. Run progress is based on completed
-planned phases for fixed traversals and lifecycle stages for adaptive runs.
+and irrelevant controls remain hidden. The executor publishes frontend-neutral
+warmup, measurement, and recovery progress with elapsed time and bounded
+operation counters. Fixed traversals combine that phase progress with the known
+plan length; adaptive runs show the current phase without inventing a total.
+Completed points stream as preliminary evidence, while the knee remains hidden
+until final validation.
 
 The traversal engine implements baseline, geometric discovery, and geometric
 midpoint refinement using conservative throughput-efficiency, latency, and

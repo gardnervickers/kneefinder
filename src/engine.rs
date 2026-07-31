@@ -21,7 +21,7 @@ use crate::{
     artifact::{ArtifactError, ArtifactWriter},
     config::RunConfig,
     executor::{ExecutionSink, ExecutorCompletion, RunExecutor},
-    measurement::{RunEvent, RunState, TransitionError},
+    measurement::{PhaseProgress, RunEvent, RunState, TransitionError},
     protocol::{PhaseId, RunId},
     stats::PhaseReport,
     strategy::StrategyDecision,
@@ -101,6 +101,10 @@ pub enum EngineEvent {
     StrategyDecision {
         run_id: RunId,
         decision: StrategyDecision,
+    },
+    PhaseProgress {
+        run_id: RunId,
+        progress: PhaseProgress,
     },
 }
 
@@ -819,6 +823,20 @@ impl EngineInner {
         Ok(())
     }
 
+    fn phase_progress(&self, run_id: RunId, progress: PhaseProgress) -> Result<(), EngineError> {
+        if !self
+            .registry
+            .lock()
+            .expect("engine registry mutex poisoned")
+            .runs
+            .contains_key(&run_id)
+        {
+            return Err(EngineError::RunNotFound(run_id));
+        }
+        self.publish(EngineEvent::PhaseProgress { run_id, progress });
+        Ok(())
+    }
+
     fn update_artifact_state(&self, run_id: RunId, state: RunState) -> Result<(), EngineError> {
         if let Some(writer) = self
             .artifacts
@@ -901,6 +919,12 @@ impl ExecutionSink for EngineExecutionSink {
     fn record_strategy_decision(&mut self, decision: StrategyDecision) -> Result<(), String> {
         self.inner
             .strategy_decision(self.run_id, decision)
+            .map_err(|error| error.to_string())
+    }
+
+    fn record_phase_progress(&mut self, progress: PhaseProgress) -> Result<(), String> {
+        self.inner
+            .phase_progress(self.run_id, progress)
             .map_err(|error| error.to_string())
     }
 }

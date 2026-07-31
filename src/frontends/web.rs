@@ -24,6 +24,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::{
     engine::{EngineCommand, EngineError, EngineEvent, EngineHandle, RunSnapshot},
+    measurement::PhaseProgress,
     protocol::{PhaseId, RunId},
     stats::PhaseReport,
     strategy::StrategyDecision,
@@ -53,6 +54,8 @@ pub struct RunResults {
     pub phases: Vec<PhaseObservation>,
     #[serde(default)]
     pub decisions: Vec<StrategyDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<PhaseProgress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -126,6 +129,7 @@ impl WebState {
 struct ResultStore {
     phases: BTreeMap<RunId, Vec<PhaseObservation>>,
     decisions: BTreeMap<RunId, Vec<StrategyDecision>>,
+    progress: BTreeMap<RunId, PhaseProgress>,
 }
 
 impl ResultStore {
@@ -160,6 +164,12 @@ impl ResultStore {
                     decisions.remove(0);
                 }
             }
+            EngineEvent::PhaseProgress { run_id, progress } => {
+                self.progress.insert(*run_id, progress.clone());
+            }
+            EngineEvent::RunStateChanged { snapshot, .. } if snapshot.state.is_terminal() => {
+                self.progress.remove(&snapshot.run_id);
+            }
             _ => {}
         }
     }
@@ -168,6 +178,7 @@ impl ResultStore {
         self.phases
             .keys()
             .chain(self.decisions.keys())
+            .chain(self.progress.keys())
             .copied()
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -175,6 +186,7 @@ impl ResultStore {
                 run_id,
                 phases: self.phases.get(&run_id).cloned().unwrap_or_default(),
                 decisions: self.decisions.get(&run_id).cloned().unwrap_or_default(),
+                progress: self.progress.get(&run_id).cloned(),
             })
             .collect()
     }
@@ -597,6 +609,23 @@ mod tests {
             },
         });
         assert_eq!(store.snapshot()[0].decisions.len(), 1);
+
+        let progress = PhaseProgress {
+            phase_id: PhaseId(3),
+            planned_phases: Some(7),
+            offered_rate: 250.0,
+            segment: crate::measurement::PhaseSegment::Measurement,
+            elapsed_ms: 4_000,
+            planned_ms: 10_000,
+            scheduled: 1_000,
+            reported: 950,
+            awaiting_results: 50,
+        };
+        store.observe(&EngineEvent::PhaseProgress {
+            run_id: RunId(1),
+            progress: progress.clone(),
+        });
+        assert_eq!(store.snapshot()[0].progress, Some(progress));
     }
 
     #[test]
@@ -639,6 +668,7 @@ mod tests {
         assert!(INDEX_HTML.contains(r#"id="strategy-help""#));
         assert!(INDEX_HTML.contains("Up / down"));
         assert!(INDEX_HTML.contains(r#"id="run-progress-track""#));
+        assert!(INDEX_HTML.contains(r#"id="run-progress-detail""#));
         assert!(INDEX_HTML.contains(r#"id="latency-slo""#));
         assert!(INDEX_HTML.contains(r#"id="bootstrap-seed""#));
         assert!(INDEX_HTML.contains(r#"id="metric-knee-detail""#));
@@ -663,6 +693,8 @@ mod tests {
         assert!(APP_JS.contains("maximum_unsuccessful_rate"));
         assert!(APP_JS.contains("confidence interval"));
         assert!(APP_JS.contains("renderRunProgress"));
+        assert!(APP_JS.contains(r#"event.event === "phase_progress""#));
+        assert!(APP_JS.contains("awaiting results"));
         assert!(APP_JS.contains("plannedPhaseCount"));
         assert!(APP_JS.contains("drawTimeline"));
         assert!(APP_JS.contains("a.phase_id - b.phase_id"));
