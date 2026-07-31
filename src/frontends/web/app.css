@@ -16,6 +16,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; min-width: 320px; background: radial-gradient(circle at 70% -10%, #142635 0, var(--bg) 38rem); }
 button, input, select, textarea { font: inherit; }
 .topbar { height: 84px; display: flex; align-items: center; justify-content: space-between; padding: 0 30px; border-bottom: 1px solid var(--line); background: rgba(9, 13, 18, .82); backdrop-filter: blur(16px); position: sticky; top: 0; z-index: 10; }
@@ -43,14 +44,39 @@ h2 { font-size: 17px; letter-spacing: -.02em; }
 form { display: grid; gap: 12px; }
 label { display: grid; gap: 6px; color: var(--muted); font-size: 11px; font-weight: 650; letter-spacing: .03em; }
 .hint { color: #657482; font-weight: 450; }
-.strategy-help { color: #718493; font-size: 10px; font-weight: 450; line-height: 1.45; min-height: 2.9em; }
+.config-step { display: grid; gap: 11px; padding: 13px; border: 1px solid var(--line); border-radius: 10px; background: rgba(8, 13, 18, .42); transition: border-color .18s, background .18s, opacity .18s; }
+.config-step.active { border-color: rgba(85,217,210,.38); background: rgba(85,217,210,.035); }
+.config-step.complete { border-color: rgba(116,214,141,.24); }
+.config-step.locked { opacity: .52; }
+.step-heading { display: grid; grid-template-columns: 25px minmax(0, 1fr) auto; align-items: center; gap: 9px; }
+.step-heading > div { display: grid; gap: 2px; }
+.step-heading .hint, .editor-heading .hint { font-size: 9px; line-height: 1.35; }
+.step-number { display: grid; place-items: center; width: 25px; height: 25px; border: 1px solid var(--line); border-radius: 50%; color: var(--muted); font: 750 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.config-step.active .step-number { color: var(--cyan); border-color: rgba(85,217,210,.42); background: rgba(85,217,210,.08); }
+.config-step.complete .step-number { color: var(--green); border-color: rgba(116,214,141,.34); }
+.step-status { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .08em; }
+.choice-grid { display: grid; gap: 7px; }
+.runner-choices { grid-template-columns: 1fr 1fr; }
+.strategy-choices { grid-template-columns: repeat(3, 1fr); }
+.preset-choices { grid-template-columns: repeat(2, 1fr); margin-top: 7px; }
+.choice-card { min-width: 0; display: grid; align-content: start; gap: 4px; padding: 9px; text-align: left; background: #0b1117; }
+.choice-card strong { color: #dbe8ed; font-size: 11px; }
+.choice-card span { color: var(--muted); font-size: 9px; font-weight: 500; line-height: 1.35; }
+.choice-card.selected { border-color: var(--cyan); background: rgba(85,217,210,.08); box-shadow: 0 0 0 2px rgba(85,217,210,.05); }
+.choice-card.selected strong { color: var(--cyan); }
+.step-fields { display: grid; gap: 11px; }
+.strategy-help { color: #9aabb7; font-size: 10px; font-weight: 450; line-height: 1.5; padding: 9px 10px; border-left: 2px solid var(--cyan); background: rgba(85,217,210,.045); }
+.advanced-fields { border-top: 1px solid var(--line); padding-top: 10px; }
+.advanced-fields summary { cursor: pointer; color: var(--muted); font-size: 10px; font-weight: 700; }
+.advanced-fields[open] { display: grid; gap: 11px; }
+.advanced-fields[open] summary { margin-bottom: 11px; }
 input, select, textarea { width: 100%; border: 1px solid var(--line); border-radius: 7px; color: var(--text); background: #0b1117; padding: 9px 10px; outline: none; transition: border-color .15s, box-shadow .15s; }
 textarea { resize: vertical; line-height: 1.45; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 input:focus, select:focus, textarea:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(85, 217, 210, .09); }
 .field-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .field-triple { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
 .field-title { display: block; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .03em; }
-.workload-editor { display: grid; gap: 9px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 14px 0; }
+.workload-editor { display: grid; gap: 9px; }
 .editor-heading, .variant-heading, .operation-heading, .configured-variant-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .editor-heading > div { display: grid; gap: 3px; }
 .catalog-status { color: var(--muted); font-size: 11px; line-height: 1.45; padding: 8px 10px; border-radius: 7px; background: #0b1117; border: 1px solid var(--line); }

@@ -25,64 +25,112 @@
           </div>
 
           <form id="config-form">
-            <label>Strategy
-              <select id="strategy" aria-describedby="strategy-help">
-                <option value="adaptive">Adaptive</option>
-                <option value="sweep">Sweep</option>
-                <option value="up-down">Up/down (detect hysteresis)</option>
-              </select>
-              <span id="strategy-help" class="strategy-help"></span>
-            </label>
-            <div class="field-pair">
-              <label>Initial rate<input id="initial-rate" type="number" min="0.001" step="any" value="100"></label>
-              <label>Maximum rate<input id="maximum-rate" type="number" min="0.001" step="any" value="10000"></label>
-            </div>
-            <div class="field-triple">
-              <label>Growth factor<input id="growth-factor" type="number" min="1.001" step="any" value="1.5"></label>
-              <label>Cycles<input id="cycles" type="number" min="1" step="1" value="1"></label>
-              <label>Attempts<input id="repetitions" type="number" min="1" step="1" value="1" title="Fixed phase repetitions; in adaptive mode, maximum stability attempts per load."></label>
-            </div>
-            <label>Explicit levels <span class="hint">comma-separated, optional</span><input id="levels" placeholder="100, 200, 300"></label>
-            <div class="field-triple">
-              <label>Warm-up ms<input id="warmup" type="number" min="0" value="2000"></label>
-              <label>Measure ms<input id="measurement" type="number" min="1" value="10000"></label>
-              <label>Recover ms<input id="recovery" type="number" min="0" value="2000"></label>
-            </div>
-            <div class="field-triple">
-              <label>p95 SLO ms <span class="hint">optional</span><input id="latency-slo" type="number" min="0.001" step="any"></label>
-              <label>Max bad rate <span class="hint">0–1, optional</span><input id="unsuccessful-slo" type="number" min="0" max="1" step="any"></label>
-              <label>Safety factor<input id="safety-factor" type="number" min="0.001" max="1" step="any" value="0.8"></label>
-            </div>
-            <div class="field-pair">
-              <label>Bootstrap samples<input id="bootstrap-samples" type="number" min="1" step="1" value="400"></label>
-              <label>Bootstrap seed<input id="bootstrap-seed" type="number" min="1" step="1" value="1263420741"></label>
-            </div>
-            <label>Adapter executable<input id="adapter-program" placeholder="./my-adapter"></label>
-            <label>Adapter arguments <span class="hint">one per line</span><textarea id="adapter-args" rows="2" placeholder="--endpoint&#10;localhost:9000"></textarea></label>
-            <label>Remote agents <span class="hint">one ID=tcp://HOST:PORT per line</span><textarea id="agent-endpoints" rows="2" placeholder="client-a=tcp://10.0.0.10:9000&#10;client-b=tcp://10.0.0.11:9000"></textarea></label>
-
-            <section class="workload-editor" aria-labelledby="workload-editor-title">
-              <div class="editor-heading">
-                <div>
-                  <span class="field-title" id="workload-editor-title">Discovered workload</span>
-                  <span class="hint">checked automatically for every configured agent</span>
-                </div>
+            <section id="runner-step" class="config-step active" aria-labelledby="runner-step-title">
+              <div class="step-heading">
+                <span class="step-number">1</span>
+                <div><span class="field-title" id="runner-step-title">Runner mode</span><span class="hint">Where workload operations execute</span></div>
+                <span id="runner-step-status" class="step-status">Choose one</span>
               </div>
-              <p id="agent-query-status" class="catalog-status">Enter an adapter or remote agent to connect automatically.</p>
-              <div id="operation-catalog" class="operation-catalog">
-                <p class="empty">Operation schemas will appear here.</p>
+              <div class="choice-grid runner-choices" role="group" aria-label="Runner mode">
+                <button type="button" class="choice-card" data-runner-mode="adapter" aria-pressed="false">
+                  <strong>Adapter executable</strong><span>Launch one colocated adapter over stdio.</span>
+                </button>
+                <button type="button" class="choice-card" data-runner-mode="remote" aria-pressed="false">
+                  <strong>Remote agents</strong><span>Coordinate one or more persistent TCP agents.</span>
+                </button>
               </div>
-
-              <div class="variant-heading">
-                <span class="field-title">Configured variants</span>
-                <span id="variant-count" class="run-chip">Adapter defaults</span>
+              <div id="adapter-config" class="step-fields" hidden>
+                <label>Adapter executable<input id="adapter-program" placeholder="./my-adapter"></label>
+                <label>Adapter arguments <span class="hint">one per line</span><textarea id="adapter-args" rows="2" placeholder="--endpoint&#10;localhost:9000"></textarea></label>
               </div>
-              <div id="configured-workload" class="configured-workload">
-                <p class="empty">Safe adapter defaults will be selected after discovery.</p>
+              <div id="remote-config" class="step-fields" hidden>
+                <label>Remote agents <span class="hint">one ID=tcp://HOST:PORT per line</span><textarea id="agent-endpoints" rows="3" placeholder="client-a=tcp://10.0.0.10:9000&#10;client-b=tcp://10.0.0.11:9000"></textarea></label>
               </div>
             </section>
 
-            <label>Output directory<input id="output-directory" value="results"></label>
+            <section id="strategy-step" class="config-step locked" aria-labelledby="strategy-step-title">
+              <div class="step-heading">
+                <span class="step-number">2</span>
+                <div><span class="field-title" id="strategy-step-title">Workload strategy</span><span class="hint">How offered load is explored</span></div>
+                <span id="strategy-step-status" class="step-status">Runner first</span>
+              </div>
+              <div id="strategy-choices" class="choice-grid strategy-choices" role="group" aria-label="Workload strategy" hidden>
+                <button type="button" class="choice-card" data-strategy="adaptive" aria-pressed="false"><strong>Adaptive</strong><span>Find and refine a saturation bracket.</span></button>
+                <button type="button" class="choice-card" data-strategy="sweep" aria-pressed="false"><strong>Sweep</strong><span>Measure a predictable low-to-high curve.</span></button>
+                <button type="button" class="choice-card" data-strategy="up-down" aria-pressed="false"><strong>Up / down</strong><span>Look for hysteresis while load falls.</span></button>
+              </div>
+              <p id="strategy-help" class="strategy-help" hidden></p>
+            </section>
+
+            <section id="parameters-step" class="config-step locked" aria-labelledby="parameters-step-title">
+              <div class="step-heading">
+                <span class="step-number">3</span>
+                <div><span class="field-title" id="parameters-step-title">Experiment parameters</span><span class="hint">Defaults tuned to the selected strategy</span></div>
+                <span id="parameters-step-status" class="step-status">Strategy first</span>
+              </div>
+              <div id="parameter-fields" class="step-fields" hidden>
+                <div>
+                  <span class="field-title">Preset</span>
+                  <div id="preset-choices" class="choice-grid preset-choices" role="group" aria-label="Experiment preset"></div>
+                </div>
+                <div class="field-pair">
+                  <label>Initial rate<input id="initial-rate" type="number" min="0.001" step="any" value="100"></label>
+                  <label>Maximum rate<input id="maximum-rate" type="number" min="0.001" step="any" value="10000"></label>
+                </div>
+                <div class="field-triple">
+                  <label>Growth factor<input id="growth-factor" type="number" min="1.001" step="any" value="1.5"></label>
+                  <label id="cycles-field">Cycles<input id="cycles" type="number" min="1" step="1" value="1"></label>
+                  <label><span id="repetitions-label">Attempts</span><input id="repetitions" type="number" min="1" step="1" value="1"></label>
+                </div>
+                <label id="levels-field">Explicit levels <span class="hint">comma-separated, optional</span><input id="levels" placeholder="100, 200, 300"></label>
+                <div class="field-triple">
+                  <label>Warm-up ms<input id="warmup" type="number" min="0" value="2000"></label>
+                  <label>Measure ms<input id="measurement" type="number" min="1" value="10000"></label>
+                  <label>Recover ms<input id="recovery" type="number" min="0" value="2000"></label>
+                </div>
+                <details class="advanced-fields">
+                  <summary>Analysis and output</summary>
+                  <div class="field-triple">
+                    <label>p95 SLO ms <span class="hint">optional</span><input id="latency-slo" type="number" min="0.001" step="any"></label>
+                    <label>Max bad rate <span class="hint">0–1, optional</span><input id="unsuccessful-slo" type="number" min="0" max="1" step="any"></label>
+                    <label>Safety factor<input id="safety-factor" type="number" min="0.001" max="1" step="any" value="0.8"></label>
+                  </div>
+                  <div class="field-pair">
+                    <label>Bootstrap samples<input id="bootstrap-samples" type="number" min="1" step="1" value="400"></label>
+                    <label>Bootstrap seed<input id="bootstrap-seed" type="number" min="1" step="1" value="1263420741"></label>
+                  </div>
+                  <label>Output directory<input id="output-directory" value="results"></label>
+                </details>
+              </div>
+            </section>
+
+            <section id="operations-step" class="config-step locked workload-editor" aria-labelledby="workload-editor-title">
+              <div class="step-heading">
+                <span class="step-number">4</span>
+                <div><span class="field-title" id="workload-editor-title">Operations</span><span class="hint">Discovered from every configured agent</span></div>
+                <span id="operations-step-status" class="step-status">Configure first</span>
+              </div>
+              <div id="operation-fields" class="step-fields" hidden>
+                <div class="editor-heading">
+                  <div>
+                    <span class="field-title">Discovered workload</span>
+                    <span class="hint">schemas must match across agents</span>
+                  </div>
+                </div>
+                <p id="agent-query-status" class="catalog-status">Enter an adapter or remote agent to connect automatically.</p>
+                <div id="operation-catalog" class="operation-catalog">
+                  <p class="empty">Operation schemas will appear here.</p>
+                </div>
+
+                <div class="variant-heading">
+                  <span class="field-title">Configured variants</span>
+                  <span id="variant-count" class="run-chip">Adapter defaults</span>
+                </div>
+                <div id="configured-workload" class="configured-workload">
+                  <p class="empty">Safe adapter defaults will be selected after discovery.</p>
+                </div>
+              </div>
+            </section>
           </form>
 
           <div class="actions">

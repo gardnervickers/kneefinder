@@ -504,12 +504,13 @@ requires explicit configuration and authentication; arbitrary adapter commands
 must not be exposed by default.
 
 The browser is a client of the engine API, not the owner of a run. Closing or
-reloading the page does not terminate the experiment. It exposes resolved
-configuration values and traversal strategies directly rather than presenting
-CLI presets whose only purpose is to select starting values. Strategy help
+reloading the page does not terminate the experiment. Its configuration flow is
+staged: runner mode first, traversal strategy second, then strategy-relevant
+presets and parameters, followed by discovered operations. Strategy help
 distinguishes the up/down traversal from the hysteresis it is intended to
-detect. Run progress is based on completed planned phases for fixed traversals
-and lifecycle stages for adaptive runs.
+detect. Presets remain transparent groups of starting values with descriptions,
+and irrelevant controls remain hidden. Run progress is based on completed
+planned phases for fixed traversals and lifecycle stages for adaptive runs.
 
 The traversal engine implements baseline, geometric discovery, and geometric
 midpoint refinement using conservative throughput-efficiency, latency, and

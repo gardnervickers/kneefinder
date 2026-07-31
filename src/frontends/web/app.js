@@ -12,7 +12,9 @@ let formDirty = false;
 let queryInFlight = false;
 let configurationSyncTimer = null;
 let configurationSyncPending = false;
-let selectedPreset = "quick";
+let runnerMode = null;
+let selectedStrategy = null;
+let selectedPreset = null;
 
 const $ = (id) => document.getElementById(id);
 const svgNs = "http://www.w3.org/2000/svg";
@@ -20,6 +22,26 @@ const strategyDescriptions = Object.freeze({
   adaptive: "Establishes a stable baseline, grows load geometrically until saturation is bracketed, then refines with geometric midpoints.",
   sweep: "Runs each configured load level from low to high for a predictable capacity curve.",
   "up-down": "Runs load upward and then downward to reveal hysteresis: different behavior while load is falling.",
+});
+const presetDefinitions = Object.freeze({
+  quick: {
+    label: "Quick",
+    strategies: ["adaptive", "sweep"],
+    description: "Fast feedback for smoke tests and early capacity exploration.",
+    values: { warmup: 2000, measurement: 10000, recovery: 2000, repetitions: 1, cycles: 1 },
+  },
+  careful: {
+    label: "Careful",
+    strategies: ["adaptive", "sweep"],
+    description: "Longer phases and repeated observations for more stable estimates.",
+    values: { warmup: 10000, measurement: 30000, recovery: 10000, repetitions: 3, cycles: 1 },
+  },
+  hysteresis: {
+    label: "Hysteresis",
+    strategies: ["up-down"],
+    description: "Three slow up/down cycles with extra recovery to expose path-dependent behavior.",
+    values: { warmup: 10000, measurement: 20000, recovery: 15000, repetitions: 1, cycles: 3 },
+  },
 });
 
 function connect() {
@@ -139,9 +161,11 @@ function readConfig() {
     : { selection: "adapter_defaults" };
   const levels = $("levels").value.split(",").map((value) => value.trim()).filter(Boolean).map(Number);
   if (levels.some((level) => !Number.isFinite(level) || level <= 0)) throw new Error("Explicit levels must be positive numbers.");
+  if (!runnerMode) throw new Error("Choose a runner mode.");
+  if (!selectedStrategy) throw new Error("Choose a workload strategy.");
+  const agents = [];
   const program = $("adapter-program").value.trim();
-  const agents = $("agent-endpoints").value.split("\n").map((line) => line.trim()).filter(Boolean).map(parseAgentEndpoint);
-  if (program) {
+  if (runnerMode === "adapter" && program) {
     agents.push({
       id: "local-0",
       transport: {
@@ -153,10 +177,17 @@ function readConfig() {
       },
     });
   }
+  if (runnerMode === "remote") {
+    agents.push(...$("agent-endpoints").value.split("\n")
+      .map((line) => line.trim()).filter(Boolean).map(parseAgentEndpoint));
+  }
+  if (!agents.length) throw new Error(
+    runnerMode === "adapter" ? "Enter an adapter executable." : "Enter at least one remote agent.",
+  );
   if (new Set(agents.map((agent) => agent.id)).size !== agents.length) throw new Error("Agent IDs must be unique.");
-  const strategy = $("strategy").value;
+  const strategy = selectedStrategy;
   const config = {
-    preset: selectedPreset,
+    preset: selectedPreset || (strategy === "up-down" ? "hysteresis" : "quick"),
     strategy,
     phases: {
       warmup_ms: numberValue("warmup"),
@@ -306,7 +337,8 @@ function scheduleConfigurationSync(delay = 650) {
 function markConfigurationDirty() {
   formDirty = true;
   updateButtons();
-  scheduleConfigurationSync();
+  updateConfigurationFlow();
+  if (configurationReady()) scheduleConfigurationSync();
 }
 
 async function synchronizeConfiguration() {
@@ -403,8 +435,10 @@ function renderRuns() {
 function loadForm(run) {
   const config = run.config;
   selectedPreset = config.preset;
-  $("strategy").value = config.strategy;
-  updateStrategyHelp();
+  selectedStrategy = config.strategy;
+  if (!presetDefinitions[selectedPreset]?.strategies.includes(selectedStrategy)) {
+    selectedPreset = selectedStrategy === "up-down" ? "hysteresis" : "quick";
+  }
   $("initial-rate").value = config.load.initial_rate;
   $("maximum-rate").value = config.load.maximum_rate;
   $("growth-factor").value = config.load.growth_factor;
@@ -422,6 +456,8 @@ function loadForm(run) {
   $("bootstrap-seed").value = analysis.bootstrap_seed ?? 1263420741;
   loadConfiguredVariants(config);
   const subprocess = config.agents.find((agent) => agent.transport.kind === "subprocess");
+  const remoteAgents = config.agents.filter((agent) => agent.transport.kind === "tcp");
+  runnerMode = subprocess && remoteAgents.length ? null : (subprocess ? "adapter" : (remoteAgents.length ? "remote" : null));
   $("adapter-program").value = subprocess?.transport.command.program || "";
   $("adapter-args").value = subprocess?.transport.command.arguments?.join("\n") || "";
   $("agent-endpoints").value = config.agents
@@ -430,6 +466,10 @@ function loadForm(run) {
     .join("\n");
   $("output-directory").value = config.output_directory;
   formDirty = false;
+  updateConfigurationFlow();
+  if (subprocess && remoteAgents.length) {
+    showMessage("This older run mixes colocated and remote agents. Choose one runner mode before editing it.", true);
+  }
 }
 
 function loadConfiguredVariants(config) {
@@ -439,13 +479,100 @@ function loadConfiguredVariants(config) {
     : [];
 }
 
-function updateStrategyHelp() {
-  const adaptive = $("strategy").value === "adaptive";
-  const description = strategyDescriptions[$("strategy").value] || "";
+function runnerConfigured() {
+  if (runnerMode === "adapter") return $("adapter-program").value.trim() !== "";
+  if (runnerMode === "remote") return $("agent-endpoints").value.trim() !== "";
+  return false;
+}
+
+function configurationReady() {
+  return runnerConfigured() && selectedStrategy !== null && selectedPreset !== null;
+}
+
+function relevantPresets() {
+  return Object.entries(presetDefinitions)
+    .filter(([, definition]) => definition.strategies.includes(selectedStrategy));
+}
+
+function applyPreset(name) {
+  const preset = presetDefinitions[name];
+  if (!preset || !preset.strategies.includes(selectedStrategy)) return;
+  selectedPreset = name;
+  for (const [field, value] of Object.entries(preset.values)) $(field).value = value;
+  updateConfigurationFlow();
+}
+
+function renderPresetChoices() {
+  const container = $("preset-choices");
+  container.replaceChildren();
+  for (const [name, preset] of relevantPresets()) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `choice-card${selectedPreset === name ? " selected" : ""}`;
+    button.dataset.preset = name;
+    button.setAttribute("aria-pressed", String(selectedPreset === name));
+    button.title = preset.description;
+    const label = document.createElement("strong");
+    label.textContent = preset.label;
+    const description = document.createElement("span");
+    description.textContent = preset.description;
+    button.append(label, description);
+    button.addEventListener("click", () => {
+      applyPreset(name);
+      markConfigurationDirty();
+    });
+    container.append(button);
+  }
+}
+
+function updateConfigurationFlow() {
+  for (const button of document.querySelectorAll("[data-runner-mode]")) {
+    const selected = button.dataset.runnerMode === runnerMode;
+    button.classList.toggle("selected", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  }
+  $("adapter-config").hidden = runnerMode !== "adapter";
+  $("remote-config").hidden = runnerMode !== "remote";
+  $("runner-step").classList.toggle("complete", runnerConfigured());
+  $("runner-step-status").textContent = !runnerMode
+    ? "Choose one"
+    : (runnerConfigured() ? (runnerMode === "adapter" ? "Executable set" : "Agents set") : "Details needed");
+
+  const runnerChosen = runnerMode !== null;
+  $("strategy-step").classList.toggle("locked", !runnerChosen);
+  $("strategy-step").classList.toggle("active", runnerChosen && !selectedStrategy);
+  $("strategy-step").classList.toggle("complete", selectedStrategy !== null);
+  $("strategy-choices").hidden = !runnerChosen;
+  $("strategy-step-status").textContent = selectedStrategy
+    ? selectedStrategy.replace("up-down", "Up / down")
+    : (runnerChosen ? "Choose one" : "Runner first");
+  for (const button of document.querySelectorAll("[data-strategy]")) {
+    const selected = button.dataset.strategy === selectedStrategy;
+    button.classList.toggle("selected", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  }
+
+  const description = strategyDescriptions[selectedStrategy] || "";
   $("strategy-help").textContent = description;
-  $("strategy").title = description;
+  $("strategy-help").hidden = !description;
+  const strategyChosen = selectedStrategy !== null;
+  $("parameters-step").classList.toggle("locked", !strategyChosen);
+  $("parameters-step").classList.toggle("active", strategyChosen);
+  $("parameters-step-status").textContent = strategyChosen ? "Review" : "Strategy first";
+  $("parameter-fields").hidden = !strategyChosen;
+  const adaptive = selectedStrategy === "adaptive";
+  $("levels-field").hidden = adaptive;
+  $("cycles-field").hidden = adaptive;
   $("levels").disabled = adaptive;
   $("cycles").disabled = adaptive;
+  $("repetitions-label").textContent = adaptive ? "Stability attempts" : "Repetitions";
+  renderPresetChoices();
+
+  const ready = configurationReady();
+  $("operations-step").classList.toggle("locked", !ready);
+  $("operations-step").classList.toggle("active", ready);
+  $("operation-fields").hidden = !ready;
+  $("operations-step-status").textContent = ready ? "Discovering" : "Configure first";
 }
 
 function selectedCatalog() {
@@ -473,16 +600,20 @@ function renderWorkloadEditor() {
   const status = $("agent-query-status");
   const catalog = preparation.status === "ready" ? preparation.catalog : null;
   if (queryInFlight || preparation.status === "preparing") {
+    $("operations-step-status").textContent = "Connecting";
     status.className = "catalog-status preparing";
     status.textContent = "Coordinator is opening and querying every configured agent…";
   } else if (preparation.status === "failed") {
+    $("operations-step-status").textContent = "Needs attention";
     status.className = "catalog-status failed";
     status.textContent = preparation.message;
   } else if (catalog) {
+    $("operations-step-status").textContent = "Ready";
     status.className = "catalog-status ready";
     const adapter = `${catalog.adapter.name}${catalog.adapter.version ? ` ${catalog.adapter.version}` : ""}`;
     status.textContent = `${adapter} · ${catalog.agents.length} agent${catalog.agents.length === 1 ? "" : "s"} ready · ${catalog.operations.length} operation${catalog.operations.length === 1 ? "" : "s"} share one schema`;
   } else {
+    $("operations-step-status").textContent = configurationReady() ? "Waiting" : "Configure first";
     status.className = "catalog-status";
     status.textContent = run?.config.agents.length
       ? "Agent endpoints changed; waiting to connect automatically."
@@ -909,9 +1040,24 @@ function updateButtons() {
 
 $("start").addEventListener("click", startRun);
 $("stop").addEventListener("click", stopRun);
-$("strategy").addEventListener("change", updateStrategyHelp);
+for (const button of document.querySelectorAll("[data-runner-mode]")) {
+  button.addEventListener("click", () => {
+    runnerMode = button.dataset.runnerMode;
+    markConfigurationDirty();
+  });
+}
+for (const button of document.querySelectorAll("[data-strategy]")) {
+  button.addEventListener("click", () => {
+    const strategy = button.dataset.strategy;
+    if (strategy === selectedStrategy) return;
+    selectedStrategy = strategy;
+    const presets = relevantPresets();
+    applyPreset(presets[0][0]);
+    markConfigurationDirty();
+  });
+}
 $("config-form").addEventListener("submit", (event) => event.preventDefault());
 $("config-form").addEventListener("input", markConfigurationDirty);
-updateStrategyHelp();
+updateConfigurationFlow();
 connect();
 render();

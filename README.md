@@ -62,8 +62,11 @@ reliability, per-variant results, and run progress based on completed phases.
 Around the knee, goodput flattens while latency rises sharply. After that run,
 edit the load levels, timings, strategy, operation variants, or remote-agent
 list. The dashboard saves the form and checks agent connectivity automatically;
-press Start when it reports ready. The browser exposes the actual traversal
-strategy directly and explains it in place; CLI-oriented presets are not shown.
+press Start when it reports ready. The browser walks through runner mode,
+traversal strategy, strategy-relevant presets and parameters, and discovered
+operations in order. It explains each strategy in place and keeps irrelevant
+controls hidden; preset descriptions explain whether they favor fast feedback,
+stable estimates, or hysteresis detection.
 Stop ends the active run while leaving both agents available for the next one.
 Run artifacts are retained in the `queue-demo-results` named volume. To copy
 them into the current directory before tearing the demo down:

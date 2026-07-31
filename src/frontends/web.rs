@@ -629,10 +629,15 @@ mod tests {
     fn browser_uses_the_discovery_driven_workload_editor() {
         assert!(!INDEX_HTML.contains(r#"id="query-agents""#));
         assert!(!INDEX_HTML.contains(r#"id="apply""#));
-        assert!(!INDEX_HTML.contains(r#"id="preset""#));
-        assert!(!APP_JS.contains(r#"$("preset")"#));
+        assert!(INDEX_HTML.contains(r#"id="runner-step""#));
+        assert!(INDEX_HTML.contains(r#"data-runner-mode="adapter""#));
+        assert!(INDEX_HTML.contains(r#"data-runner-mode="remote""#));
+        assert!(INDEX_HTML.contains(r#"id="strategy-step""#));
+        assert!(INDEX_HTML.contains(r#"id="parameters-step""#));
+        assert!(INDEX_HTML.contains(r#"id="operations-step""#));
+        assert!(INDEX_HTML.contains(r#"id="preset-choices""#));
         assert!(INDEX_HTML.contains(r#"id="strategy-help""#));
-        assert!(INDEX_HTML.contains("Up/down (detect hysteresis)"));
+        assert!(INDEX_HTML.contains("Up / down"));
         assert!(INDEX_HTML.contains(r#"id="run-progress-track""#));
         assert!(INDEX_HTML.contains(r#"id="latency-slo""#));
         assert!(INDEX_HTML.contains(r#"id="bootstrap-seed""#));
@@ -647,7 +652,12 @@ mod tests {
         assert!(APP_JS.contains(r#""select" : "input""#));
         assert!(APP_JS.contains(r#""Add explicitly""#));
         assert!(APP_JS.contains("strategyDescriptions"));
-        assert!(APP_JS.contains("updateStrategyHelp"));
+        assert!(APP_JS.contains("presetDefinitions"));
+        assert!(APP_JS.contains("updateConfigurationFlow"));
+        assert!(APP_JS.contains(r#"strategies: ["up-down"]"#));
+        assert!(APP_JS.contains("button.title = preset.description"));
+        assert!(APP_JS.contains(r#"$("levels-field").hidden = adaptive"#));
+        assert!(APP_JS.contains(r#"$("cycles-field").hidden = adaptive"#));
         assert!(APP_JS.contains("geometric midpoints"));
         assert!(APP_JS.contains("maximum_unsuccessful_rate"));
         assert!(APP_JS.contains("confidence interval"));
