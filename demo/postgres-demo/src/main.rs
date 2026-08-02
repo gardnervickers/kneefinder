@@ -82,16 +82,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn print_help() {
     println!(
-        "kneefinder queue demo\n\n\
+        "kneefinder PostgreSQL demo\n\n\
          Usage:\n  \
-           kneefinder-queue-demo e2e\n  \
-           kneefinder-queue-demo e2e-adaptive\n  \
-           kneefinder-queue-demo e2e-tcp\n  \
-           kneefinder-queue-demo e2e-tcp-web [HOST:PORT]\n  \
-           kneefinder-queue-demo e2e-tcp-web-external HOST:PORT ID=tcp://HOST:PORT...\n  \
-           kneefinder-queue-demo adapter\n  \
-           kneefinder-queue-demo adapter-tcp HOST:PORT\n  \
-           kneefinder-queue-demo healthcheck HOST:PORT"
+           kneefinder-postgres-demo e2e\n  \
+           kneefinder-postgres-demo e2e-adaptive\n  \
+           kneefinder-postgres-demo e2e-tcp\n  \
+           kneefinder-postgres-demo e2e-tcp-web [HOST:PORT]\n  \
+           kneefinder-postgres-demo e2e-tcp-web-external HOST:PORT ID=tcp://HOST:PORT...\n  \
+           kneefinder-postgres-demo adapter\n  \
+           kneefinder-postgres-demo adapter-tcp HOST:PORT\n  \
+           kneefinder-postgres-demo healthcheck HOST:PORT"
     );
 }
 

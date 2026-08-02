@@ -516,6 +516,13 @@ plan length; adaptive runs show the current phase without inventing a total.
 Completed points stream as preliminary evidence, while the knee remains hidden
 until final validation.
 
+The current dashboard makes that distinction visible during a long
+[hysteresis run](images/dashboard-progress.png) and after a
+[validated knee](images/dashboard-knee.png). With seven explicit levels, the
+three-cycle hysteresis preset visits 39 phases; its 10-second warmup, 20-second
+measurement, and 15-second recovery total roughly 29 minutes before terminal
+analysis.
+
 The traversal engine implements baseline, geometric discovery, and geometric
 midpoint refinement using conservative throughput-efficiency, latency, and
 unsuccessful-rate evidence. The shared analysis stage then performs the
@@ -584,7 +591,9 @@ errors, and generator lag. It will make the search algorithm and every frontend
 testable without a real target system.
 
 The first external fixture is maintained as the separate Rust package under
-`demo/queue-demo`. It combines a real fixed-worker queue with its agent in one
-external process. Its small end-to-end coordinator exercises both the real
-colocated stdio path and a two-process TCP cohort before the full kneefinder
-executor is available.
+`demo/postgres-demo`. It uses the native Rust PostgreSQL client for real MVCC
+lookups and transactional transfers against a shared PostgreSQL 18.3 server.
+The intentionally hot source row is held for 10 ms inside each transfer so its
+lock-serialization ceiling is visible in short runs. The package exercises the
+production executor through colocated stdio, a two-process TCP cohort, and the
+containerized browser deployment.

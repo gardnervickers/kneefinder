@@ -1,7 +1,7 @@
 # Multi-agent dashboard friction log
 
 This log records usability problems found while exercising the containerized
-queue demo as an operator would. The demo now runs through the production
+PostgreSQL demo as an operator would. The demo now runs through the production
 generic executor, including its interruptible Stop path.
 
 | Friction | Resolution |
@@ -15,6 +15,7 @@ generic executor, including its interruptible Stop path.
 | Instructions assumed Docker even when a Docker-compatible Podman setup was available. | The README now gives both Docker Compose and Podman Compose commands, plus a container-free colocated smoke test. |
 | Opening the demo immediately launched the default workload before the operator could review it. | Startup now prepares and discovers the initial run only; workload traffic begins exclusively after an explicit Start command. |
 | Separate Apply and Query buttons made saving, discovery, and readiness look like unrelated manual steps. | Form edits are saved automatically, endpoint changes trigger automatic agent preparation, connection failures are shown inline, and Start is enabled only after the agents are ready. |
+| Long warmup, measurement, and recovery intervals looked stalled, and a long up/down run appeared never to produce a knee. | Frontend-neutral phase progress now reports the phase and segment, elapsed time, scheduled and returned operations, and fixed-plan ETA. The dashboard states explicitly that the knee appears only after final validation. |
 
 The required regression scenario is: verify the prepared default run remains
 idle, explicitly start and complete it, create a run with changed settings and

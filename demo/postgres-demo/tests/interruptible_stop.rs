@@ -41,9 +41,12 @@ fn stop_forces_a_hung_colocated_adapter_after_the_cancellation_deadline() {
                 workload: WorkloadConfig {
                     operations: OperationSelection::Selected {
                         operations: vec![WeightedOperation {
-                            name: "read".into(),
+                            name: "lookup".into(),
                             weight: 1.0,
-                            arguments: BTreeMap::from([("key".into(), ArgumentValue::Integer(0))]),
+                            arguments: BTreeMap::from([(
+                                "account".into(),
+                                ArgumentValue::Integer(1),
+                            )]),
                         }],
                     },
                 },
@@ -52,7 +55,7 @@ fn stop_forces_a_hung_colocated_adapter_after_the_cancellation_deadline() {
                     id: "hung-local".into(),
                     transport: AgentTransportConfig::Subprocess {
                         command: AdapterCommand {
-                            program: env!("CARGO_BIN_EXE_kneefinder-queue-demo").into(),
+                            program: env!("CARGO_BIN_EXE_kneefinder-postgres-demo").into(),
                             arguments: vec!["adapter-hang".into()],
                         },
                     },

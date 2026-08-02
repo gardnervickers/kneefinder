@@ -32,15 +32,11 @@ use kneefinder::{
 #[cfg(feature = "web")]
 use kneefinder::frontends::{Frontend, web::WebFrontend};
 
-const WORKERS: usize = 4;
-const READ_SERVICE_MS: u64 = 10;
-const WRITE_SERVICE_MS: u64 = 20;
+const CONNECTIONS: usize = 4;
+const LOCK_HOLD_MS: u64 = 10;
 
-fn theoretical_knee(workers: usize) -> f64 {
-    let average_read_ms = READ_SERVICE_MS as f64 * 1.25;
-    let average_write_ms = WRITE_SERVICE_MS as f64 * 1.25;
-    let average_service_ms = (9.0 * average_read_ms + average_write_ms) / 10.0;
-    workers as f64 * 1_000.0 / average_service_ms
+fn theoretical_knee() -> f64 {
+    1_000.0 / LOCK_HOLD_MS as f64 / 0.16
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
@@ -55,15 +51,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         },
     }];
 
-    let expected_knee = theoretical_knee(WORKERS);
+    let expected_knee = theoretical_knee();
+    eprintln!("e2e topology: coordinator -> colocated agent -> PostgreSQL adapter -> PostgreSQL");
     eprintln!(
-        "e2e topology: coordinator -> colocated agent -> external adapter -> internal queue service"
-    );
-    eprintln!(
-        "target: {WORKERS} workers; 90/10 operations and 3/1 argument variants; theoretical knee {expected_knee:.0} req/s\n"
+        "target: {CONNECTIONS} client connections; 80/20 lookups/transfers; hot-row lock held {LOCK_HOLD_MS} ms; expected knee near {expected_knee:.0} req/s\n"
     );
 
-    let rates = [100.0, 200.0, 250.0, 290.0, 325.0, 425.0, 550.0];
+    let rates = [150.0, 300.0, 450.0, 600.0, 750.0, 1_000.0, 1_400.0];
     let engine = Engine::new();
     let handle = engine.handle();
     let events = handle.subscribe();
@@ -80,9 +74,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         .operations
         .iter()
         .map(|operation| operation.name.as_str())
-        .eq(["read", "write"])
+        .eq(["lookup", "transfer"])
     {
-        eprintln!("adapter advertised operations: read=9, write=1");
+        eprintln!("adapter advertised operations: lookup=4, transfer=1");
     } else {
         return Err(format!("unexpected advertised operations: {:?}", catalog.operations).into());
     }
@@ -126,17 +120,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         .as_ref()
         .ok_or_else(|| format!("fixed sweep did not produce a knee: {outcome:?}"))?;
     if outcome.classification != RunClassification::TargetSaturated
-        || !(250.0..=350.0).contains(&knee.offered_rate)
+        || !(450.0..=850.0).contains(&knee.offered_rate)
         || outcome.analysis.is_none()
     {
         return Err(format!("unexpected fixed-sweep knee result: {outcome:?}").into());
     }
     eprintln!(
         "fitted knee {:.1} req/s ({:.1}–{:.1}), recommended {:.1}\n",
-        knee.offered_rate,
-        knee.lower_bound,
-        knee.upper_bound,
-        knee.recommended_operating_rate
+        knee.offered_rate, knee.lower_bound, knee.upper_bound, knee.recommended_operating_rate
     );
     print_rows(&rows, expected_knee);
     print_variant_stats(&rows);
@@ -154,7 +145,7 @@ pub fn run_adaptive() -> Result<(), Box<dyn Error>> {
             },
         },
     }];
-    let mut config = demo_config(endpoints, &[100.0, 550.0]);
+    let mut config = demo_config(endpoints, &[150.0, 1_400.0]);
     config.strategy = Strategy::Adaptive;
     config.load.explicit_levels.clear();
     config.load.growth_factor = 2.0;
@@ -209,7 +200,7 @@ pub fn run_adaptive() -> Result<(), Box<dyn Error>> {
         .knee
         .as_ref()
         .ok_or("adaptive run did not produce a knee estimate")?;
-    if !(250.0..=350.0).contains(&knee.offered_rate)
+    if !(450.0..=850.0).contains(&knee.offered_rate)
         || knee.lower_bound > knee.offered_rate
         || knee.upper_bound < knee.offered_rate
         || knee.recommended_operating_rate > knee.lower_bound
@@ -230,10 +221,7 @@ pub fn run_adaptive() -> Result<(), Box<dyn Error>> {
     }
     println!(
         "adaptive E2E passed: {reports} phases, knee {:.1} req/s ({:.1}–{:.1}), recommended {:.1}",
-        knee.offered_rate,
-        knee.lower_bound,
-        knee.upper_bound,
-        knee.recommended_operating_rate
+        knee.offered_rate, knee.lower_bound, knee.upper_bound, knee.recommended_operating_rate
     );
     Ok(())
 }
@@ -242,8 +230,8 @@ pub fn run_tcp_multi_client() -> Result<(), Box<dyn Error>> {
     let mut cohort = connect_tcp_cohort()?;
     cohort.initialize(RunId(2), 2)?;
 
-    let offered_per_second = 100.0;
-    let operations = (0..80)
+    let offered_per_second = 150.0;
+    let operations = (0..100)
         .map(|index| {
             let (operation, arguments) = variant_for_index(index);
             ScheduledOperation {
@@ -264,9 +252,9 @@ pub fn run_tcp_multi_client() -> Result<(), Box<dyn Error>> {
         return Err(format!("expected two per-agent results, got {}", phase.agents.len()).into());
     }
     for result in &phase.agents {
-        if result.operations.len() != 40 {
+        if result.operations.len() != 50 {
             return Err(format!(
-                "agent {} executed {} operations instead of 40",
+                "agent {} executed {} operations instead of 50",
                 result.agent.id,
                 result.operations.len()
             )
@@ -278,7 +266,7 @@ pub fn run_tcp_multi_client() -> Result<(), Box<dyn Error>> {
             .iter()
             .map(|variant| variant.stats.attempts)
             .collect::<Vec<_>>();
-        if attempts != [27, 9, 1, 3] {
+        if attempts != [32, 8, 2, 8] {
             return Err(format!(
                 "agent {} received an imbalanced variant mix: {attempts:?}",
                 result.agent.id,
@@ -288,8 +276,8 @@ pub fn run_tcp_multi_client() -> Result<(), Box<dyn Error>> {
     }
     let operations = phase.into_operations();
     let stats = summarize_results(&operations)?;
-    if stats.overall.attempts != 80
-        || stats.overall.successful != 80
+    if stats.overall.attempts != 100
+        || stats.overall.successful != 100
         || stats.overall.failed != 0
         || stats.overall.timed_out != 0
     {
@@ -301,7 +289,7 @@ pub fn run_tcp_multi_client() -> Result<(), Box<dyn Error>> {
     }
 
     cohort.shutdown()?;
-    println!("multi-client TCP E2E passed: 2 clients, 40 operations each, 80 successful total");
+    println!("multi-client TCP E2E passed: 2 clients, 50 operations each, 100 successful total");
     Ok(())
 }
 
@@ -348,15 +336,13 @@ impl TcpDemoCohort {
     fn initialize(
         &mut self,
         run_id: RunId,
-        workers_per_agent: usize,
+        connections_per_agent: usize,
     ) -> Result<(), Box<dyn Error>> {
         let ready = self.agents.initialize(
             run_id,
             serde_json::json!({
-                "workers": workers_per_agent,
-                "read_service_ms": READ_SERVICE_MS,
-                "write_service_ms": WRITE_SERVICE_MS,
-                "queue_capacity": 4096
+                "connections": connections_per_agent,
+                "lock_hold_ms": LOCK_HOLD_MS
             }),
         )?;
         if ready.agents.len() != 2
@@ -404,15 +390,15 @@ fn run_tcp_multi_client_dashboard(
     let handle = engine.handle();
     let web_handle = handle.clone();
     thread::Builder::new()
-        .name("kneefinder-queue-demo-web".into())
+        .name("kneefinder-postgres-demo-web".into())
         .spawn(move || {
             if let Err(error) = WebFrontend::new(bind, allow_remote).run(web_handle) {
-                eprintln!("queue demo web server failed: {error}");
+                eprintln!("PostgreSQL demo web server failed: {error}");
             }
         })?;
     wait_for_web(bind)?;
 
-    let rates = [100.0, 200.0, 250.0, 290.0, 325.0, 425.0, 550.0];
+    let rates = [150.0, 300.0, 450.0, 600.0, 750.0, 1_000.0, 1_400.0];
     let configured = handle.execute(EngineCommand::Configure {
         config: Box::new(demo_config(endpoints, &rates)),
     })?;
@@ -462,24 +448,24 @@ fn demo_config(endpoints: Vec<AgentEndpointConfig>, rates: &[f64]) -> RunConfig 
         workload: WorkloadConfig {
             operations: OperationSelection::Selected {
                 operations: vec![
-                    weighted_operation("read", "key", ArgumentValue::Integer(0), 27.0),
-                    weighted_operation("read", "key", ArgumentValue::Integer(1), 9.0),
+                    weighted_operation("lookup", "account", ArgumentValue::Integer(1), 32.0),
+                    weighted_operation("lookup", "account", ArgumentValue::Integer(2), 8.0),
                     weighted_operation(
-                        "write",
-                        "value",
-                        ArgumentValue::String("small".into()),
-                        3.0,
+                        "transfer",
+                        "route",
+                        ArgumentValue::String("hot".into()),
+                        8.0,
                     ),
                     weighted_operation(
-                        "write",
-                        "value",
-                        ArgumentValue::String("large".into()),
-                        1.0,
+                        "transfer",
+                        "route",
+                        ArgumentValue::String("cold".into()),
+                        2.0,
                     ),
                 ],
             },
         },
-        output_directory: PathBuf::from("results/queue-demo-multi-client"),
+        output_directory: PathBuf::from("results/postgres-demo"),
         agents: endpoints,
     }
 }
@@ -523,7 +509,7 @@ impl TcpAdapterProcess {
     fn spawn(executable: &std::path::Path) -> Result<Self, Box<dyn Error>> {
         let mut child = Command::new(executable)
             .args(["adapter-tcp", "127.0.0.1:0"])
-            .env("KNEEFINDER_QUEUE_DEMO_WORKERS", "2")
+            .env("KNEEFINDER_POSTGRES_CONNECTIONS", "2")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -572,25 +558,25 @@ impl Drop for TcpAdapterProcess {
     }
 }
 
-/// One interleaved 40-operation cycle: read(0)=27, read(1)=9,
-/// write(small)=3, write(large)=1.
+/// One interleaved 50-operation cycle: lookup(1)=32, lookup(2)=8,
+/// transfer(hot)=8, transfer(cold)=2.
 fn variant_for_index(index: u64) -> (&'static str, BTreeMap<String, ArgumentValue>) {
-    match index % 40 {
-        39 => (
-            "write",
-            BTreeMap::from([("value".into(), ArgumentValue::String("large".into()))]),
+    match index % 50 {
+        24 | 49 => (
+            "transfer",
+            BTreeMap::from([("route".into(), ArgumentValue::String("cold".into()))]),
         ),
-        9 | 19 | 29 => (
-            "write",
-            BTreeMap::from([("value".into(), ArgumentValue::String("small".into()))]),
+        5 | 11 | 17 | 23 | 30 | 36 | 42 | 48 => (
+            "transfer",
+            BTreeMap::from([("route".into(), ArgumentValue::String("hot".into()))]),
         ),
-        3 | 7 | 11 | 15 | 23 | 27 | 31 | 35 | 37 => (
-            "read",
-            BTreeMap::from([("key".into(), ArgumentValue::Integer(1))]),
+        3 | 9 | 15 | 21 | 28 | 34 | 40 | 46 => (
+            "lookup",
+            BTreeMap::from([("account".into(), ArgumentValue::Integer(2))]),
         ),
         _ => (
-            "read",
-            BTreeMap::from([("key".into(), ArgumentValue::Integer(0))]),
+            "lookup",
+            BTreeMap::from([("account".into(), ArgumentValue::Integer(1))]),
         ),
     }
 }

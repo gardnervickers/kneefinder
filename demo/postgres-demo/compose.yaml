@@ -1,0 +1,76 @@
+name: kneefinder-postgres-demo
+
+x-postgres-demo: &postgres-demo
+  image: kneefinder-postgres-demo:local
+  init: true
+
+services:
+  postgres:
+    image: postgres:18.3-bookworm
+    environment:
+      POSTGRES_DB: kneefinder
+      POSTGRES_USER: kneefinder
+      POSTGRES_PASSWORD: kneefinder
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kneefinder -d kneefinder"]
+      interval: 1s
+      timeout: 2s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql
+
+  agent-a:
+    <<: *postgres-demo
+    command: ["adapter-tcp", "0.0.0.0:9000"]
+    environment:
+      KNEEFINDER_POSTGRES_URL: postgres://kneefinder:kneefinder@postgres:5432/kneefinder
+      KNEEFINDER_POSTGRES_CONNECTIONS: "2"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "kneefinder-postgres-demo", "healthcheck", "127.0.0.1:9000"]
+      interval: 1s
+      timeout: 2s
+      retries: 10
+
+  agent-b:
+    <<: *postgres-demo
+    command: ["adapter-tcp", "0.0.0.0:9000"]
+    environment:
+      KNEEFINDER_POSTGRES_URL: postgres://kneefinder:kneefinder@postgres:5432/kneefinder
+      KNEEFINDER_POSTGRES_CONNECTIONS: "2"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "kneefinder-postgres-demo", "healthcheck", "127.0.0.1:9000"]
+      interval: 1s
+      timeout: 2s
+      retries: 10
+
+  web:
+    <<: *postgres-demo
+    build:
+      context: ../..
+      dockerfile: demo/postgres-demo/Dockerfile
+    command:
+      - e2e-tcp-web-external
+      - 0.0.0.0:8080
+      - agent-a=tcp://agent-a:9000
+      - agent-b=tcp://agent-b:9000
+    depends_on:
+      agent-a:
+        condition: service_healthy
+      agent-b:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - postgres-demo-results:/demo/results
+
+volumes:
+  postgres-data:
+  postgres-demo-results:

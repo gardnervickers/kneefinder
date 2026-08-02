@@ -186,7 +186,7 @@ time buckets should support stationarity checks, repeats, and uncertainty.
 - `src/frontends/web.rs`: optional HTTP/WebSocket control plane
 - `src/frontends/web/`: dependency-free browser assets
 - `examples/rust-adapter.rs`: runnable adapter-authoring example
-- `demo/queue-demo`: separate combined adapter/service and E2E controller
+- `demo/postgres-demo`: real PostgreSQL adapter and E2E controller
 - `docs/design.md`: architecture and measurement design, including aspirational
   sections that are not necessarily implemented
 - `docs/images`: README dashboard screenshots
@@ -211,7 +211,7 @@ At the time this handoff was written, these pieces exist:
   transport
 - fixed agent cohort with stable identities plus colocated and remote session
   implementations
-- runnable queue demonstrations using the colocated path and two TCP clients,
+- runnable PostgreSQL demonstrations using the colocated path and two TCP clients,
   including repeated browser-configured runs and graceful stop/rerun
 - schema-versioned incremental artifacts, redacted configuration, recovery,
   inspect/render commands, and stable batch exit statuses
@@ -224,7 +224,7 @@ checks with bounded repeats, strategy-decision provenance, per-phase statistics,
 generator-saturation invalidation, statistical knee fitting, deterministic
 confidence bounds, SLO capacity, conservative recommendations, and cooperative
 stop.
-The queue demo exercises this production path for both colocated and
+The PostgreSQL demo exercises this production path for both colocated and
 multi-client web runs. In-flight schedules are interruptible: Stop preserves
 partial results, sends `CancelPhase`, and force-closes the session after a
 deadline, killing only a colocated subprocess while leaving a remote agent
@@ -236,41 +236,47 @@ honest as work progresses.
 Inspect source and current GitHub issue state before relying on a described
 command or component.
 
-## Queue demo contract
+## PostgreSQL demo contract
 
-`demo/queue-demo` is a separate Rust package that combines a protocol adapter
-and a fixed-worker FIFO service. Its coordinator uses the real `AgentCohort`,
+`demo/postgres-demo` is a separate Rust package whose adapter uses the native
+Rust PostgreSQL client. Its coordinator uses the real `AgentCohort`,
 `ColocatedAgent`, `TcpAgent`, and adapter session. It is the current complete
 measured E2E path for both colocated and multi-client transport modes.
 
-The default workload has four workers and four variants with weights 27:9:3:1:
+The default workload has four client connections and four variants with
+weights 32:8:8:2:
 
-- `read(key=0)`: 10 ms
-- `read(key=1)`: 20 ms
-- `write(value=small)`: 20 ms
-- `write(value=large)`: 40 ms
+- `lookup(account=1)`: normal MVCC read of the hot account
+- `lookup(account=2)`: normal MVCC read of another account
+- `transfer(route=hot)`: transaction over accounts 1 and 2
+- `transfer(route=cold)`: transaction over accounts 3 and 4
 
-The weighted mean service time is 13.75 ms, so the theoretical shared-queue
-knee is about 291 operations/second. The demo should show goodput flattening
-and p95 latency rising near/after that point. Avoid fragile assertions on exact
-wall-clock numbers.
+Transfers hold the source row lock for 10 ms before updating the destination
+and committing. Hot transfers are 16% of total traffic, so the controlled
+serialization ceiling predicts a knee near 625 offered operations/second. The
+E2E accepts 450–850 operations/second to account for PostgreSQL and host
+overhead. The demo should show goodput flattening and p95 latency rising near
+or after that point; do not narrow the assertion to one wall-clock result.
 
 Run it with:
 
 ```console
-cargo run --release --manifest-path demo/queue-demo/Cargo.toml -- e2e
+KNEEFINDER_POSTGRES_URL=postgres://kneefinder:kneefinder@127.0.0.1:55432/kneefinder \
+  cargo run --release --manifest-path demo/postgres-demo/Cargo.toml -- e2e
 ```
 
 Run the adaptive baseline/discovery/refinement E2E with:
 
 ```console
-cargo run --release --manifest-path demo/queue-demo/Cargo.toml -- e2e-adaptive
+KNEEFINDER_POSTGRES_URL=postgres://kneefinder:kneefinder@127.0.0.1:55432/kneefinder \
+  cargo run --release --manifest-path demo/postgres-demo/Cargo.toml -- e2e-adaptive
 ```
 
 Run the two-client TCP transport E2E with:
 
 ```console
-cargo run --manifest-path demo/queue-demo/Cargo.toml -- e2e-tcp
+KNEEFINDER_POSTGRES_URL=postgres://kneefinder:kneefinder@127.0.0.1:55432/kneefinder \
+  cargo run --release --manifest-path demo/postgres-demo/Cargo.toml -- e2e-tcp
 ```
 
 Keep the demo external to the main crate. When the generic session/executor is
@@ -294,7 +300,7 @@ chain is #1 -> #2 -> #3 -> #4, with artifact and frontend work building on it.
 - [#10](https://github.com/gardnervickers/kneefinder/issues/10): remote transport and multi-client coordination
 - [#11](https://github.com/gardnervickers/kneefinder/issues/11): persisted browser run history and comparison
 - [#12](https://github.com/gardnervickers/kneefinder/issues/12): adapter-managed high-throughput phases
-- [#13](https://github.com/gardnervickers/kneefinder/issues/13): CI across feature sets and the queue demo
+- [#13](https://github.com/gardnervickers/kneefinder/issues/13): CI across feature sets and the PostgreSQL demo
 
 Update or close the applicable issue when implementation lands. Do not create a
 parallel TODO list in code when an existing issue already captures the work.
@@ -302,7 +308,7 @@ parallel TODO list in code when an existing issue already captures the work.
 ## Development and verification
 
 This is Rust 2024. The root crate's default feature is `cli`; `web` is optional,
-and the core supports `--no-default-features`. The queue demo has its own
+and the core supports `--no-default-features`. The PostgreSQL demo has its own
 manifest and lockfile.
 
 Use the repository's locked dependencies. Prefer offline checks when the Cargo
@@ -317,11 +323,11 @@ cargo clippy --offline --all-targets -- -D warnings
 cargo clippy --offline --no-default-features --all-targets -- -D warnings
 cargo clippy --offline --features web --all-targets -- -D warnings
 cargo build --offline --no-default-features --example rust-adapter
-cargo test --offline --manifest-path demo/queue-demo/Cargo.toml
-cargo clippy --offline --manifest-path demo/queue-demo/Cargo.toml --all-targets -- -D warnings
+cargo test --offline --manifest-path demo/postgres-demo/Cargo.toml
+cargo clippy --offline --manifest-path demo/postgres-demo/Cargo.toml --all-targets -- -D warnings
 ```
 
-Run the release queue E2E for changes to protocol, scheduling, measurement,
+Run the release PostgreSQL E2E for changes to protocol, scheduling, measurement,
 statistics, or the demo. For web changes, also launch the server and verify the
 HTTP endpoints, WebSocket snapshot/event flow, and dashboard visually.
 

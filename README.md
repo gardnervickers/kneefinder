@@ -22,35 +22,36 @@ supervised stdio process or a persistent TCP connection.
 - a knee estimate, confidence bounds, and a conservative operating rate
 
 An operation plus its concrete arguments is one workload variant. For example,
-`read(key=0)` and `read(key=1)` receive independent weights and independent
-statistics.
+`lookup(account=1)` and `lookup(account=2)` receive independent weights and
+independent statistics.
 
-![Kneefinder reliability and per-variant reporting](docs/images/dashboard-reliability.png)
+Long runs expose their current phase, warmup/measurement/recovery segment,
+elapsed time, scheduled and reported operations, and an estimated remaining
+time. Completed points stream into the charts as preliminary evidence; the knee
+remains hidden until the run finishes statistical validation.
 
-The reliability view above uses fault-injected high-load phases to demonstrate
-error-code grouping and explicit timeout reporting.
+![Kneefinder dashboard showing live hysteresis progress](docs/images/dashboard-progress.png)
 
 ## Try the containerized multi-agent demo
 
-The included demo combines an adapter with a four-worker FIFO service. Its
-weighted service time gives it a theoretical knee near 291 requests per second.
-The default demo runs the real distributed topology:
+The included demo runs a real PostgreSQL 18.3 database, two independent
+workload agents, and the browser coordinator:
 
 ```text
-browser -> web coordinator -> TCP agent A -> queue workers
-                           \-> TCP agent B -> queue workers
+browser -> web coordinator -> TCP agent A -\
+                           \-> TCP agent B ---> PostgreSQL
 ```
 
-Start all three containers with either Docker Compose:
+Start all four containers with either Docker Compose:
 
 ```console
-docker compose -f demo/queue-demo/compose.yaml up --build
+docker compose -f demo/postgres-demo/compose.yaml up --build
 ```
 
 or Podman Compose:
 
 ```console
-podman-compose -f demo/queue-demo/compose.yaml up --build
+podman-compose -f demo/postgres-demo/compose.yaml up --build
 ```
 
 Open <http://127.0.0.1:8080>. The coordinator waits for both agents, initiates
@@ -70,12 +71,16 @@ traversal strategy, strategy-relevant presets and parameters, and discovered
 operations in order. It explains each strategy in place and keeps irrelevant
 controls hidden; preset descriptions explain whether they favor fast feedback,
 stable estimates, or hysteresis detection.
+The seven-level hysteresis preset traverses 13 phases per cycle for three
+cycles: 39 phases total. At 10 seconds of warmup, 20 seconds of measurement,
+and 15 seconds of recovery per phase, final knee validation takes roughly 29
+minutes. The dashboard shows that phase count and a live ETA throughout.
 Stop ends the active run while leaving both agents available for the next one.
-Run artifacts are retained in the `queue-demo-results` named volume. To copy
+Run artifacts are retained in the `postgres-demo-results` named volume. To copy
 them into the current directory before tearing the demo down:
 
 ```console
-docker compose -f demo/queue-demo/compose.yaml cp web:/demo/results ./results
+docker compose -f demo/postgres-demo/compose.yaml cp web:/demo/results ./results
 ```
 
 Use `podman-compose` in the command above when applicable.
@@ -87,23 +92,54 @@ The dashboard is published on loopback only. When finished, stop the foreground
 process with `Ctrl+C` and remove the demo containers:
 
 ```console
-docker compose -f demo/queue-demo/compose.yaml down
+docker compose -f demo/postgres-demo/compose.yaml down
 ```
 
 Use `podman-compose` in the command above if that is how the demo was started.
 
-For a quick local smoke test without a container runtime, the colocated mode remains
-available:
+The workload performs real MVCC lookups and transactional account transfers.
+The hot transfer holds a PostgreSQL row lock for 10 ms, making its serialization
+ceiling easy to see: 16% of traffic takes that path, so the controlled component
+predicts a knee near 625 offered operations per second. PostgreSQL and host
+overhead move the fitted result somewhat; the E2E accepts 450–850 ops/s rather
+than asserting one wall-clock value.
+
+For local Rust runs, start only PostgreSQL:
 
 ```console
-cargo run --release --manifest-path demo/queue-demo/Cargo.toml -- e2e
+docker compose -f demo/postgres-demo/compose.yaml up -d postgres
 ```
 
-The same queue also provides a release-mode adaptive traversal check:
+Then exercise the release-mode adaptive traversal:
 
 ```console
-cargo run --release --manifest-path demo/queue-demo/Cargo.toml -- e2e-adaptive
+KNEEFINDER_POSTGRES_URL=postgres://kneefinder:kneefinder@127.0.0.1:55432/kneefinder \
+  cargo run --release --manifest-path demo/postgres-demo/Cargo.toml -- e2e-adaptive
 ```
+
+Exercise the normal `kneefinder run` CLI against the bundled adapter with a
+short, complete sweep:
+
+```console
+cargo build --release --manifest-path demo/postgres-demo/Cargo.toml
+KNEEFINDER_POSTGRES_URL=postgres://kneefinder:kneefinder@127.0.0.1:55432/kneefinder \
+  cargo run --release -- run \
+  --strategy sweep \
+  --levels 150,300,450,600,750,1000,1400 \
+  --warmup 0ms \
+  --measurement 1s \
+  --recovery 0ms \
+  --operation 'lookup:account=1@32' \
+  --operation 'lookup:account=2@8' \
+  --operation 'transfer:route=hot@8' \
+  --operation 'transfer:route=cold@2' \
+  -- demo/postgres-demo/target/release/kneefinder-postgres-demo adapter
+```
+
+This takes about seven seconds of configured measurement time and should report
+a knee around PostgreSQL's hot-row contention limit. See the
+[demo guide](demo/postgres-demo/README.md) for fixed, adaptive, TCP, browser,
+and integration-test commands.
 
 ## Browser UI and API
 
@@ -117,7 +153,7 @@ Open <http://127.0.0.1:8080>. The server exposes:
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /api/v1/snapshot` | Current run state and retained phase results |
+| `GET /api/v1/snapshot` | Current run state, live phase progress, and retained results |
 | `POST /api/v1/commands` | Submit a serialized engine command |
 | `GET /api/v1/ws` | Full-duplex commands, acknowledgements, and streamed events |
 | `GET /healthz` | Process and API-version health |
@@ -139,15 +175,15 @@ safe defaults behind an explicit add action.
 ## Configure a workload
 
 The same resolved configuration is shared by CLI, web, and future TUI
-frontends. A 90/10 read/write mix with 3:1 argument ratios becomes four flat
+frontends. The PostgreSQL demo's 80/20 lookup/transfer mix becomes four flat
 weights:
 
 ```console
 cargo run -- run \
-  --operation 'read:key=0@27' \
-  --operation 'read:key=1@9' \
-  --operation 'write:value=small@3' \
-  --operation 'write:value=large@1' \
+  --operation 'lookup:account=1@32' \
+  --operation 'lookup:account=2@8' \
+  --operation 'transfer:route=hot@8' \
+  --operation 'transfer:route=cold@2' \
   --print-config
 ```
 
@@ -212,17 +248,14 @@ Batch exit statuses are stable: `0` for a completed result, `2` for stopped,
 `3` for invalid or generator-limited measurements, `4` for a failed run, and
 `1` for CLI or artifact-reading errors.
 
-Durations and load traversal are configurable without a YAML file:
+Durations and load traversal are configurable without a YAML file. This command
+prints the complete seven-level hysteresis plan without executing its 39
+phases:
 
 ```console
 cargo run -- run \
-  --preset careful \
-  --strategy up-down \
-  --levels 100,200,300,400 \
-  --warmup 10s \
-  --measurement 30s \
-  --recovery 15s \
-  --cycles 3 \
+  --preset hysteresis \
+  --levels 150,300,450,600,750,1000,1400 \
   --print-config
 ```
 
@@ -243,7 +276,8 @@ Its lifecycle is:
 5. Return stable, low-cardinality error codes and represent timeouts explicitly.
 
 The complete stdio Rust example is [examples/rust-adapter.rs](examples/rust-adapter.rs),
-and the queue demo provides both stdio and TCP implementations.
+and the PostgreSQL demo provides both stdio and TCP implementations against a
+real native client.
 The only target-specific part is the function that calls the system under test:
 
 ```rust
@@ -293,15 +327,15 @@ saturated target visibly different failure modes.
 
 The adapter protocol, supervised subprocess and persistent TCP transports,
 coordinator-owned colocated and remote session agents, fixed multi-agent cohort,
-workload model, measurement types, statistics, lifecycle engine, queue
+workload model, measurement types, statistics, lifecycle engine, PostgreSQL
 demonstration, CLI configuration, HTTP/WebSocket control plane, and browser UI
 are implemented. The engine and browser also implement coordinator-owned agent
 preparation, retained initialized cohorts, discovery events, and a typed
-workload editor. The queue demo exercises both the colocated path and a
+workload editor. The PostgreSQL demo exercises both the colocated path and a
 two-agent TCP cohort, including a Docker/Podman Compose deployment with the web
-coordinator in a third container and the preparation flow in its live
-dashboard. That demo can execute repeated browser-configured runs and gracefully
-stop an active run while retaining its agents. The production engine now turns
+coordinator and one shared PostgreSQL instance. Its real MVCC lookup and hot-row
+transaction workload can execute repeated browser-configured runs and
+gracefully stop an active run while retaining its agents. The production engine now turns
 prepared cohorts and `RunConfig` values into bounded, deterministic scheduled
 operation batches for CLI and browser runs, including warmup, measurement,
 recovery, repetitions, sweep/up-down traversal, per-phase statistics, and
@@ -310,7 +344,10 @@ discover a healthy/saturated bracket geometrically, and refine it with
 geometric midpoints. Fixed time buckets can reject non-stationary phases;
 adaptive runs repeat them within the configured repetition budget. Every load
 selection, acceptance, repetition, rejection, and recovery interval is emitted
-through the shared engine API and retained in browser run results. Completed
+through the shared engine API and retained in browser run results. The executor
+also emits frontend-neutral live phase progress, which the browser retains for
+reconnects and renders with segment timing, operation activity, and fixed-plan
+ETA. Completed
 runs fit a continuous two-segment goodput model, compare it with a single-line
 null model, validate the candidate using latency, reliability, in-flight
 growth, and dispatch lag, and estimate deterministic confidence bounds from

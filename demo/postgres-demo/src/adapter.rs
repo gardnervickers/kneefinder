@@ -3,7 +3,7 @@ use std::{
     error::Error,
     io::{self, BufRead, BufReader, BufWriter, Write},
     net::TcpListener,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Condvar, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -13,37 +13,40 @@ use kneefinder::protocol::{
     LoadModel, OperationArgument, OperationDescriptor, OperationKind, OperationResult,
     OperationStatus, PROTOCOL_VERSION, ScheduledOperation,
 };
+use postgres::{Client, NoTls};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 struct AdapterConfig {
-    #[serde(default = "default_workers")]
-    workers: usize,
-    #[serde(default = "default_read_service_ms")]
-    read_service_ms: u64,
-    #[serde(default = "default_write_service_ms")]
-    write_service_ms: u64,
-    #[serde(default = "default_queue_capacity")]
-    queue_capacity: usize,
+    #[serde(default = "default_database_url")]
+    database_url: String,
+    #[serde(default = "default_connections")]
+    connections: usize,
+    #[serde(default = "default_lock_hold_ms")]
+    lock_hold_ms: u64,
 }
 
-fn default_workers() -> usize {
-    env::var("KNEEFINDER_QUEUE_DEMO_WORKERS")
+fn default_database_url() -> String {
+    env::var("KNEEFINDER_POSTGRES_URL")
+        .unwrap_or_else(|_| "postgres://kneefinder:kneefinder@127.0.0.1:5432/kneefinder".into())
+}
+
+fn default_connections() -> usize {
+    env::var("KNEEFINDER_POSTGRES_CONNECTIONS")
         .ok()
-        .and_then(|workers| workers.parse().ok())
+        .and_then(|connections| connections.parse().ok())
         .unwrap_or(4)
 }
 
-fn default_read_service_ms() -> u64 {
-    10
+fn default_lock_hold_ms() -> u64 {
+    env::var("KNEEFINDER_POSTGRES_LOCK_HOLD_MS")
+        .ok()
+        .and_then(|milliseconds| milliseconds.parse().ok())
+        .unwrap_or(10)
 }
 
-fn default_write_service_ms() -> u64 {
+fn maximum_lock_hold_ms() -> u64 {
     20
-}
-
-fn default_queue_capacity() -> usize {
-    4_096
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,17 +76,17 @@ pub fn run_tcp(address: &str) -> Result<(), Box<dyn Error>> {
     loop {
         let (stream, peer) = listener.accept()?;
         stream.set_nodelay(true)?;
-        eprintln!("demo TCP agent accepted coordinator connection from {peer}");
+        eprintln!("PostgreSQL demo agent accepted coordinator connection from {peer}");
         let input = BufReader::new(stream.try_clone()?);
         let output = BufWriter::new(stream);
         match run_session(input, output) {
             Ok(SessionExit::EndOfStream) => {
-                eprintln!("demo TCP agent connection closed; waiting for a coordinator");
+                eprintln!("PostgreSQL demo agent connection closed; waiting for a coordinator");
             }
             Ok(SessionExit::Shutdown) => return Ok(()),
             Err(error) => {
                 eprintln!(
-                    "demo TCP agent session failed ({error}); waiting for another coordinator"
+                    "PostgreSQL demo agent session failed ({error}); waiting for another coordinator"
                 );
             }
         }
@@ -99,7 +102,7 @@ fn run_session_mode(
     mut output: impl Write,
     hang_on_schedule: bool,
 ) -> Result<SessionExit, Box<dyn Error>> {
-    let mut service: Option<QueueService> = None;
+    let mut service: Option<PostgresService> = None;
 
     for line in input.lines() {
         let line = line?;
@@ -130,13 +133,17 @@ fn run_session_mode(
                 }
 
                 let config: AdapterConfig = serde_json::from_value(supplied_config)?;
-                service = Some(QueueService::new(config)?);
+                service = if hang_on_schedule {
+                    None
+                } else {
+                    Some(PostgresService::new(config)?)
+                };
                 write_message(
                     &mut output,
                     &AdapterMessage::Ready {
                         protocol_version: PROTOCOL_VERSION,
                         identity: AdapterIdentity {
-                            name: "kneefinder-queue-demo".into(),
+                            name: "kneefinder-postgres-demo".into(),
                             version: Some(env!("CARGO_PKG_VERSION").into()),
                         },
                         capabilities: Capabilities {
@@ -147,39 +154,39 @@ fn run_session_mode(
                         },
                         operations: vec![
                             OperationDescriptor {
-                                name: "read".into(),
+                                name: "lookup".into(),
                                 description: Some(
-                                    "enqueue a read; key 0 costs 10 ms and key 1 costs 20 ms"
-                                        .into(),
+                                    "read an account balance through PostgreSQL MVCC".into(),
                                 ),
                                 kind: OperationKind::Read,
                                 enabled_by_default: true,
-                                default_weight: 9.0,
+                                default_weight: 4.0,
                                 arguments: vec![OperationArgument {
-                                    name: "key".into(),
-                                    description: Some("integer key to read".into()),
+                                    name: "account".into(),
+                                    description: Some("account id to read".into()),
                                     kind: ArgumentKind::Integer,
                                     values: Vec::new(),
                                     required: true,
-                                    default: Some(ArgumentValue::Integer(0)),
+                                    default: Some(ArgumentValue::Integer(1)),
                                 }],
                             },
                             OperationDescriptor {
-                                name: "write".into(),
+                                name: "transfer".into(),
                                 description: Some(
-                                    "enqueue a write; small costs 20 ms and large costs 40 ms"
-                                        .into(),
+                                    "update a pair of accounts in a PostgreSQL transaction".into(),
                                 ),
                                 kind: OperationKind::Write,
                                 enabled_by_default: false,
                                 default_weight: 1.0,
                                 arguments: vec![OperationArgument {
-                                    name: "value".into(),
-                                    description: Some("string value to write".into()),
+                                    name: "route".into(),
+                                    description: Some(
+                                        "account pair updated by the transaction".into(),
+                                    ),
                                     kind: ArgumentKind::Enum,
-                                    values: vec!["small".into(), "large".into()],
+                                    values: vec!["hot".into(), "cold".into()],
                                     required: true,
-                                    default: Some(ArgumentValue::String("small".into())),
+                                    default: Some(ArgumentValue::String("hot".into())),
                                 }],
                             },
                         ],
@@ -257,18 +264,24 @@ fn run_session_mode(
 }
 
 fn execute_operation(
-    service: QueueService,
+    service: PostgresService,
     phase_start_unix_ns: u64,
     actual_start_unix_ns: u64,
     operation: ScheduledOperation,
 ) -> OperationResult {
     let started = Instant::now();
-    let status = match validate_arguments(&operation)
-        .and_then(|()| service.call(&operation.operation, &operation.arguments))
-    {
-        Ok(()) => OperationStatus::Ok,
-        Err(error) => OperationStatus::Error {
-            code: Some(error.to_string()),
+    let status = match validate_arguments(&operation) {
+        Err(()) => OperationStatus::Error {
+            code: Some("invalid_arguments".into()),
+        },
+        Ok(()) => match service.call(&operation.operation, &operation.arguments) {
+            Ok(()) => OperationStatus::Ok,
+            Err(error) => {
+                eprintln!("PostgreSQL operation failed: {error}");
+                OperationStatus::Error {
+                    code: Some("postgres_error".into()),
+                }
+            }
         },
     };
 
@@ -283,77 +296,69 @@ fn execute_operation(
     }
 }
 
-fn validate_arguments(operation: &ScheduledOperation) -> Result<(), Box<dyn Error + Send + Sync>> {
+fn validate_arguments(operation: &ScheduledOperation) -> Result<(), ()> {
     match operation.operation.as_str() {
-        "read"
+        "lookup"
             if matches!(
-                operation.arguments.get("key"),
-                Some(ArgumentValue::Integer(_))
+                operation.arguments.get("account"),
+                Some(ArgumentValue::Integer(1..=4))
             ) =>
         {
             Ok(())
         }
-        "write"
+        "transfer"
             if matches!(
-                operation.arguments.get("value"),
-                Some(ArgumentValue::String(_))
+                operation.arguments.get("route"),
+                Some(ArgumentValue::String(route)) if matches!(route.as_str(), "hot" | "cold")
             ) =>
         {
             Ok(())
         }
-        "read" => Err("read requires integer argument key".into()),
-        "write" => Err("write requires string argument value".into()),
-        unknown => Err(format!("unknown operation {unknown:?}").into()),
+        _ => Err(()),
     }
 }
 
 #[derive(Clone)]
-struct QueueService {
-    requests: mpsc::SyncSender<QueuedRequest>,
-    read_service_time: Duration,
-    write_service_time: Duration,
+struct PostgresService {
+    pool: Arc<PostgresPool>,
+    lock_hold_seconds: f64,
 }
 
-struct QueuedRequest {
-    value: u8,
-    service_time: Duration,
-    response: mpsc::Sender<u8>,
+struct PostgresPool {
+    clients: Mutex<Vec<Client>>,
+    available: Condvar,
 }
 
-impl QueueService {
+impl PostgresService {
     fn new(config: AdapterConfig) -> Result<Self, Box<dyn Error>> {
-        if config.workers == 0
-            || config.read_service_ms == 0
-            || config.write_service_ms == 0
-            || config.queue_capacity == 0
-        {
-            return Err(
-                "workers, read_service_ms, write_service_ms, and queue_capacity must be nonzero"
-                    .into(),
-            );
+        if config.connections == 0 {
+            return Err("connections must be nonzero".into());
+        }
+        if config.lock_hold_ms == 0 || config.lock_hold_ms > maximum_lock_hold_ms() {
+            return Err(format!(
+                "lock_hold_ms must be between 1 and {}",
+                maximum_lock_hold_ms()
+            )
+            .into());
         }
 
-        let (requests, receiver) = mpsc::sync_channel(config.queue_capacity);
-        let receiver = Arc::new(Mutex::new(receiver));
-        for worker_id in 0..config.workers {
-            let receiver = Arc::clone(&receiver);
-            thread::Builder::new()
-                .name(format!("demo-queue-worker-{worker_id}"))
-                .spawn(move || queue_worker(receiver))?;
+        let mut clients = Vec::with_capacity(config.connections);
+        for _ in 0..config.connections {
+            clients.push(Client::connect(&config.database_url, NoTls)?);
         }
-
-        let average_read_ms = config.read_service_ms as f64 * 1.25;
-        let average_write_ms = config.write_service_ms as f64 * 1.25;
-        let mixed_service_ms = (9.0 * average_read_ms + average_write_ms) / 10.0;
+        initialize_schema(&mut clients[0])?;
         eprintln!(
-            "demo queue: {} workers; 90/10 ops and 3/1 arg variants; knee {:.0} req/s",
-            config.workers,
-            config.workers as f64 * 1_000.0 / mixed_service_ms
+            "PostgreSQL demo: {} connections; hot-row lock held {} ms; expected knee near {:.0} req/s",
+            config.connections,
+            config.lock_hold_ms,
+            theoretical_knee(config.lock_hold_ms)
         );
         Ok(Self {
-            requests,
-            read_service_time: Duration::from_millis(config.read_service_ms),
-            write_service_time: Duration::from_millis(config.write_service_ms),
+            pool: Arc::new(PostgresPool {
+                clients: Mutex::new(clients),
+                available: Condvar::new(),
+            }),
+            lock_hold_seconds: config.lock_hold_ms as f64 / 1_000.0,
         })
     }
 
@@ -362,47 +367,99 @@ impl QueueService {
         operation: &str,
         arguments: &std::collections::BTreeMap<String, ArgumentValue>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let service_time = match (operation, arguments) {
-            ("read", arguments) if arguments.get("key") == Some(&ArgumentValue::Integer(0)) => {
-                self.read_service_time
-            }
-            ("read", arguments) if arguments.get("key") == Some(&ArgumentValue::Integer(1)) => {
-                self.read_service_time * 2
-            }
-            ("write", arguments)
-                if arguments.get("value") == Some(&ArgumentValue::String("small".into())) =>
-            {
-                self.write_service_time
-            }
-            ("write", arguments)
-                if arguments.get("value") == Some(&ArgumentValue::String("large".into())) =>
-            {
-                self.write_service_time * 2
-            }
-            _ => return Err(format!("unsupported operation variant {operation:?}").into()),
-        };
-        let (response, received) = mpsc::channel();
-        self.requests.send(QueuedRequest {
-            value: 41,
-            service_time,
-            response,
-        })?;
-        if received.recv()? != 42 {
-            return Err("unexpected queue response".into());
-        }
-        Ok(())
+        self.pool
+            .with_client(|client| match (operation, arguments) {
+                ("lookup", arguments) => {
+                    let Some(ArgumentValue::Integer(account)) = arguments.get("account") else {
+                        return Err("lookup requires integer argument account".into());
+                    };
+                    client.query_one(
+                        "SELECT balance FROM kneefinder_accounts WHERE id = $1",
+                        &[account],
+                    )?;
+                    Ok(())
+                }
+                ("transfer", arguments)
+                    if arguments.get("route") == Some(&ArgumentValue::String("hot".into())) =>
+                {
+                    transfer(client, 1, 2, self.lock_hold_seconds)
+                }
+                ("transfer", arguments)
+                    if arguments.get("route") == Some(&ArgumentValue::String("cold".into())) =>
+                {
+                    transfer(client, 3, 4, self.lock_hold_seconds)
+                }
+                _ => Err(format!("unsupported operation variant {operation:?}").into()),
+            })
     }
 }
 
-fn queue_worker(receiver: Arc<Mutex<mpsc::Receiver<QueuedRequest>>>) {
-    loop {
-        let request = receiver.lock().expect("queue mutex poisoned").recv();
-        let Ok(request) = request else {
-            return;
-        };
-        thread::sleep(request.service_time);
-        let _ = request.response.send(request.value.wrapping_add(1));
+impl PostgresPool {
+    fn with_client<T>(
+        &self,
+        call: impl FnOnce(&mut Client) -> Result<T, Box<dyn Error + Send + Sync>>,
+    ) -> Result<T, Box<dyn Error + Send + Sync>> {
+        let mut clients = self
+            .clients
+            .lock()
+            .map_err(|_| "PostgreSQL pool mutex poisoned")?;
+        while clients.is_empty() {
+            clients = self
+                .available
+                .wait(clients)
+                .map_err(|_| "PostgreSQL pool mutex poisoned")?;
+        }
+        let mut client = clients.pop().expect("pool checked as non-empty");
+        drop(clients);
+
+        let result = call(&mut client);
+        let mut clients = self
+            .clients
+            .lock()
+            .map_err(|_| "PostgreSQL pool mutex poisoned")?;
+        clients.push(client);
+        self.available.notify_one();
+        result
     }
+}
+
+fn initialize_schema(client: &mut Client) -> Result<(), postgres::Error> {
+    let mut transaction = client.transaction()?;
+    transaction.query_one("SELECT pg_advisory_xact_lock(7046029254386353131)", &[])?;
+    transaction.batch_execute(
+        "CREATE TABLE IF NOT EXISTS kneefinder_accounts (
+             id BIGINT PRIMARY KEY,
+             balance BIGINT NOT NULL
+         );
+         INSERT INTO kneefinder_accounts (id, balance)
+         SELECT id, 1000000 FROM generate_series(1, 4) AS id
+         ON CONFLICT (id) DO NOTHING;",
+    )?;
+    transaction.commit()
+}
+
+fn transfer(
+    client: &mut Client,
+    from: i64,
+    to: i64,
+    lock_hold_seconds: f64,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut transaction = client.transaction()?;
+    transaction.query_one(
+        "UPDATE kneefinder_accounts SET balance = balance - 1 WHERE id = $1 RETURNING balance",
+        &[&from],
+    )?;
+    transaction.query_one("SELECT pg_sleep($1)", &[&lock_hold_seconds])?;
+    transaction.execute(
+        "UPDATE kneefinder_accounts SET balance = balance + 1 WHERE id = $1",
+        &[&to],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn theoretical_knee(lock_hold_ms: u64) -> f64 {
+    1_000.0 / lock_hold_ms as f64 / 0.16
 }
 
 fn sleep_until(deadline_unix_ns: u64) {
@@ -428,4 +485,45 @@ fn write_message(writer: &mut impl Write, message: &AdapterMessage) -> Result<()
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn operation(name: &str, argument: &str, value: ArgumentValue) -> ScheduledOperation {
+        ScheduledOperation {
+            id: kneefinder::protocol::OperationId(1),
+            operation: name.into(),
+            start_offset_ns: 0,
+            arguments: BTreeMap::from([(argument.into(), value)]),
+        }
+    }
+
+    #[test]
+    fn validates_only_advertised_postgres_variants() {
+        assert!(
+            validate_arguments(&operation("lookup", "account", ArgumentValue::Integer(1))).is_ok()
+        );
+        assert!(
+            validate_arguments(&operation(
+                "transfer",
+                "route",
+                ArgumentValue::String("hot".into())
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_arguments(&operation("lookup", "account", ArgumentValue::Integer(9))).is_err()
+        );
+        assert!(
+            validate_arguments(&operation(
+                "transfer",
+                "route",
+                ArgumentValue::String("unknown".into())
+            ))
+            .is_err()
+        );
+    }
 }

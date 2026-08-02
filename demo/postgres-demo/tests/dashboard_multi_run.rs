@@ -27,11 +27,12 @@ impl Drop for DemoProcess {
 }
 
 #[test]
+#[ignore = "requires PostgreSQL; run with KNEEFINDER_POSTGRES_URL set"]
 fn dashboard_completes_adjusts_stops_and_reruns_on_persistent_agents() {
     let port = unused_loopback_port();
     let address = format!("127.0.0.1:{port}");
     let _demo = DemoProcess(
-        Command::new(env!("CARGO_BIN_EXE_kneefinder-queue-demo"))
+        Command::new(env!("CARGO_BIN_EXE_kneefinder-postgres-demo"))
             .args(["e2e-tcp-web", &address])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -49,16 +50,16 @@ fn dashboard_completes_adjusts_stops_and_reruns_on_persistent_agents() {
     let size = catalog
         .operations
         .iter()
-        .find(|operation| operation.name == "write")
+        .find(|operation| operation.name == "transfer")
         .and_then(|operation| {
             operation
                 .arguments
                 .iter()
-                .find(|argument| argument.name == "value")
+                .find(|argument| argument.name == "route")
         })
-        .expect("queue demo should advertise its write value argument");
+        .expect("PostgreSQL demo should advertise its transfer route argument");
     assert_eq!(size.kind, ArgumentKind::Enum);
-    assert_eq!(size.values, ["small", "large"]);
+    assert_eq!(size.values, ["hot", "cold"]);
     thread::sleep(Duration::from_millis(300));
     let still_idle = snapshot(&address)
         .runs
