@@ -667,6 +667,7 @@ mod tests {
         assert!(INDEX_HTML.contains(r#"id="preset-choices""#));
         assert!(INDEX_HTML.contains(r#"id="strategy-help""#));
         assert!(INDEX_HTML.contains("Up / down"));
+        assert!(INDEX_HTML.contains("SCENARIO PROGRESS"));
         assert!(INDEX_HTML.contains(r#"id="run-progress-track""#));
         assert!(INDEX_HTML.contains(r#"id="run-progress-detail""#));
         assert!(INDEX_HTML.contains(r#"id="latency-slo""#));
@@ -693,9 +694,17 @@ mod tests {
         assert!(APP_JS.contains("maximum_unsuccessful_rate"));
         assert!(APP_JS.contains("confidence interval"));
         assert!(APP_JS.contains("renderRunProgress"));
+        assert!(APP_JS.contains(r#"progress.percent === null"#));
+        assert!(APP_JS.contains(r#"Math.max(previousPercent, progress.percent)"#));
+        assert!(APP_JS.contains(r#"fill.classList.add("no-transition")"#));
+        assert!(APP_JS.contains(r#"active.planned_phases"#));
+        assert!(!APP_JS.contains(r#"Math.max(5, measuredPercent)"#));
         assert!(APP_JS.contains(r#"event.event === "phase_progress""#));
         assert!(APP_JS.contains("awaiting results"));
         assert!(APP_JS.contains("plannedPhaseCount"));
+        assert!(APP_CSS.contains("transition: width 1s linear"));
+        assert!(APP_CSS.contains("span.no-transition"));
+        assert!(APP_CSS.contains("indeterminate-progress"));
         assert!(APP_JS.contains("drawTimeline"));
         assert!(APP_JS.contains("a.phase_id - b.phase_id"));
         assert!(APP_JS.contains("Goodput and p95 client latency by completed phase"));

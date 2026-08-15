@@ -37,8 +37,17 @@ h2 { font-size: 17px; letter-spacing: -.02em; }
 .run-progress-heading .eyebrow { margin-bottom: 3px; }
 .run-progress-heading > span { color: var(--muted); font-size: 11px; text-align: right; }
 .run-progress-track { height: 8px; overflow: hidden; border: 1px solid var(--line); border-radius: 999px; background: #090f14; }
-.run-progress-track > span { display: block; width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--blue), var(--cyan)); box-shadow: 0 0 16px rgba(85, 217, 210, .38); transition: width .25s ease; }
+.run-progress-track > span { display: block; width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--blue), var(--cyan)); box-shadow: 0 0 16px rgba(85, 217, 210, .38); transition: width 1s linear; }
+.run-progress-track > span.no-transition { transition: none; }
+.run-progress-track.indeterminate > span { width: 100%; animation: indeterminate-progress 2.4s ease-in-out infinite; }
 .run-progress-detail { min-height: 14px; margin-top: 8px; color: var(--muted); font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+@keyframes indeterminate-progress {
+  0%, 100% { opacity: .22; }
+  50% { opacity: .62; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .run-progress-track.indeterminate > span { animation: none; opacity: .42; }
+}
 .controls { padding: 18px; }
 .panel-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 17px; }
 .run-chip { border: 1px solid var(--line); border-radius: 999px; color: var(--muted); padding: 5px 9px; font-size: 11px; }

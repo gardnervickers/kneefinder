@@ -816,8 +816,11 @@ function renderRunProgress() {
     $("run-progress-title").textContent = "No run selected";
     $("run-progress-status").textContent = "Ready to configure";
     fill.style.width = "0%";
+    fill.dataset.runId = "";
+    fill.dataset.percent = "0";
     track.setAttribute("aria-valuenow", "0");
     track.setAttribute("aria-valuetext", "No run selected");
+    track.classList.remove("indeterminate");
     $("run-progress-detail").textContent = "Phase activity will appear here.";
     return;
   }
@@ -826,9 +829,30 @@ function renderRunProgress() {
   $("run-progress-title").textContent = `Run ${run.run_id}`;
   $("run-progress-status").textContent = progress.label;
   $("run-progress-detail").textContent = progress.detail || "Waiting for phase activity.";
-  fill.style.width = `${progress.percent}%`;
-  track.setAttribute("aria-valuenow", String(Math.round(progress.percent)));
-  track.setAttribute("aria-valuetext", progress.label);
+  const indeterminate = progress.percent === null;
+  const runId = String(run.run_id);
+  const sameRun = fill.dataset.runId === runId;
+  const previousPercent = Number(fill.dataset.percent);
+  const displayPercent = indeterminate
+    ? null
+    : (sameRun && Number.isFinite(previousPercent)
+      ? Math.max(previousPercent, progress.percent)
+      : progress.percent);
+  track.classList.toggle("indeterminate", indeterminate);
+  if (!sameRun) fill.classList.add("no-transition");
+  fill.style.width = indeterminate ? "" : `${displayPercent}%`;
+  if (!sameRun) {
+    void fill.offsetWidth;
+    fill.classList.remove("no-transition");
+  }
+  fill.dataset.runId = runId;
+  fill.dataset.percent = indeterminate ? "" : String(displayPercent);
+  if (indeterminate) track.removeAttribute("aria-valuenow");
+  else track.setAttribute("aria-valuenow", String(Math.round(displayPercent)));
+  track.setAttribute(
+    "aria-valuetext",
+    indeterminate ? `Overall completion cannot be estimated · ${progress.label}` : progress.label,
+  );
 }
 
 function progressForRun(run) {
@@ -838,7 +862,7 @@ function progressForRun(run) {
   const active = phaseProgress.get(run.run_id);
   const measuredPercent = planned ? Math.min(96, completed / planned * 100) : 0;
   if (state === "configured") return { percent: 0, label: "Ready to start", detail: "No workload traffic yet." };
-  if (state === "starting") return { percent: 3, label: "Starting workload agents", detail: "Preparing the execution session." };
+  if (state === "starting") return { percent: 0, label: "Starting workload agents", detail: "Preparing the execution session." };
   if (state === "completed") return { percent: 100, label: `Complete · ${completed} measurements`, detail: "Analysis and validation complete." };
   if (state === "stopped") return { percent: measuredPercent, label: `Stopped · ${completed} measurements`, detail: "Partial results were preserved." };
   if (state === "failed") return { percent: measuredPercent, label: `Failed · ${completed} measurements`, detail: run.state.message };
@@ -852,7 +876,7 @@ function progressForRun(run) {
       const phaseFraction = progressWithinPhase(run.config, active.segment, segmentFraction);
       const percent = active.planned_phases
         ? Math.min(99, ((active.phase_id - 1) + phaseFraction) / active.planned_phases * 100)
-        : segmentFraction * 100;
+        : null;
       const phaseCount = active.planned_phases ? ` of ${active.planned_phases}` : "";
       const segment = active.segment[0].toUpperCase() + active.segment.slice(1);
       const label = stopping
@@ -871,12 +895,10 @@ function progressForRun(run) {
       const label = stopping
         ? `${completed} of ${planned} measurements complete · stopping`
         : `Measurement ${activePhase} of ${planned} · ${completed} complete`;
-      return { percent: Math.max(5, measuredPercent), label, detail: "Waiting for phase activity." };
+      return { percent: measuredPercent, label, detail: "Waiting for phase activity." };
     }
-    const stage = state === "measuring" ? run.state.stage : run.state.interrupted_stage;
-    const stagePercent = { baseline: 10, discovery: 35, refinement: 65, validation: 88 }[stage] || 5;
     const label = `${completed} measurements complete · ${stopping ? "stopping" : stageName(run.state)}`;
-    return { percent: Math.max(measuredPercent, stagePercent), label, detail: "Waiting for phase activity." };
+    return { percent: null, label, detail: "Waiting for phase activity." };
   }
 
   return { percent: measuredPercent, label: stateName(run.state), detail: "Waiting for phase activity." };
