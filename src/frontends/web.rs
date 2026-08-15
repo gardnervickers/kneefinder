@@ -585,6 +585,10 @@ mod tests {
                     offered_rate: 100.0,
                     goodput_rate,
                     elapsed_ns: 1_000_000_000,
+                    offered_count: 100,
+                    started_count: 100,
+                    completed_count: 100,
+                    successful_in_window: goodput_rate as u64,
                     in_flight_high_water: 1,
                     stats: summarize_results(&[]).unwrap(),
                     quality: Default::default(),
@@ -666,6 +670,7 @@ mod tests {
         assert!(INDEX_HTML.contains(r#"id="operations-step""#));
         assert!(INDEX_HTML.contains(r#"id="preset-choices""#));
         assert!(INDEX_HTML.contains(r#"id="strategy-help""#));
+        assert!(!INDEX_HTML.contains("data-execution-mode"));
         assert!(INDEX_HTML.contains("Up / down"));
         assert!(INDEX_HTML.contains("SCENARIO PROGRESS"));
         assert!(INDEX_HTML.contains(r#"id="run-progress-track""#));
@@ -685,6 +690,7 @@ mod tests {
         assert!(APP_JS.contains(r#""Add explicitly""#));
         assert!(APP_JS.contains("strategyDescriptions"));
         assert!(APP_JS.contains("presetDefinitions"));
+        assert!(!APP_JS.contains("execution_mode"));
         assert!(APP_JS.contains("updateConfigurationFlow"));
         assert!(APP_JS.contains(r#"strategies: ["up-down"]"#));
         assert!(APP_JS.contains("button.title = preset.description"));

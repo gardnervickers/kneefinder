@@ -26,7 +26,7 @@ An operation plus its concrete arguments is one workload variant. For example,
 independent statistics.
 
 Long runs expose their current phase, warmup/measurement/recovery segment,
-elapsed time, scheduled and reported operations, and an estimated remaining
+elapsed time, offered and completed operations, and an estimated remaining
 time. Completed points stream into the charts as preliminary evidence; the knee
 remains hidden until the run finishes statistical validation.
 
@@ -203,6 +203,24 @@ cargo run -- run \
   -- ./adapter
 ```
 
+Adapters execute open-loop phases locally and return HdrHistogram V2 summaries:
+
+```console
+cargo run --release -- run \
+  --strategy sweep \
+  --levels 100000,250000,500000 \
+  --warmup 2s \
+  --measurement 10s \
+  --operation 'noop:class=a,outcome=ok@1' \
+  -- ./adapter
+```
+
+Kneefinder still selects the load, defines fixed buckets and histogram bounds,
+coordinates prepare/start and cancellation barriers, and validates every
+returned aggregate. Completed phases must account for every started call;
+cancelled multi-agent phases use one coordinator-owned cutoff so their partial
+summaries retain a common measurement window.
+
 A run may combine the colocated `-- ./adapter` mode with explicitly addressed
 remote agents:
 
@@ -269,13 +287,16 @@ Its lifecycle is:
 
 1. Receive `initialize` and reply with `ready`, including adapter identity,
    capabilities, and operation descriptors.
-2. Receive batches of scheduled operations with absolute phase time and relative
-   per-operation deadlines. Keep reading control messages while batches execute:
-   Kneefinder queues bounded lookahead, and results may complete out of phase-ID
-   order.
-3. Call the target's native client and return measured operation results.
-4. Echo the operation name and concrete arguments in every result.
-5. Return stable, low-cardinality error codes and represent timeouts explicitly.
+2. Advertise managed phases, open-loop load, and `hdr_v2_base64` support.
+3. Acknowledge `prepare_phase`, then wait for the coordinator-owned absolute
+   `start_phase` time.
+4. Generate the assigned deterministic stream, call the target's native client,
+   and measure dispatch lag and client latency.
+5. Return exact counts, stable low-cardinality errors, fixed buckets, and
+   mergeable histograms.
+
+The [synthetic adapter](examples/synthetic-adapter.rs) is used for protocol
+conformance and capacity measurements.
 
 The complete stdio Rust example is [examples/rust-adapter.rs](examples/rust-adapter.rs),
 and the PostgreSQL demo provides both stdio and TCP implementations against a
@@ -283,17 +304,14 @@ real native client.
 The only target-specific part is the function that calls the system under test:
 
 ```rust
-fn call_target(
-    operation: &str,
-    arguments: &BTreeMap<String, ArgumentValue>,
-) -> Result<(), &'static str> {
-    match operation {
-        "get" => my_client.get(integer_argument(arguments, "key")?)
+fn call_target(operation: &ManagedOperation) -> Result<(), &'static str> {
+    match operation.operation.as_str() {
+        "get" => my_client.get(integer_argument(&operation.arguments, "key")?)
             .map(|_| ())
             .map_err(|_| "get_failed"),
         "put" => my_client.put(
-            integer_argument(arguments, "key")?,
-            string_argument(arguments, "value")?,
+            integer_argument(&operation.arguments, "key")?,
+            string_argument(&operation.arguments, "value")?,
         ).map_err(|_| "put_failed"),
         _ => Err("unknown_operation"),
     }
@@ -307,8 +325,9 @@ cargo build --no-default-features --example rust-adapter
 ```
 
 The production direction is to provide reusable language runtimes that own the
-protocol, deadline dispatch, batching, and measurement, leaving adapter authors
-with only an async callback like `call_target`.
+protocol, deterministic stream generation, local deadline dispatch, and
+measurement, leaving adapter authors with only an async callback like
+`call_target`.
 
 ## Error reporting
 
@@ -337,11 +356,13 @@ workload editor. The PostgreSQL demo exercises both the colocated path and a
 two-agent TCP cohort, including a Docker/Podman Compose deployment with the web
 coordinator and one shared PostgreSQL instance. Its real MVCC lookup and hot-row
 transaction workload can execute repeated browser-configured runs and
-gracefully stop an active run while retaining its agents. The production engine now turns
-prepared cohorts and `RunConfig` values into bounded, deterministic scheduled
-operation batches with two-batch lookahead for CLI and browser runs, including
-warmup, measurement, recovery, repetitions, sweep/up-down traversal, per-phase
-statistics, and bounded interruptible stop. Adaptive runs now establish a stable baseline,
+gracefully stop an active run while retaining its agents. The production engine
+now turns prepared cohorts and `RunConfig` values into deterministic managed
+open-loop phases for CLI and browser runs, including warmup, measurement,
+recovery, repetitions, sweep/up-down traversal, per-phase statistics, and
+bounded interruptible stop. Agents return strictly validated, mergeable
+HdrHistogram V2 summaries behind prepare/start and cancellation barriers.
+Adaptive runs now establish a stable baseline,
 discover a healthy/saturated bracket geometrically, and refine it with
 geometric midpoints. Fixed time buckets can reject non-stationary phases;
 adaptive runs repeat them within the configured repetition budget. Every load

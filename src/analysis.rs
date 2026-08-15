@@ -16,7 +16,7 @@ const LATENCY_VALIDATION_MULTIPLIER: f64 = 1.50;
 const IN_FLIGHT_VALIDATION_MULTIPLIER: f64 = 2.0;
 const RELIABILITY_VALIDATION_INCREASE: f64 = 0.005;
 const MINIMUM_DISPATCH_LAG_NS: u64 = 10_000_000;
-const DISPATCH_LAG_FRACTION: f64 = 0.10;
+const DISPATCH_LAG_FRACTION: f64 = 0.01;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisTermination {
@@ -114,7 +114,10 @@ pub fn analyze(
             None,
             slo_maximum(reports, config),
             None,
-            vec!["dispatch lag invalidated target-knee analysis; the generator saturated".into()],
+            vec![
+                "incomplete starts or dispatch lag invalidated target-knee analysis; the generator saturated"
+                    .into(),
+            ],
         );
     }
 
@@ -525,6 +528,18 @@ fn validate_candidate(reports: &[PhaseReport], breakpoint: f64) -> CandidateVali
 }
 
 fn dispatch_lag_invalid(report: &PhaseReport) -> bool {
+    let exact_counts_available = report.offered_count > 0
+        || report.started_count > 0
+        || report.completed_count > 0
+        || report.successful_in_window > 0;
+    let expected_offers = (report.offered_rate * report.elapsed_ns as f64 / 1_000_000_000.0)
+        .ceil()
+        .clamp(0.0, u64::MAX as f64) as u64;
+    if report.started_count < report.offered_count
+        || (exact_counts_available && report.offered_count.saturating_add(1) < expected_offers)
+    {
+        return true;
+    }
     let threshold = MINIMUM_DISPATCH_LAG_NS.max(
         (report.elapsed_ns as f64 * DISPATCH_LAG_FRACTION)
             .round()
@@ -670,6 +685,10 @@ mod tests {
             offered_rate: rate,
             goodput_rate: goodput,
             elapsed_ns: 1_000_000_000,
+            offered_count: attempts,
+            started_count: attempts,
+            completed_count: attempts,
+            successful_in_window: attempts.saturating_sub(unsuccessful),
             in_flight_high_water: in_flight,
             stats: StatsReport {
                 overall: SampleStats {
@@ -846,7 +865,7 @@ mod tests {
     #[test]
     fn false_target_knee_from_generator_lag_is_invalidated() {
         let mut reports = clear_knee();
-        reports[5].stats.overall.dispatch_lag_ns.p99 = Some(200_000_000);
+        reports[5].stats.overall.dispatch_lag_ns.p99 = Some(20_000_000);
         let outcome = analyze(
             &reports,
             &AnalysisConfig::default(),
@@ -858,6 +877,42 @@ mod tests {
             RunClassification::GeneratorSaturated
         );
         assert!(outcome.knee.is_none());
+    }
+
+    #[test]
+    fn missed_offers_invalidate_target_knee_even_with_low_dispatch_lag() {
+        let mut reports = clear_knee();
+        reports[5].offered_count = 1_000;
+        reports[5].started_count = 999;
+        let outcome = analyze(
+            &reports,
+            &AnalysisConfig::default(),
+            AnalysisTermination::CompletedPlan,
+        );
+
+        assert_eq!(
+            outcome.classification,
+            RunClassification::GeneratorSaturated
+        );
+        assert!(outcome.knee.is_none());
+    }
+
+    #[test]
+    fn underreported_offer_stream_invalidates_target_knee() {
+        let mut reports = clear_knee();
+        reports[5].offered_count = 100;
+        reports[5].started_count = 100;
+        reports[5].completed_count = 100;
+        let outcome = analyze(
+            &reports,
+            &AnalysisConfig::default(),
+            AnalysisTermination::CompletedPlan,
+        );
+
+        assert_eq!(
+            outcome.classification,
+            RunClassification::GeneratorSaturated
+        );
     }
 
     #[test]

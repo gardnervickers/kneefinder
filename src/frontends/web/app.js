@@ -560,7 +560,6 @@ function updateConfigurationFlow() {
     button.classList.toggle("selected", selected);
     button.setAttribute("aria-pressed", String(selected));
   }
-
   const description = strategyDescriptions[selectedStrategy] || "";
   $("strategy-help").textContent = description;
   $("strategy-help").hidden = !description;

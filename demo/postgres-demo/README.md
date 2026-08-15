@@ -29,7 +29,7 @@ timeline and capacity charts; the knee appears only after terminal validation.
 ![Live three-cycle hysteresis progress](../../docs/images/dashboard-progress.png)
 
 The agents only listen on the private Compose network. Both connect to the same
-PostgreSQL instance, while every protocol session and operation batch still
+PostgreSQL instance, while every protocol session and managed phase still
 originates from the coordinator. The agents remain available after a run, so
 the browser can change the strategy, levels, timings, and workload before
 starting another run.
@@ -61,7 +61,7 @@ The first `UPDATE` takes PostgreSQL's row lock; the transaction deliberately
 holds it for 10 ms before updating the destination and committing. That makes
 the hot row's serialization ceiling easy to see in a short demo. It is real
 database contention: requests execute real SQL through the native client, and
-the latency includes pool wait, PostgreSQL execution, lock wait, and commit.
+client latency includes PostgreSQL execution, lock wait, and commit.
 
 The controlled component predicts a knee near
 `1000 ms / 10 ms / 0.16 = 625` offered operations per second. PostgreSQL and
@@ -69,6 +69,14 @@ host overhead move the fitted value somewhat; the E2E accepts a 450–850 ops/s
 range rather than asserting an exact wall-clock result. After saturation,
 goodput flattens while latency rises as work waits for a client connection and
 the hot row lock.
+
+The adapter implements the managed open-loop protocol directly. Each agent
+owns a fixed shard of the global deadline sequence and feeds a bounded queue
+serviced by its PostgreSQL connections. Queue delay is reported as dispatch
+lag; client latency starts when a worker invokes the native PostgreSQL client.
+Agents return mergeable HdrHistogram payloads plus overall, per-variant, and
+fixed-time-bucket counts. If the queue cannot accept an offer, that deadline is
+retained as offered but unstarted so generator saturation remains visible.
 
 ## Local modes
 
@@ -143,7 +151,7 @@ Database credentials stay in `KNEEFINDER_POSTGRES_URL`, not in persisted run
 configuration. An `initialize` message can tune only non-secret demo controls:
 
 ```json
-{"type":"initialize","protocol_version":3,"run_id":1,"config":{"connections":4,"lock_hold_ms":10}}
+{"type":"initialize","protocol_version":4,"run_id":1,"config":{"connections":4,"lock_hold_ms":10}}
 ```
 
 The `e2e` commands are black-box fixtures around the production `RunExecutor`,

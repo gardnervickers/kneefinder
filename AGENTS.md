@@ -27,13 +27,11 @@ The product must work headlessly as well as interactively:
 ### Kneefinder owns scheduling
 
 Do not push rate selection, ramp traversal, or knee-finding into every adapter
-language. Kneefinder selects offered load and schedules operations. Adapters
-should remain thin; reusable language runtimes should eventually reduce the
-user-facing implementation to operation discovery plus an async callback.
-
-The default execution mode sends scheduled operations ahead in batches. An
-adapter-managed whole-phase mode is only a high-throughput escape hatch and
-must preserve equivalent measurement semantics and pass conformance tests.
+language. Kneefinder selects offered load and defines the deterministic stream,
+timing, sharding, buckets, histogram bounds, and cancellation cutoff. Adapter
+runtimes execute that contract locally and return bounded aggregate summaries.
+Reusable language runtimes should reduce the user-facing implementation to
+operation discovery plus an async callback.
 
 ### The adapter protocol is cross-language and transport-independent
 
@@ -61,8 +59,9 @@ leaves a remote agent listening for another session. Sending the protocol
 `Shutdown` command is an explicit agent-process termination action, not normal
 run cleanup. Do not add a one-shot TCP agent mode.
 
-Do not include adapter IPC time in native client latency. Batching and dispatch
-lag exist so the load generator cannot silently become the bottleneck.
+Do not include adapter IPC time in native client latency. Local dispatch lag
+and exact offered/started counts exist so the adapter-side generator cannot
+silently become the bottleneck.
 
 ### A bound operation variant is the atomic workload unit
 
@@ -216,17 +215,16 @@ At the time this handoff was written, these pieces exist:
 - schema-versioned incremental artifacts, redacted configuration, recovery,
   inspect/render commands, and stable batch exit statuses
 
-The generic executor now turns a prepared cohort and `RunConfig` into a bounded,
-two-batch lookahead pipeline of deterministic scheduled operations for CLI and
-browser runs. It supports warmup, measured intervals, recovery, repetitions,
-fixed sweep/up-down plans,
+The generic executor now turns a prepared cohort and `RunConfig` into
+deterministic managed open-loop phases for CLI and browser runs. It supports
+warmup, measured intervals, recovery, repetitions, fixed sweep/up-down plans,
 adaptive baseline/discovery/geometric refinement, fixed-bucket stationarity
 checks with bounded repeats, strategy-decision provenance, per-phase statistics,
 generator-saturation invalidation, statistical knee fitting, deterministic
 confidence bounds, SLO capacity, conservative recommendations, and cooperative
-stop.
+stop through a coordinator-owned cohort cutoff.
 The PostgreSQL demo exercises this production path for both colocated and
-multi-client web runs. In-flight schedules are interruptible: Stop preserves
+multi-client web runs. In-flight phases are interruptible: Stop preserves
 partial results, sends `CancelPhase`, and force-closes the session after a
 deadline, killing only a colocated subprocess while leaving a remote agent
 process available. Started runs persist partial and terminal evidence in unique

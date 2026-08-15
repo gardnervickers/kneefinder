@@ -312,6 +312,10 @@ mod tests {
             offered_rate: rate,
             goodput_rate: goodput,
             elapsed_ns: 1_000_000_000,
+            offered_count: rate as u64,
+            started_count: rate as u64,
+            completed_count: rate as u64,
+            successful_in_window: goodput as u64,
             in_flight_high_water: 1,
             stats: StatsReport {
                 overall: SampleStats {

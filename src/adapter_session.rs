@@ -1,18 +1,18 @@
 //! Transport-independent adapter sessions and the default NDJSON subprocess transport.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     fmt,
     io::{self, BufRead, BufReader, BufWriter, Write},
     net::{Shutdown, TcpStream, ToSocketAddrs},
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::Value;
@@ -20,8 +20,9 @@ use serde_json::Value;
 use crate::{
     config::AdapterCommand,
     protocol::{
-        AdapterIdentity, AdapterMessage, Capabilities, ControllerMessage, OperationDescriptor,
-        OperationId, OperationResult, PROTOCOL_VERSION, PhaseId, RunId, ScheduledOperation,
+        AdapterIdentity, AdapterMessage, Capabilities, ControllerMessage, HistogramEncoding, Load,
+        LoadModel, ManagedPhaseRequest, OperationDescriptor, PROTOCOL_VERSION, PhaseCompletion,
+        PhaseId, PhaseResult, RunId,
     },
 };
 
@@ -30,7 +31,7 @@ const DEFAULT_MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_DIAGNOSTIC_LINES: usize = 1_024;
 const BUFFERED_ADAPTER_MESSAGES: usize = 8;
 const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
-pub(crate) const SCHEDULE_PIPELINE_DEPTH: usize = 2;
+const MANAGED_CANCELLATION_LEAD_NS: u64 = 50_000_000;
 
 #[derive(Debug, Clone)]
 pub struct SessionOptions {
@@ -58,7 +59,7 @@ impl Default for SessionOptions {
 }
 
 /// Message transport used by [`AdapterSession`]. Stdio and TCP use the same
-/// handshake, scheduling, cancellation, and validation logic.
+/// handshake, phase execution, cancellation, and validation logic.
 pub trait AdapterTransport: Send {
     fn send(&mut self, message: &ControllerMessage) -> Result<(), TransportError>;
     fn receive(&mut self, timeout: Duration) -> Result<AdapterMessage, TransportError>;
@@ -466,15 +467,11 @@ pub struct AdapterReady {
 pub enum SessionState {
     New,
     Ready,
+    PhasePreparing(PhaseId),
+    PhasePrepared(PhaseId),
     PhaseActive(PhaseId),
     Failed,
     Closed,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ScheduleOutcome {
-    pub operations: Vec<OperationResult>,
-    pub completion: ScheduleCompletion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,19 +480,18 @@ pub enum ScheduleCompletion {
     Cancelled { forced: bool },
 }
 
-struct PendingSchedule {
-    phase_id: PhaseId,
-    operations: Vec<ScheduledOperation>,
-    expected: HashMap<OperationId, ScheduledOperation>,
-    received: HashMap<OperationId, OperationResult>,
-    response_deadline: Instant,
-    terminal: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedPhaseOutcome {
+    /// The adapter's aggregate. A forced cancellation has no aggregate because
+    /// the coordinator never received a terminal phase message.
+    pub result: Option<PhaseResult>,
+    pub completion: ScheduleCompletion,
 }
 
-impl PendingSchedule {
-    fn complete(&self) -> bool {
-        self.terminal || self.received.len() == self.expected.len()
-    }
+#[derive(Debug, Clone, Copy)]
+struct PreparedManagedPhase {
+    phase_id: PhaseId,
+    response_wait: Duration,
 }
 
 /// Owns adapter protocol state and validation independently of how frames are
@@ -505,7 +501,7 @@ pub struct AdapterSession<T> {
     options: SessionOptions,
     state: SessionState,
     capabilities: Option<Capabilities>,
-    pending_schedules: VecDeque<PendingSchedule>,
+    prepared_managed_phase: Option<PreparedManagedPhase>,
 }
 
 impl<T: AdapterTransport> AdapterSession<T> {
@@ -515,7 +511,7 @@ impl<T: AdapterTransport> AdapterSession<T> {
             options,
             state: SessionState::New,
             capabilities: None,
-            pending_schedules: VecDeque::new(),
+            prepared_managed_phase: None,
         }
     }
 
@@ -581,179 +577,179 @@ impl<T: AdapterTransport> AdapterSession<T> {
         }
     }
 
-    pub fn schedule(
+    pub fn prepare_managed_phase(
         &mut self,
         phase_id: PhaseId,
-        phase_start_unix_ns: u64,
-        operations: Vec<ScheduledOperation>,
-    ) -> Result<Vec<OperationResult>, SessionError> {
-        let stop = AtomicBool::new(false);
-        self.schedule_interruptible(phase_id, phase_start_unix_ns, operations, &stop)
-            .map(|outcome| outcome.operations)
-    }
-
-    pub fn schedule_interruptible(
-        &mut self,
-        phase_id: PhaseId,
-        phase_start_unix_ns: u64,
-        operations: Vec<ScheduledOperation>,
-        stop: &AtomicBool,
-    ) -> Result<ScheduleOutcome, SessionError> {
-        if operations.is_empty() {
-            return Ok(ScheduleOutcome {
-                operations: Vec::new(),
-                completion: ScheduleCompletion::Completed,
-            });
-        }
-        if stop.load(Ordering::Acquire) {
-            return Ok(ScheduleOutcome {
-                operations: Vec::new(),
-                completion: ScheduleCompletion::Cancelled { forced: false },
-            });
-        }
-        self.submit_schedule(phase_id, phase_start_unix_ns, operations)?;
-        self.receive_schedule(phase_id, stop)
-    }
-
-    /// Submits one schedule without waiting for its results. Several schedules
-    /// may be active so the coordinator can keep bounded work queued ahead of
-    /// the open-loop deadline stream.
-    pub fn submit_schedule(
-        &mut self,
-        phase_id: PhaseId,
-        phase_start_unix_ns: u64,
-        operations: Vec<ScheduledOperation>,
+        request: ManagedPhaseRequest,
     ) -> Result<(), SessionError> {
-        match self.state {
-            SessionState::Ready | SessionState::PhaseActive(_) => {}
-            state => {
-                return Err(SessionError::InvalidState {
-                    expected: SessionState::Ready,
-                    actual: state,
-                });
-            }
-        }
-        if let Some(maximum) = self
+        self.require_state(SessionState::Ready)?;
+        let capabilities = self
             .capabilities
             .as_ref()
-            .and_then(|capabilities| capabilities.max_batch_size)
-            && operations.len() > maximum as usize
+            .expect("a ready session retained its negotiated capabilities");
+        if !capabilities.adapter_managed_phases {
+            return Err(SessionError::UnsupportedCapability(
+                "adapter-managed phases",
+            ));
+        }
+        let load_model = match &request.load {
+            Load::OpenLoop { .. } => LoadModel::OpenLoop,
+            Load::ClosedLoop { .. } => LoadModel::ClosedLoop,
+        };
+        if load_model != LoadModel::OpenLoop || !capabilities.load_models.contains(&load_model) {
+            return Err(SessionError::UnsupportedLoadModel(load_model));
+        }
+        if !capabilities
+            .histogram_encodings
+            .contains(&HistogramEncoding::HdrV2Base64)
         {
-            return Err(SessionError::BatchTooLarge {
-                actual: operations.len(),
-                maximum,
-            });
+            return Err(SessionError::UnsupportedHistogramEncoding(
+                HistogramEncoding::HdrV2Base64,
+            ));
         }
-        if self
-            .pending_schedules
-            .iter()
-            .any(|pending| pending.phase_id == phase_id)
-        {
-            return Err(SessionError::DuplicatePhase(phase_id));
-        }
-        if self.pending_schedules.len() >= SCHEDULE_PIPELINE_DEPTH {
-            return Err(SessionError::SchedulePipelineFull {
-                maximum: SCHEDULE_PIPELINE_DEPTH,
-            });
-        }
+        let phase_ns = request
+            .warmup_ns
+            .checked_add(request.measurement_ns)
+            .and_then(|duration| duration.checked_add(request.operation_timeout_ns))
+            .ok_or(SessionError::ManagedPhaseDurationOverflow)?;
+        let response_wait = Duration::from_nanos(phase_ns)
+            .checked_add(self.options.response_timeout)
+            .ok_or(SessionError::ManagedPhaseDurationOverflow)?;
 
-        let mut expected = HashMap::with_capacity(operations.len());
-        for operation in &operations {
-            if expected.insert(operation.id, operation.clone()).is_some() {
-                return Err(SessionError::DuplicateScheduledOperation(operation.id));
+        self.send(&ControllerMessage::PreparePhase { phase_id, request })?;
+        self.state = SessionState::PhasePreparing(phase_id);
+        let message = self.receive(self.options.response_timeout)?;
+        match message {
+            AdapterMessage::PhaseReady {
+                phase_id: actual_phase,
+            } if actual_phase == phase_id => {
+                self.state = SessionState::PhasePrepared(phase_id);
+                self.prepared_managed_phase = Some(PreparedManagedPhase {
+                    phase_id,
+                    response_wait,
+                });
+                Ok(())
             }
-        }
-        if !operations.is_empty() {
-            self.send(&ControllerMessage::Schedule {
+            AdapterMessage::PhaseReady {
+                phase_id: actual, ..
+            } => self.fail(SessionError::UnexpectedPhase {
+                expected: phase_id,
+                actual,
+            }),
+            AdapterMessage::Error {
+                phase_id: Some(actual),
+                ..
+            } if actual != phase_id => self.fail(SessionError::UnexpectedPhase {
+                expected: phase_id,
+                actual,
+            }),
+            AdapterMessage::Error {
                 phase_id,
-                phase_start_unix_ns,
-                operations: operations.clone(),
-            })?;
+                code,
+                message,
+                retryable,
+            } => self.fail(SessionError::Adapter {
+                phase_id,
+                code,
+                message,
+                retryable,
+            }),
+            message => self.fail(SessionError::UnexpectedMessage {
+                state: self.state,
+                message: message_kind(&message),
+            }),
         }
-        self.pending_schedules.push_back(PendingSchedule {
-            phase_id,
-            operations,
-            expected,
-            received: HashMap::new(),
-            response_deadline: Instant::now() + self.options.response_timeout,
-            terminal: false,
-        });
-        self.refresh_active_state();
-        Ok(())
     }
 
-    /// Waits for one submitted schedule. Results for other active schedules
-    /// are validated and buffered. Cancellation covers every active schedule
-    /// and returns all partial results retained by the pipeline.
-    pub fn receive_schedule(
+    pub fn start_managed_phase_interruptible(
         &mut self,
         phase_id: PhaseId,
+        phase_start_unix_ns: u64,
         stop: &AtomicBool,
-    ) -> Result<ScheduleOutcome, SessionError> {
-        if !self
-            .pending_schedules
-            .iter()
-            .any(|pending| pending.phase_id == phase_id)
-        {
-            return Err(SessionError::UnknownPhase(phase_id));
-        }
+    ) -> Result<ManagedPhaseOutcome, SessionError> {
+        let cancel_at_unix_ns = AtomicU64::new(0);
+        self.start_managed_phase_interruptible_with_cutoff(
+            phase_id,
+            phase_start_unix_ns,
+            stop,
+            &cancel_at_unix_ns,
+        )
+    }
+
+    pub fn start_managed_phase_interruptible_with_cutoff(
+        &mut self,
+        phase_id: PhaseId,
+        phase_start_unix_ns: u64,
+        stop: &AtomicBool,
+        cancel_at_unix_ns: &AtomicU64,
+    ) -> Result<ManagedPhaseOutcome, SessionError> {
+        self.require_state(SessionState::PhasePrepared(phase_id))?;
+        let prepared = self
+            .prepared_managed_phase
+            .expect("a prepared session retained its managed phase deadline");
+        debug_assert_eq!(prepared.phase_id, phase_id);
+
+        let start_delay = Duration::from_nanos(phase_start_unix_ns.saturating_sub(unix_now_ns()));
+        let response_wait = prepared
+            .response_wait
+            .checked_add(start_delay)
+            .ok_or(SessionError::ManagedPhaseDurationOverflow)?;
+        let response_deadline = Instant::now()
+            .checked_add(response_wait)
+            .ok_or(SessionError::ManagedPhaseDurationOverflow)?;
         let mut cancellation_deadline = None;
+        let mut started = false;
+        let start_requested = !stop.load(Ordering::Acquire);
+        if !start_requested {
+            let cutoff = managed_cancellation_cutoff(cancel_at_unix_ns);
+            if self
+                .transport
+                .send(&ControllerMessage::CancelPhase {
+                    phase_id,
+                    cancel_at_unix_ns: Some(cutoff),
+                })
+                .is_err()
+            {
+                return Ok(self.force_managed_cancellation());
+            }
+            cancellation_deadline = Some(managed_cancellation_deadline(
+                cutoff,
+                self.options.cancellation_timeout,
+            ));
+        } else {
+            self.send(&ControllerMessage::StartPhase {
+                phase_id,
+                phase_start_unix_ns,
+            })?;
+        }
+        self.state = SessionState::PhaseActive(phase_id);
+
         loop {
             if stop.load(Ordering::Acquire) && cancellation_deadline.is_none() {
-                let active = self
-                    .pending_schedules
-                    .iter()
-                    .filter(|pending| !pending.complete() && !pending.operations.is_empty())
-                    .map(|pending| pending.phase_id)
-                    .collect::<Vec<_>>();
-                for active_phase in active {
-                    if self
-                        .transport
-                        .send(&ControllerMessage::CancelPhase {
-                            phase_id: active_phase,
-                        })
-                        .is_err()
-                    {
-                        let _ = self.transport.abort();
-                        self.state = SessionState::Closed;
-                        return Ok(
-                            self.drain_pending(ScheduleCompletion::Cancelled { forced: true })
-                        );
-                    }
+                let cutoff = managed_cancellation_cutoff(cancel_at_unix_ns);
+                if self
+                    .transport
+                    .send(&ControllerMessage::CancelPhase {
+                        phase_id,
+                        cancel_at_unix_ns: Some(cutoff),
+                    })
+                    .is_err()
+                {
+                    return Ok(self.force_managed_cancellation());
                 }
-                cancellation_deadline = Some(Instant::now() + self.options.cancellation_timeout);
-            }
-
-            if cancellation_deadline.is_none()
-                && self
-                    .pending_schedules
-                    .iter()
-                    .find(|pending| pending.phase_id == phase_id)
-                    .is_some_and(PendingSchedule::complete)
-            {
-                return Ok(self.take_pending(phase_id, ScheduleCompletion::Completed));
-            }
-            if cancellation_deadline.is_some()
-                && self.pending_schedules.iter().all(PendingSchedule::complete)
-            {
-                return Ok(self.drain_pending(ScheduleCompletion::Cancelled { forced: false }));
+                cancellation_deadline = Some(managed_cancellation_deadline(
+                    cutoff,
+                    self.options.cancellation_timeout,
+                ));
             }
 
             let now = Instant::now();
             if cancellation_deadline.is_some_and(|deadline| now >= deadline) {
-                let _ = self.transport.abort();
-                self.state = SessionState::Closed;
-                return Ok(self.drain_pending(ScheduleCompletion::Cancelled { forced: true }));
+                return Ok(self.force_managed_cancellation());
             }
-            let response_deadline = self
-                .pending_schedules
-                .iter()
-                .map(|pending| pending.response_deadline)
-                .min()
-                .expect("a requested schedule remains pending");
             if cancellation_deadline.is_none() && now >= response_deadline {
                 return self.fail(SessionError::Transport(TransportError::ReceiveTimeout(
-                    self.options.response_timeout,
+                    response_wait,
                 )));
             }
 
@@ -764,87 +760,76 @@ impl<T: AdapterTransport> AdapterSession<T> {
             let message = match self.transport.receive(wait) {
                 Ok(message) => message,
                 Err(TransportError::ReceiveTimeout(_)) => continue,
+                Err(_) if cancellation_deadline.is_some() => {
+                    let _ = self.transport.abort();
+                    self.state = SessionState::Closed;
+                    self.prepared_managed_phase = None;
+                    return Ok(ManagedPhaseOutcome {
+                        result: None,
+                        completion: ScheduleCompletion::Cancelled { forced: true },
+                    });
+                }
                 Err(error) => {
                     self.state = SessionState::Failed;
                     return Err(SessionError::Transport(error));
                 }
             };
             match message {
-                AdapterMessage::Results {
+                AdapterMessage::PhaseStarted {
                     phase_id: actual_phase,
-                    operations: results,
-                } => {
-                    if results.is_empty() {
-                        return self.fail(SessionError::EmptyResults {
-                            phase_id: actual_phase,
-                        });
-                    }
-                    let Some(pending_index) = self
-                        .pending_schedules
-                        .iter()
-                        .position(|pending| pending.phase_id == actual_phase)
-                    else {
-                        return self.fail(SessionError::UnexpectedPhase {
-                            expected: phase_id,
-                            actual: actual_phase,
-                        });
-                    };
-                    for result in results {
-                        let pending = &mut self.pending_schedules[pending_index];
-                        let Some(scheduled) = pending.expected.get(&result.id) else {
-                            return self.fail(SessionError::UnexpectedOperationResult(result.id));
-                        };
-                        if pending.received.contains_key(&result.id) {
-                            return self.fail(SessionError::DuplicateOperationResult(result.id));
-                        }
-                        if result.operation != scheduled.operation
-                            || result.arguments != scheduled.arguments
-                            || result.intended_start_offset_ns != scheduled.start_offset_ns
-                        {
-                            return self.fail(SessionError::OperationResultMismatch(result.id));
-                        }
-                        pending.received.insert(result.id, result);
-                    }
+                } if actual_phase == phase_id && start_requested && !started => {
+                    started = true;
+                }
+                AdapterMessage::PhaseStarted {
+                    phase_id: actual, ..
+                }
+                | AdapterMessage::PhaseReady {
+                    phase_id: actual, ..
+                }
+                | AdapterMessage::PhaseComplete {
+                    phase_id: actual, ..
+                } if actual != phase_id => {
+                    return self.fail(SessionError::UnexpectedPhase {
+                        expected: phase_id,
+                        actual,
+                    });
                 }
                 AdapterMessage::PhaseComplete {
-                    phase_id: actual_phase,
-                    ..
-                } if cancellation_deadline.is_some() => {
-                    let Some(pending) = self
-                        .pending_schedules
-                        .iter_mut()
-                        .find(|pending| pending.phase_id == actual_phase)
-                    else {
-                        return self.fail(SessionError::UnexpectedPhase {
-                            expected: phase_id,
-                            actual: actual_phase,
+                    phase_id: actual,
+                    completion,
+                    result,
+                } => {
+                    debug_assert_eq!(actual, phase_id);
+                    if completion == PhaseCompletion::Cancelled && cancellation_deadline.is_none() {
+                        return self.fail(SessionError::UnsolicitedPhaseCancellation(phase_id));
+                    }
+                    if completion == PhaseCompletion::Completed && !started {
+                        return self.fail(SessionError::UnexpectedMessage {
+                            state: self.state,
+                            message: "phase_complete",
                         });
-                    };
-                    pending.terminal = true;
+                    }
+                    self.state = SessionState::Ready;
+                    self.prepared_managed_phase = None;
+                    return Ok(ManagedPhaseOutcome {
+                        result: Some(result),
+                        completion: match completion {
+                            PhaseCompletion::Completed => ScheduleCompletion::Completed,
+                            PhaseCompletion::Cancelled => {
+                                ScheduleCompletion::Cancelled { forced: false }
+                            }
+                        },
+                    });
                 }
                 AdapterMessage::Error {
-                    phase_id: error_phase,
+                    phase_id: Some(actual),
                     ..
-                } if cancellation_deadline.is_some() => match error_phase {
-                    Some(actual_phase) => {
-                        let Some(pending) = self
-                            .pending_schedules
-                            .iter_mut()
-                            .find(|pending| pending.phase_id == actual_phase)
-                        else {
-                            return self.fail(SessionError::UnexpectedPhase {
-                                expected: phase_id,
-                                actual: actual_phase,
-                            });
-                        };
-                        pending.terminal = true;
-                    }
-                    None => {
-                        for pending in &mut self.pending_schedules {
-                            pending.terminal = true;
-                        }
-                    }
-                },
+                } if actual != phase_id => {
+                    return self.fail(SessionError::UnexpectedPhase {
+                        expected: phase_id,
+                        actual,
+                    });
+                }
                 AdapterMessage::Error {
                     phase_id,
                     code,
@@ -870,8 +855,20 @@ impl<T: AdapterTransport> AdapterSession<T> {
 
     pub fn cancel(&mut self, phase_id: PhaseId) -> Result<(), SessionError> {
         match self.state {
-            SessionState::Ready | SessionState::PhaseActive(_) => {
-                self.send(&ControllerMessage::CancelPhase { phase_id })?;
+            SessionState::Ready => {
+                self.send(&ControllerMessage::CancelPhase {
+                    phase_id,
+                    cancel_at_unix_ns: None,
+                })?;
+                Ok(())
+            }
+            SessionState::PhasePrepared(active) | SessionState::PhaseActive(active)
+                if active == phase_id =>
+            {
+                self.send(&ControllerMessage::CancelPhase {
+                    phase_id,
+                    cancel_at_unix_ns: None,
+                })?;
                 Ok(())
             }
             state => Err(SessionError::InvalidState {
@@ -888,6 +885,7 @@ impl<T: AdapterTransport> AdapterSession<T> {
         let send = self.transport.send(&ControllerMessage::Shutdown);
         let close = self.transport.close(self.options.shutdown_timeout);
         self.state = SessionState::Closed;
+        self.prepared_managed_phase = None;
         send.and(close).map_err(SessionError::Transport)
     }
 
@@ -900,6 +898,7 @@ impl<T: AdapterTransport> AdapterSession<T> {
         }
         let close = self.transport.close(self.options.shutdown_timeout);
         self.state = SessionState::Closed;
+        self.prepared_managed_phase = None;
         close.map_err(SessionError::Transport)
     }
 
@@ -930,73 +929,50 @@ impl<T: AdapterTransport> AdapterSession<T> {
 
     fn fail<R>(&mut self, error: SessionError) -> Result<R, SessionError> {
         self.state = SessionState::Failed;
+        self.prepared_managed_phase = None;
         Err(error)
     }
 
-    fn take_pending(
-        &mut self,
-        phase_id: PhaseId,
-        completion: ScheduleCompletion,
-    ) -> ScheduleOutcome {
-        let index = self
-            .pending_schedules
-            .iter()
-            .position(|pending| pending.phase_id == phase_id)
-            .expect("the requested schedule was checked before it was taken");
-        let pending = self
-            .pending_schedules
-            .remove(index)
-            .expect("the pending schedule index remains valid");
-        self.refresh_active_state();
-        schedule_outcome(&pending.operations, pending.received, completion)
-    }
-
-    fn drain_pending(&mut self, completion: ScheduleCompletion) -> ScheduleOutcome {
-        let operations = self
-            .pending_schedules
-            .drain(..)
-            .flat_map(|pending| {
-                schedule_outcome(&pending.operations, pending.received, completion).operations
-            })
-            .collect();
-        self.refresh_active_state();
-        ScheduleOutcome {
-            operations,
-            completion,
+    fn force_managed_cancellation(&mut self) -> ManagedPhaseOutcome {
+        let _ = self.transport.abort();
+        self.state = SessionState::Closed;
+        self.prepared_managed_phase = None;
+        ManagedPhaseOutcome {
+            result: None,
+            completion: ScheduleCompletion::Cancelled { forced: true },
         }
-    }
-
-    fn refresh_active_state(&mut self) {
-        if matches!(self.state, SessionState::Failed | SessionState::Closed) {
-            return;
-        }
-        self.state = self
-            .pending_schedules
-            .front()
-            .map_or(SessionState::Ready, |pending| {
-                SessionState::PhaseActive(pending.phase_id)
-            });
     }
 }
 
-fn schedule_outcome(
-    scheduled: &[ScheduledOperation],
-    mut received: HashMap<OperationId, OperationResult>,
-    completion: ScheduleCompletion,
-) -> ScheduleOutcome {
-    ScheduleOutcome {
-        operations: scheduled
-            .iter()
-            .filter_map(|operation| received.remove(&operation.id))
-            .collect(),
-        completion,
+fn unix_now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
+}
+
+fn managed_cancellation_cutoff(cancel_at_unix_ns: &AtomicU64) -> u64 {
+    let existing = cancel_at_unix_ns.load(Ordering::Acquire);
+    if existing != 0 {
+        return existing;
     }
+    let cutoff = unix_now_ns().saturating_add(MANAGED_CANCELLATION_LEAD_NS);
+    cancel_at_unix_ns
+        .compare_exchange(0, cutoff, Ordering::AcqRel, Ordering::Acquire)
+        .unwrap_or_else(|actual| actual)
+}
+
+fn managed_cancellation_deadline(cutoff_unix_ns: u64, timeout: Duration) -> Instant {
+    let until_cutoff = Duration::from_nanos(cutoff_unix_ns.saturating_sub(unix_now_ns()));
+    Instant::now() + until_cutoff + timeout
 }
 
 fn message_kind(message: &AdapterMessage) -> &'static str {
     match message {
         AdapterMessage::Ready { .. } => "ready",
-        AdapterMessage::Results { .. } => "results",
+        AdapterMessage::PhaseReady { .. } => "phase_ready",
+        AdapterMessage::PhaseStarted { .. } => "phase_started",
         AdapterMessage::PhaseComplete { .. } => "phase_complete",
         AdapterMessage::Error { .. } => "error",
     }
@@ -1077,26 +1053,15 @@ pub enum SessionError {
         message: String,
         retryable: bool,
     },
-    BatchTooLarge {
-        actual: usize,
-        maximum: u32,
-    },
-    DuplicateScheduledOperation(OperationId),
-    DuplicatePhase(PhaseId),
-    UnknownPhase(PhaseId),
-    SchedulePipelineFull {
-        maximum: usize,
-    },
-    EmptyResults {
-        phase_id: PhaseId,
-    },
     UnexpectedPhase {
         expected: PhaseId,
         actual: PhaseId,
     },
-    UnexpectedOperationResult(OperationId),
-    DuplicateOperationResult(OperationId),
-    OperationResultMismatch(OperationId),
+    UnsupportedCapability(&'static str),
+    UnsupportedLoadModel(LoadModel),
+    UnsupportedHistogramEncoding(HistogramEncoding),
+    ManagedPhaseDurationOverflow,
+    UnsolicitedPhaseCancellation(PhaseId),
 }
 
 impl From<TransportError> for SessionError {
@@ -1137,53 +1102,31 @@ impl fmt::Display for SessionError {
                 formatter,
                 "adapter error {code:?} for phase {phase_id:?} (retryable={retryable}): {message}"
             ),
-            Self::BatchTooLarge { actual, maximum } => write!(
-                formatter,
-                "scheduled batch contains {actual} operations but the adapter limit is {maximum}"
-            ),
-            Self::DuplicateScheduledOperation(id) => {
-                write!(formatter, "operation {} was scheduled more than once", id.0)
-            }
-            Self::DuplicatePhase(phase_id) => {
-                write!(
-                    formatter,
-                    "phase {} was submitted more than once",
-                    phase_id.0
-                )
-            }
-            Self::UnknownPhase(phase_id) => {
-                write!(formatter, "phase {} is not active", phase_id.0)
-            }
-            Self::SchedulePipelineFull { maximum } => write!(
-                formatter,
-                "adapter session already has its maximum of {maximum} queued schedules"
-            ),
-            Self::EmptyResults { phase_id } => {
-                write!(
-                    formatter,
-                    "adapter returned an empty result batch for phase {}",
-                    phase_id.0
-                )
-            }
             Self::UnexpectedPhase { expected, actual } => write!(
                 formatter,
-                "adapter returned results for phase {} while phase {} was active",
+                "adapter returned a message for phase {} while phase {} was active",
                 actual.0, expected.0
             ),
-            Self::UnexpectedOperationResult(id) => {
-                write!(formatter, "adapter returned unscheduled operation {}", id.0)
+            Self::UnsupportedCapability(capability) => {
+                write!(formatter, "adapter does not support {capability}")
             }
-            Self::DuplicateOperationResult(id) => {
+            Self::UnsupportedLoadModel(model) => {
                 write!(
                     formatter,
-                    "adapter returned operation {} more than once",
-                    id.0
+                    "adapter does not support the {model:?} load model"
                 )
             }
-            Self::OperationResultMismatch(id) => write!(
+            Self::UnsupportedHistogramEncoding(encoding) => write!(
                 formatter,
-                "adapter result for operation {} does not match its scheduled operation",
-                id.0
+                "adapter does not support the {encoding:?} histogram encoding"
+            ),
+            Self::ManagedPhaseDurationOverflow => {
+                formatter.write_str("managed phase duration exceeds the supported range")
+            }
+            Self::UnsolicitedPhaseCancellation(phase_id) => write!(
+                formatter,
+                "adapter cancelled phase {} without a coordinator cancellation request",
+                phase_id.0
             ),
         }
     }
@@ -1203,7 +1146,9 @@ mod tests {
     use std::net::TcpListener;
 
     use super::*;
-    use crate::protocol::{LoadModel, OperationStatus};
+    use crate::protocol::{
+        EncodedHistogram, HistogramSpec, LoadModel, ManagedOperation, PhaseErrorCount, TimeBucket,
+    };
 
     struct FakeTransport {
         sent: Arc<Mutex<Vec<ControllerMessage>>>,
@@ -1276,33 +1221,82 @@ mod tests {
                 version: Some("1.0.0".into()),
             },
             capabilities: Capabilities {
-                scheduled_operations: true,
                 adapter_managed_phases: false,
                 load_models: vec![LoadModel::OpenLoop],
-                max_batch_size: Some(8),
+                histogram_encodings: Vec::new(),
             },
             operations: Vec::new(),
         }
     }
 
-    fn scheduled(id: u64) -> ScheduledOperation {
-        ScheduledOperation {
-            id: OperationId(id),
-            operation: "read".into(),
-            start_offset_ns: id * 100,
-            arguments: Default::default(),
+    fn managed_ready(version: u16) -> AdapterMessage {
+        let mut message = ready(version);
+        let AdapterMessage::Ready { capabilities, .. } = &mut message else {
+            unreachable!();
+        };
+        capabilities.adapter_managed_phases = true;
+        capabilities.histogram_encodings = vec![HistogramEncoding::HdrV2Base64];
+        message
+    }
+
+    fn managed_request() -> ManagedPhaseRequest {
+        ManagedPhaseRequest {
+            warmup_ns: 10,
+            measurement_ns: 100,
+            operation_timeout_ns: 20,
+            load: Load::OpenLoop {
+                requests_per_second: 1_000.0,
+            },
+            operations: vec![ManagedOperation {
+                operation: "read".into(),
+                arguments: Default::default(),
+                weight: 1.0,
+                shard_index: 0,
+                shard_count: 1,
+            }],
+            bucket_count: 2,
+            histogram: HistogramSpec {
+                lowest_discernible_ns: 1,
+                highest_trackable_ns: 1_000_000,
+                significant_figures: 3,
+            },
         }
     }
 
-    fn result(id: u64) -> OperationResult {
-        OperationResult {
-            id: OperationId(id),
-            operation: "read".into(),
-            arguments: Default::default(),
-            intended_start_offset_ns: id * 100,
-            actual_start_offset_ns: id * 100 + 1,
-            client_latency_ns: 10,
-            status: OperationStatus::Ok,
+    fn encoded_histogram() -> EncodedHistogram {
+        EncodedHistogram {
+            encoding: HistogramEncoding::HdrV2Base64,
+            data: String::new(),
+        }
+    }
+
+    fn phase_result() -> PhaseResult {
+        PhaseResult {
+            offered: 1,
+            started: 1,
+            completed: 1,
+            successful: 1,
+            successful_in_window: 1,
+            failed: 0,
+            timed_out: 0,
+            errors_by_code: Vec::<PhaseErrorCount>::new(),
+            elapsed_ns: 100,
+            in_flight_high_water: 1,
+            client_latency: encoded_histogram(),
+            total_latency: encoded_histogram(),
+            dispatch_lag: encoded_histogram(),
+            time_buckets: vec![TimeBucket {
+                start_offset_ns: 0,
+                duration_ns: 100,
+                offered: 1,
+                started: 1,
+                completed: 1,
+                successful: 1,
+                failed: 0,
+                timed_out: 0,
+                in_flight_high_water: 1,
+            }],
+            per_operation: Vec::new(),
         }
     }
 
@@ -1338,6 +1332,190 @@ mod tests {
     }
 
     #[test]
+    fn managed_phase_requires_negotiated_capabilities_before_sending() {
+        let (transport, sent) = FakeTransport::new(vec![ready(PROTOCOL_VERSION)]);
+        let mut session = AdapterSession::new(transport, SessionOptions::default());
+        session.initialize(RunId(1), Value::Null).unwrap();
+
+        assert!(matches!(
+            session.prepare_managed_phase(PhaseId(4), managed_request()),
+            Err(SessionError::UnsupportedCapability(
+                "adapter-managed phases"
+            ))
+        ));
+        assert_eq!(session.state(), SessionState::Ready);
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn managed_phase_prepares_starts_and_completes_in_order() {
+        let result = phase_result();
+        let responses = vec![
+            managed_ready(PROTOCOL_VERSION),
+            AdapterMessage::PhaseReady {
+                phase_id: PhaseId(4),
+            },
+            AdapterMessage::PhaseStarted {
+                phase_id: PhaseId(4),
+            },
+            AdapterMessage::PhaseComplete {
+                phase_id: PhaseId(4),
+                completion: PhaseCompletion::Completed,
+                result: result.clone(),
+            },
+        ];
+        let (transport, sent) = FakeTransport::new(responses);
+        let mut session = AdapterSession::new(transport, SessionOptions::default());
+        session.initialize(RunId(1), Value::Null).unwrap();
+
+        session
+            .prepare_managed_phase(PhaseId(4), managed_request())
+            .unwrap();
+        assert_eq!(session.state(), SessionState::PhasePrepared(PhaseId(4)));
+        let outcome = session
+            .start_managed_phase_interruptible(PhaseId(4), 42_000, &AtomicBool::new(false))
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            ManagedPhaseOutcome {
+                result: Some(result),
+                completion: ScheduleCompletion::Completed,
+            }
+        );
+        assert_eq!(session.state(), SessionState::Ready);
+        assert!(matches!(
+            &sent.lock().unwrap()[1],
+            ControllerMessage::PreparePhase {
+                phase_id: PhaseId(4),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &sent.lock().unwrap()[2],
+            ControllerMessage::StartPhase {
+                phase_id: PhaseId(4),
+                phase_start_unix_ns: 42_000,
+            }
+        ));
+    }
+
+    #[test]
+    fn managed_phase_can_be_cancelled_while_prepared_without_starting() {
+        let result = phase_result();
+        let responses = vec![
+            managed_ready(PROTOCOL_VERSION),
+            AdapterMessage::PhaseReady {
+                phase_id: PhaseId(4),
+            },
+            AdapterMessage::PhaseComplete {
+                phase_id: PhaseId(4),
+                completion: PhaseCompletion::Cancelled,
+                result: result.clone(),
+            },
+        ];
+        let (transport, sent) = FakeTransport::new(responses);
+        let mut session = AdapterSession::new(transport, SessionOptions::default());
+        session.initialize(RunId(1), Value::Null).unwrap();
+        session
+            .prepare_managed_phase(PhaseId(4), managed_request())
+            .unwrap();
+
+        let cutoff = unix_now_ns().saturating_add(50_000_000);
+        let outcome = session
+            .start_managed_phase_interruptible_with_cutoff(
+                PhaseId(4),
+                42_000,
+                &AtomicBool::new(true),
+                &AtomicU64::new(cutoff),
+            )
+            .unwrap();
+
+        assert_eq!(outcome.result, Some(result));
+        assert_eq!(
+            outcome.completion,
+            ScheduleCompletion::Cancelled { forced: false }
+        );
+        assert_eq!(session.state(), SessionState::Ready);
+        assert!(sent.lock().unwrap().iter().any(|message| matches!(
+            message,
+            ControllerMessage::CancelPhase {
+                phase_id: PhaseId(4),
+                cancel_at_unix_ns: Some(actual),
+            } if *actual == cutoff
+        )));
+        assert!(
+            !sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|message| matches!(message, ControllerMessage::StartPhase { .. }))
+        );
+    }
+
+    #[test]
+    fn managed_phase_cancellation_deadline_aborts_without_fabricating_a_result() {
+        let responses = vec![
+            managed_ready(PROTOCOL_VERSION),
+            AdapterMessage::PhaseReady {
+                phase_id: PhaseId(4),
+            },
+        ];
+        let (transport, _, aborted) = FakeTransport::interruptible(responses);
+        let options = SessionOptions {
+            cancellation_timeout: Duration::from_millis(20),
+            ..SessionOptions::default()
+        };
+        let mut session = AdapterSession::new(transport, options);
+        session.initialize(RunId(1), Value::Null).unwrap();
+        session
+            .prepare_managed_phase(PhaseId(4), managed_request())
+            .unwrap();
+
+        let outcome = session
+            .start_managed_phase_interruptible(PhaseId(4), 42_000, &AtomicBool::new(true))
+            .unwrap();
+
+        assert_eq!(outcome.result, None);
+        assert_eq!(
+            outcome.completion,
+            ScheduleCompletion::Cancelled { forced: true }
+        );
+        assert!(aborted.load(Ordering::Acquire));
+        assert_eq!(session.state(), SessionState::Closed);
+    }
+
+    #[test]
+    fn unsolicited_managed_phase_cancellation_fails_the_session() {
+        let responses = vec![
+            managed_ready(PROTOCOL_VERSION),
+            AdapterMessage::PhaseReady {
+                phase_id: PhaseId(4),
+            },
+            AdapterMessage::PhaseStarted {
+                phase_id: PhaseId(4),
+            },
+            AdapterMessage::PhaseComplete {
+                phase_id: PhaseId(4),
+                completion: PhaseCompletion::Cancelled,
+                result: phase_result(),
+            },
+        ];
+        let (transport, _) = FakeTransport::new(responses);
+        let mut session = AdapterSession::new(transport, SessionOptions::default());
+        session.initialize(RunId(1), Value::Null).unwrap();
+        session
+            .prepare_managed_phase(PhaseId(4), managed_request())
+            .unwrap();
+
+        assert!(matches!(
+            session.start_managed_phase_interruptible(PhaseId(4), 42_000, &AtomicBool::new(false)),
+            Err(SessionError::UnsolicitedPhaseCancellation(PhaseId(4)))
+        ));
+        assert_eq!(session.state(), SessionState::Failed);
+    }
+
+    #[test]
     fn empty_adapter_identity_fails_the_handshake() {
         let mut response = ready(PROTOCOL_VERSION);
         let AdapterMessage::Ready { identity, .. } = &mut response else {
@@ -1355,166 +1533,9 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_results_are_validated_and_restored_to_schedule_order() {
-        let responses = vec![
-            ready(PROTOCOL_VERSION),
-            AdapterMessage::Results {
-                phase_id: PhaseId(3),
-                operations: vec![result(2), result(1)],
-            },
-        ];
-        let (transport, _) = FakeTransport::new(responses);
-        let mut session = AdapterSession::new(transport, SessionOptions::default());
-        session.initialize(RunId(1), Value::Null).unwrap();
-
-        let results = session
-            .schedule(PhaseId(3), 42, vec![scheduled(1), scheduled(2)])
-            .unwrap();
-
-        assert_eq!(
-            results.iter().map(|result| result.id.0).collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-        assert_eq!(session.state(), SessionState::Ready);
-    }
-
-    #[test]
-    fn queued_schedules_are_sent_ahead_and_buffer_out_of_order_results() {
-        let responses = vec![
-            ready(PROTOCOL_VERSION),
-            AdapterMessage::Results {
-                phase_id: PhaseId(4),
-                operations: vec![result(2)],
-            },
-            AdapterMessage::Results {
-                phase_id: PhaseId(3),
-                operations: vec![result(1)],
-            },
-        ];
-        let (transport, sent) = FakeTransport::new(responses);
-        let mut session = AdapterSession::new(transport, SessionOptions::default());
-        session.initialize(RunId(1), Value::Null).unwrap();
-
-        session
-            .submit_schedule(PhaseId(3), 42, vec![scheduled(1)])
-            .unwrap();
-        session
-            .submit_schedule(PhaseId(4), 42, vec![scheduled(2)])
-            .unwrap();
-        assert!(matches!(
-            session.submit_schedule(PhaseId(5), 42, vec![scheduled(3)]),
-            Err(SessionError::SchedulePipelineFull { maximum: 2 })
-        ));
-
-        let sent = sent.lock().unwrap();
-        assert!(matches!(
-            &sent[1],
-            ControllerMessage::Schedule {
-                phase_id: PhaseId(3),
-                ..
-            }
-        ));
-        assert!(matches!(
-            &sent[2],
-            ControllerMessage::Schedule {
-                phase_id: PhaseId(4),
-                ..
-            }
-        ));
-        drop(sent);
-
-        assert_eq!(
-            session
-                .receive_schedule(PhaseId(3), &AtomicBool::new(false))
-                .unwrap()
-                .operations,
-            [result(1)]
-        );
-        assert_eq!(session.state(), SessionState::PhaseActive(PhaseId(4)));
-        assert_eq!(
-            session
-                .receive_schedule(PhaseId(4), &AtomicBool::new(false))
-                .unwrap()
-                .operations,
-            [result(2)]
-        );
-        assert_eq!(session.state(), SessionState::Ready);
-    }
-
-    #[test]
-    fn cancellation_covers_every_queued_schedule_and_preserves_partial_results() {
-        let responses = vec![
-            ready(PROTOCOL_VERSION),
-            AdapterMessage::Results {
-                phase_id: PhaseId(9),
-                operations: vec![result(1)],
-            },
-            AdapterMessage::Error {
-                phase_id: Some(PhaseId(9)),
-                code: "cancelled".into(),
-                message: "cancelled".into(),
-                retryable: false,
-            },
-            AdapterMessage::Error {
-                phase_id: Some(PhaseId(10)),
-                code: "cancelled".into(),
-                message: "cancelled".into(),
-                retryable: false,
-            },
-        ];
-        let (transport, sent) = FakeTransport::new(responses);
-        let mut session = AdapterSession::new(transport, SessionOptions::default());
-        session.initialize(RunId(1), Value::Null).unwrap();
-        session
-            .submit_schedule(PhaseId(9), 42, vec![scheduled(1), scheduled(2)])
-            .unwrap();
-        session
-            .submit_schedule(PhaseId(10), 42, vec![scheduled(3)])
-            .unwrap();
-
-        let outcome = session
-            .receive_schedule(PhaseId(9), &AtomicBool::new(true))
-            .unwrap();
-
-        assert_eq!(outcome.operations, [result(1)]);
-        assert_eq!(
-            outcome.completion,
-            ScheduleCompletion::Cancelled { forced: false }
-        );
-        assert_eq!(session.state(), SessionState::Ready);
-        let sent = sent.lock().unwrap();
-        for phase_id in [PhaseId(9), PhaseId(10)] {
-            assert!(sent.iter().any(|message| matches!(
-                message,
-                ControllerMessage::CancelPhase { phase_id: actual } if *actual == phase_id
-            )));
-        }
-    }
-
-    #[test]
-    fn duplicate_results_fail_the_session() {
-        let responses = vec![
-            ready(PROTOCOL_VERSION),
-            AdapterMessage::Results {
-                phase_id: PhaseId(3),
-                operations: vec![result(1), result(1)],
-            },
-        ];
-        let (transport, _) = FakeTransport::new(responses);
-        let mut session = AdapterSession::new(transport, SessionOptions::default());
-        session.initialize(RunId(1), Value::Null).unwrap();
-
-        assert!(matches!(
-            session.schedule(PhaseId(3), 42, vec![scheduled(1), scheduled(2)]),
-            Err(SessionError::DuplicateOperationResult(OperationId(1)))
-        ));
-        assert_eq!(session.state(), SessionState::Failed);
-    }
-
-    #[test]
     fn adapter_errors_preserve_retryability_and_phase_context() {
         let responses = vec![
-            ready(PROTOCOL_VERSION),
+            managed_ready(PROTOCOL_VERSION),
             AdapterMessage::Error {
                 phase_id: Some(PhaseId(3)),
                 code: "overloaded".into(),
@@ -1527,7 +1548,7 @@ mod tests {
         session.initialize(RunId(1), Value::Null).unwrap();
 
         assert!(matches!(
-            session.schedule(PhaseId(3), 42, vec![scheduled(1)]),
+            session.prepare_managed_phase(PhaseId(3), managed_request()),
             Err(SessionError::Adapter {
                 phase_id: Some(PhaseId(3)),
                 code,
@@ -1548,56 +1569,11 @@ mod tests {
         assert!(matches!(
             &sent.lock().unwrap()[1],
             ControllerMessage::CancelPhase {
-                phase_id: PhaseId(9)
+                phase_id: PhaseId(9),
+                cancel_at_unix_ns: None,
             }
         ));
         assert_eq!(session.state(), SessionState::Ready);
-    }
-
-    #[test]
-    fn interruptible_schedule_preserves_partial_results_and_forces_a_deadline() {
-        let responses = vec![
-            ready(PROTOCOL_VERSION),
-            AdapterMessage::Results {
-                phase_id: PhaseId(9),
-                operations: vec![result(1)],
-            },
-        ];
-        let (transport, sent, aborted) = FakeTransport::interruptible(responses);
-        let options = SessionOptions {
-            cancellation_timeout: Duration::from_millis(30),
-            response_timeout: Duration::from_secs(1),
-            ..SessionOptions::default()
-        };
-        let mut session = AdapterSession::new(transport, options);
-        session.initialize(RunId(1), Value::Null).unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let request_stop = Arc::clone(&stop);
-        let interrupter = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(5));
-            request_stop.store(true, Ordering::Release);
-        });
-
-        let started = Instant::now();
-        let outcome = session
-            .schedule_interruptible(PhaseId(9), 42, vec![scheduled(1), scheduled(2)], &stop)
-            .unwrap();
-        interrupter.join().unwrap();
-
-        assert!(started.elapsed() < Duration::from_millis(250));
-        assert_eq!(outcome.operations, [result(1)]);
-        assert_eq!(
-            outcome.completion,
-            ScheduleCompletion::Cancelled { forced: true }
-        );
-        assert!(aborted.load(Ordering::Acquire));
-        assert_eq!(session.state(), SessionState::Closed);
-        assert!(sent.lock().unwrap().iter().any(|message| matches!(
-            message,
-            ControllerMessage::CancelPhase {
-                phase_id: PhaseId(9)
-            }
-        )));
     }
 
     #[test]
@@ -1648,92 +1624,6 @@ mod tests {
         let mut session = AdapterSession::new(transport, options);
         session.initialize(RunId(7), Value::Null).unwrap();
         session.shutdown().unwrap();
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn interrupt_deadline_drops_only_the_remote_session() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut input = BufReader::new(stream.try_clone().unwrap());
-            let mut output = BufWriter::new(stream);
-            assert!(matches!(
-                read_controller_message(&mut input),
-                ControllerMessage::Initialize {
-                    run_id: RunId(7),
-                    ..
-                }
-            ));
-            serde_json::to_writer(&mut output, &ready(PROTOCOL_VERSION)).unwrap();
-            output.write_all(b"\n").unwrap();
-            output.flush().unwrap();
-            assert!(matches!(
-                read_controller_message(&mut input),
-                ControllerMessage::Schedule {
-                    phase_id: PhaseId(4),
-                    ..
-                }
-            ));
-            assert!(matches!(
-                read_controller_message(&mut input),
-                ControllerMessage::CancelPhase {
-                    phase_id: PhaseId(4)
-                }
-            ));
-            let mut trailing = String::new();
-            assert_eq!(input.read_line(&mut trailing).unwrap(), 0);
-
-            let (stream, _) = listener.accept().unwrap();
-            let mut input = BufReader::new(stream.try_clone().unwrap());
-            let mut output = BufWriter::new(stream);
-            assert!(matches!(
-                read_controller_message(&mut input),
-                ControllerMessage::Initialize {
-                    run_id: RunId(8),
-                    ..
-                }
-            ));
-            serde_json::to_writer(&mut output, &ready(PROTOCOL_VERSION)).unwrap();
-            output.write_all(b"\n").unwrap();
-            output.flush().unwrap();
-            assert!(matches!(
-                read_controller_message(&mut input),
-                ControllerMessage::Shutdown
-            ));
-        });
-
-        let options = SessionOptions {
-            cancellation_timeout: Duration::from_millis(40),
-            response_timeout: Duration::from_secs(1),
-            ..SessionOptions::default()
-        };
-        let transport = TcpTransport::connect(&endpoint.to_string(), &options).unwrap();
-        let mut session = AdapterSession::new(transport, options);
-        session.initialize(RunId(7), Value::Null).unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let request_stop = Arc::clone(&stop);
-        let interrupter = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(5));
-            request_stop.store(true, Ordering::Release);
-        });
-
-        let outcome = session
-            .schedule_interruptible(PhaseId(4), 100, vec![scheduled(1)], &stop)
-            .unwrap();
-        interrupter.join().unwrap();
-
-        assert_eq!(
-            outcome.completion,
-            ScheduleCompletion::Cancelled { forced: true }
-        );
-        assert_eq!(session.state(), SessionState::Closed);
-        let options = SessionOptions::default();
-        let transport = TcpTransport::connect(&endpoint.to_string(), &options).unwrap();
-        let mut second_session = AdapterSession::new(transport, options);
-        second_session.initialize(RunId(8), Value::Null).unwrap();
-        second_session.shutdown().unwrap();
         server.join().unwrap();
     }
 

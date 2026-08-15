@@ -209,7 +209,7 @@ operation has a stable name, description, broad kind (`read`, `write`,
 simple named arguments. Concrete arguments are either signed integers or
 strings and may be required or provide a default. An enum argument advertises
 an ordered, non-empty set of allowed string values, so interactive frontends
-can render a dropdown while scheduled operations continue to carry ordinary
+can render a dropdown while bound operations continue to carry ordinary
 string values. This intentionally small type system is easy to implement
 consistently across languages and straightforward for CLI, TUI, and browser
 frontends to render.
@@ -285,43 +285,43 @@ required arguments, weights, and duplicates.
 Resolved relative weights are normalized to sum to one in `RunConfig`.
 Operations not marked as defaults require an explicit add action.
 
-## Adapter execution modes
+## Adapter phase execution
 
-### Scheduled operations (default)
+Adapters execute complete phases and return bounded aggregate summaries. This
+keeps per-operation IPC and coordinator scheduling out of the hot path. Every
+adapter runtime must pass the same protocol conformance tests; official language
+runtimes should reduce the user-facing adapter to operation discovery plus an
+async callback.
 
-Kneefinder computes operation deadlines and sends them ahead of time in
-batches. A reusable language runtime dispatches the supplied user callback at
-those deadlines, measures the native client call, and returns batched results.
-Adapter authors do not implement the ramp algorithm or choose rates.
+The coordinator still owns the workload plan. Protocol version 4 uses a
+two-step barrier: every agent first acknowledges `prepare_phase`, then the
+coordinator sends every prepared agent the same future Unix-nanosecond start
+time in `start_phase`. The prepared request fixes the warmup and measurement
+durations, global open-loop rate, weighted bound variants, per-agent shard,
+operation timeout, bucket boundaries, and histogram contract. An adapter
+generates the same global deterministic stream and executes only indices that
+belong to its fixed shard. This preserves the meaning of offered load when a
+cohort has more than one agent.
 
-The coordinator keeps a bounded number of batches queued ahead. Adapter
-runtimes continue reading control messages while earlier batches execute and
-correlate possibly out-of-order results by phase and operation identifier. This
-keeps control-plane round trips outside the open-loop deadline path without
-making queued work unbounded.
+Managed results use uncompressed HdrHistogram V2 binary payloads encoded as
+base64 for NDJSON transport. Client latency, total latency, and dispatch lag
+use the same negotiated range and precision overall and for every bound
+variant. Each result also carries exact offered, started, completed, terminal
+outcome, error-code, fixed-bucket, and in-flight counts. The coordinator
+decodes under byte and allocation limits, rejects mismatched histogram specs or
+sample counts, reconciles per-variant totals with overall totals, and merges
+only validated contributions. A completed phase may report fewer starts than
+offers; that is generator saturation and invalidates a target-knee claim. A
+completed phase must report one terminal outcome for every started call.
+Incomplete calls are valid only in a cancelled partial result.
 
-Each result carries:
+Managed cancellation uses a coordinator-owned future absolute cutoff shared by
+the cohort. Every agent stops the measured stream at that cutoff and reports
+the same elapsed measurement duration, which keeps partial time buckets and
+histograms mergeable despite transport and cancellation-delivery skew.
 
-- operation identifier
-- advertised operation name
-- intended start offset
-- actual start offset
-- completion offset or client latency
-- success, error, or timeout status
-
-Batching keeps IPC off the critical scheduling path. Dispatch lag reveals when
-the adapter runtime or load generator cannot keep up.
-
-Official language runtimes should make the user-facing adapter approximately an
-async callback. The runtime owns protocol handling, timers, concurrency,
-measurement, batching, and error normalization.
-
-### Adapter-managed phase (escape hatch)
-
-An adapter may advertise a capability to execute a complete phase and return
-histograms. This supports extremely high-throughput systems for which even
-batched operation dispatch is material. It is more difficult to compare across
-languages, so it is not the default and must pass protocol conformance tests.
+Memory grows with variant, bucket, error-code, and histogram cardinality rather
+than operation count.
 
 ## Measurement model
 
@@ -544,14 +544,14 @@ Useful engine events include:
 - run state changed
 - adapter ready or exited
 - phase started, progress updated, and phase completed
-- measurement point accepted, rejected, or scheduled for repetition
+- measurement point accepted, rejected, or selected for repetition
 - bracket changed
 - candidate knee changed
 - warning or failure recorded
 
-High-frequency operation results need not be broadcast to every frontend. The
-engine aggregates them into bounded-rate snapshots while the artifact writer
-retains the data required for later analysis.
+High-frequency phase progress need not be broadcast to every frontend. The
+engine publishes bounded-rate snapshots while the artifact writer retains the
+aggregate data required for later analysis.
 
 Each run receives a unique identifier and an artifact directory containing at
 least:
@@ -584,8 +584,8 @@ invalid or generator-limited (`3`), failed (`4`), and command/read errors (`1`).
 1. Typed protocol messages and a lifecycle reducer with transition tests.
 2. Transport-independent adapter session with supervised NDJSON subprocess and
    coordinator-initiated persistent TCP bindings.
-3. Fixed agent cohort, colocated/remote session agents, deterministic schedule
-   fan-out, phase aggregation, and generator-lag checks.
+3. Fixed agent cohort, colocated/remote session agents, deterministic
+   managed-phase orchestration, aggregate merging, and generator-lag checks.
 4. Baseline, geometric discovery, and bracket refinement.
 5. Reproducible JSON/NDJSON artifacts and inspect/render commands (implemented).
 6. Richer terminal progress and SVG report presentation.

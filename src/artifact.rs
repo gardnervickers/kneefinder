@@ -795,10 +795,9 @@ mod tests {
                 version: Some("1.0".into()),
             },
             capabilities: Capabilities {
-                scheduled_operations: true,
                 adapter_managed_phases: false,
                 load_models: vec![LoadModel::OpenLoop],
-                max_batch_size: None,
+                histogram_encodings: Vec::new(),
             },
             operations: Vec::new(),
         }
@@ -809,6 +808,10 @@ mod tests {
             offered_rate: rate,
             goodput_rate: rate - 1.0,
             elapsed_ns: 1_000_000_000,
+            offered_count: rate as u64,
+            started_count: rate as u64,
+            completed_count: rate as u64,
+            successful_in_window: (rate - 1.0) as u64,
             in_flight_high_water: 2,
             stats: summarize_results(&[]).unwrap(),
             quality: PhaseQuality::default(),

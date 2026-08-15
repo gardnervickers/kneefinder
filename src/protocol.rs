@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub use crate::histogram::{EncodedHistogram, HistogramEncoding, HistogramSpec};
+
+pub const PROTOCOL_VERSION: u16 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -27,22 +29,20 @@ pub enum ControllerMessage {
         #[serde(default)]
         config: Value,
     },
-    Schedule {
+    PreparePhase {
+        phase_id: PhaseId,
+        request: ManagedPhaseRequest,
+    },
+    StartPhase {
         phase_id: PhaseId,
         phase_start_unix_ns: u64,
-        operations: Vec<ScheduledOperation>,
-    },
-    RunPhase {
-        phase_id: PhaseId,
-        warmup_ms: u64,
-        duration_ms: u64,
-        timeout_ms: u64,
-        load: Load,
-        #[serde(default)]
-        parameters: Value,
     },
     CancelPhase {
         phase_id: PhaseId,
+        /// Coordinator-owned absolute cutoff for a managed phase. `None`
+        /// requests immediate cleanup of a prepared phase that never started.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel_at_unix_ns: Option<u64>,
     },
     Shutdown,
 }
@@ -57,12 +57,15 @@ pub enum AdapterMessage {
         #[serde(default)]
         operations: Vec<OperationDescriptor>,
     },
-    Results {
+    PhaseReady {
         phase_id: PhaseId,
-        operations: Vec<OperationResult>,
+    },
+    PhaseStarted {
+        phase_id: PhaseId,
     },
     PhaseComplete {
         phase_id: PhaseId,
+        completion: PhaseCompletion,
         result: PhaseResult,
     },
     Error {
@@ -81,16 +84,16 @@ pub struct AdapterIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
-    pub scheduled_operations: bool,
     pub adapter_managed_phases: bool,
     #[serde(default)]
     pub load_models: Vec<LoadModel>,
-    pub max_batch_size: Option<u32>,
+    #[serde(default)]
+    pub histogram_encodings: Vec<HistogramEncoding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OperationDescriptor {
-    /// Stable machine-readable name referenced by scheduled operations.
+    /// Stable machine-readable name referenced by bound operation variants.
     pub name: String,
     pub description: Option<String>,
     pub kind: OperationKind,
@@ -161,7 +164,35 @@ pub enum Load {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ScheduledOperation {
+pub struct ManagedPhaseRequest {
+    pub warmup_ns: u64,
+    pub measurement_ns: u64,
+    pub operation_timeout_ns: u64,
+    pub load: Load,
+    pub operations: Vec<ManagedOperation>,
+    pub bucket_count: u16,
+    pub histogram: HistogramSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManagedOperation {
+    pub operation: String,
+    #[serde(default)]
+    pub arguments: BTreeMap<String, ArgumentValue>,
+    pub weight: f64,
+    pub shard_index: u32,
+    pub shard_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhaseCompletion {
+    Completed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OperationInvocation {
     pub id: OperationId,
     pub operation: String,
     /// Intended start relative to the phase start.
@@ -208,8 +239,11 @@ pub struct PhaseResult {
     pub started: u64,
     pub completed: u64,
     pub successful: u64,
+    pub successful_in_window: u64,
     pub failed: u64,
     pub timed_out: u64,
+    #[serde(default)]
+    pub errors_by_code: Vec<PhaseErrorCount>,
     pub elapsed_ns: u64,
     pub in_flight_high_water: u64,
     pub client_latency: EncodedHistogram,
@@ -230,17 +264,20 @@ pub struct OperationPhaseResult {
     pub started: u64,
     pub completed: u64,
     pub successful: u64,
+    pub successful_in_window: u64,
     pub failed: u64,
     pub timed_out: u64,
+    #[serde(default)]
+    pub errors_by_code: Vec<PhaseErrorCount>,
     pub client_latency: EncodedHistogram,
     pub total_latency: EncodedHistogram,
     pub dispatch_lag: EncodedHistogram,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EncodedHistogram {
-    pub encoding: String,
-    pub data: String,
+pub struct PhaseErrorCount {
+    pub code: Option<String>,
+    pub count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,9 +285,12 @@ pub struct TimeBucket {
     pub start_offset_ns: u64,
     pub duration_ns: u64,
     pub offered: u64,
+    pub started: u64,
+    pub completed: u64,
     pub successful: u64,
     pub failed: u64,
     pub timed_out: u64,
+    pub in_flight_high_water: u64,
 }
 
 #[cfg(test)]
@@ -259,22 +299,36 @@ mod tests {
 
     #[test]
     fn controller_message_round_trips_as_tagged_json() {
-        let message = ControllerMessage::Schedule {
+        let message = ControllerMessage::PreparePhase {
             phase_id: PhaseId(3),
-            phase_start_unix_ns: 42,
-            operations: vec![ScheduledOperation {
-                id: OperationId(9),
-                operation: "lookup".into(),
-                start_offset_ns: 1_000,
-                arguments: BTreeMap::from([(
-                    "key".into(),
-                    ArgumentValue::String("example".into()),
-                )]),
-            }],
+            request: ManagedPhaseRequest {
+                warmup_ns: 0,
+                measurement_ns: 1_000,
+                operation_timeout_ns: 100,
+                load: Load::OpenLoop {
+                    requests_per_second: 10.0,
+                },
+                operations: vec![ManagedOperation {
+                    operation: "lookup".into(),
+                    arguments: BTreeMap::from([(
+                        "key".into(),
+                        ArgumentValue::String("example".into()),
+                    )]),
+                    weight: 1.0,
+                    shard_index: 0,
+                    shard_count: 1,
+                }],
+                bucket_count: 1,
+                histogram: HistogramSpec {
+                    lowest_discernible_ns: 1,
+                    highest_trackable_ns: 1_000,
+                    significant_figures: 3,
+                },
+            },
         };
 
         let json = serde_json::to_string(&message).unwrap();
-        assert!(json.contains(r#""type":"schedule""#));
+        assert!(json.contains(r#""type":"prepare_phase""#));
         assert_eq!(
             serde_json::from_str::<ControllerMessage>(&json).unwrap(),
             message
@@ -295,6 +349,42 @@ mod tests {
 
         assert_eq!(result.dispatch_lag_ns(), 250);
         assert_eq!(result.total_latency_ns(), 1_000);
+    }
+
+    #[test]
+    fn managed_phase_messages_round_trip_with_typed_contracts() {
+        let message = ControllerMessage::PreparePhase {
+            phase_id: PhaseId(4),
+            request: ManagedPhaseRequest {
+                warmup_ns: 10,
+                measurement_ns: 100,
+                operation_timeout_ns: 20,
+                load: Load::OpenLoop {
+                    requests_per_second: 1_000.0,
+                },
+                operations: vec![ManagedOperation {
+                    operation: "lookup".into(),
+                    arguments: BTreeMap::from([("key".into(), ArgumentValue::Integer(1))]),
+                    weight: 1.0,
+                    shard_index: 0,
+                    shard_count: 2,
+                }],
+                bucket_count: 5,
+                histogram: HistogramSpec {
+                    lowest_discernible_ns: 1,
+                    highest_trackable_ns: 1_000_000,
+                    significant_figures: 3,
+                },
+            },
+        };
+
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains(r#""type":"prepare_phase""#));
+        assert!(json.contains(r#""shard_count":2"#));
+        assert_eq!(
+            serde_json::from_str::<ControllerMessage>(&json).unwrap(),
+            message
+        );
     }
 
     #[test]

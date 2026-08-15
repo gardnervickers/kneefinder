@@ -1,24 +1,29 @@
 //! Frontend-neutral execution of prepared workload cohorts.
 
 use std::{
-    collections::VecDeque,
     fmt,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use crate::{
-    adapter_session::{SCHEDULE_PIPELINE_DEPTH, ScheduleCompletion},
+    adapter_session::ScheduleCompletion,
     agent::{AgentCohort, CohortError, CohortReady},
     analysis::{AnalysisTermination, analyze},
     config::{OperationSelection, RunConfig, Strategy, WeightedOperation},
     measurement::{PhaseProgress, PhaseSegment, RunClassification, RunEvent, RunOutcome},
-    protocol::{OperationId, OperationResult, OperationStatus, PhaseId, ScheduledOperation},
-    stats::{MeasurementBucket, PhaseQuality, PhaseReport, StatsError, summarize_results},
+    protocol::{
+        HistogramEncoding, HistogramSpec, Load, LoadModel, ManagedOperation, ManagedPhaseRequest,
+        PhaseId,
+    },
+    stats::{
+        MeasurementBucket, OperationVariant, PhaseAccumulator, PhaseAggregationPlan, PhaseQuality,
+        PhaseReport, StatsError,
+    },
     strategy::{
         AdaptiveStrategy, ObservationOutcome, StrategyAction, StrategyDecision, fixed_stage,
     },
@@ -28,15 +33,9 @@ const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
 
 #[derive(Debug, Clone)]
 pub struct ExecutorOptions {
-    /// Maximum global schedule submitted in one coordinator round trip.
-    pub maximum_batch_size: usize,
-    /// Maximum retained operation results used to summarize one phase.
-    pub maximum_results_per_phase: usize,
     /// Maximum number of measured phases in one fixed plan.
     pub maximum_phases: usize,
-    /// Maximum intended duration represented by one schedule batch.
-    pub schedule_horizon: Duration,
-    /// Lead time allowing every agent to receive a schedule before it begins.
+    /// Lead time allowing every agent to receive a phase start before it begins.
     pub schedule_lead_time: Duration,
     /// Dispatch-lag fraction that invalidates target-capacity conclusions.
     pub dispatch_lag_fraction: f64,
@@ -53,12 +52,9 @@ pub struct ExecutorOptions {
 impl Default for ExecutorOptions {
     fn default() -> Self {
         Self {
-            maximum_batch_size: 4_096,
-            maximum_results_per_phase: 1_000_000,
             maximum_phases: 10_000,
-            schedule_horizon: Duration::from_secs(1),
             schedule_lead_time: Duration::from_millis(25),
-            dispatch_lag_fraction: 0.10,
+            dispatch_lag_fraction: 0.01,
             minimum_dispatch_lag: Duration::from_millis(10),
             stationarity_buckets: 5,
             stationarity_tolerance: 0.30,
@@ -101,22 +97,10 @@ impl RunExecutor {
         validate_capabilities(catalog)?;
         let rates = configured_rates(config, self.options.maximum_phases)?;
         let operations = concrete_operations(config)?;
-        validate_operation_budget(config, &rates, &self.options)?;
-        let batch_limit = catalog
-            .capabilities
-            .max_batch_size
-            .map_or(self.options.maximum_batch_size, |limit| {
-                self.options.maximum_batch_size.min(limit as usize)
-            });
-        if batch_limit == 0 {
-            return Err(ExecutorError::InvalidConfiguration(
-                "adapter maximum batch size must be greater than zero".into(),
-            ));
-        }
+
         sink.record_run_event(RunEvent::AdapterReady)
             .map_err(ExecutorError::Sink)?;
         let mut next_wire_phase_id = 1_u64;
-        let mut next_operation_id = 1_u64;
         if config.strategy == Strategy::Adaptive {
             self.execute_adaptive(
                 config,
@@ -124,9 +108,7 @@ impl RunExecutor {
                 stop,
                 sink,
                 operations,
-                batch_limit,
                 &mut next_wire_phase_id,
-                &mut next_operation_id,
             )
         } else {
             self.execute_fixed(
@@ -136,9 +118,7 @@ impl RunExecutor {
                 stop,
                 sink,
                 operations,
-                batch_limit,
                 &mut next_wire_phase_id,
-                &mut next_operation_id,
             )
         }
     }
@@ -152,9 +132,7 @@ impl RunExecutor {
         stop: &Arc<AtomicBool>,
         sink: &mut impl ExecutionSink,
         operations: &[WeightedOperation],
-        batch_limit: usize,
         next_wire_phase_id: &mut u64,
-        next_operation_id: &mut u64,
     ) -> Result<ExecutorCompletion, ExecutorError> {
         let mut sequence = 1_u64;
         let mut measured_phases = 0_u64;
@@ -180,9 +158,7 @@ impl RunExecutor {
                 stop,
                 sink,
                 operations,
-                batch_limit,
                 next_wire_phase_id,
-                next_operation_id,
                 rate,
                 progress,
             )?
@@ -247,9 +223,7 @@ impl RunExecutor {
         stop: &Arc<AtomicBool>,
         sink: &mut impl ExecutionSink,
         operations: &[WeightedOperation],
-        batch_limit: usize,
         next_wire_phase_id: &mut u64,
-        next_operation_id: &mut u64,
     ) -> Result<ExecutorCompletion, ExecutorError> {
         let mut strategy = AdaptiveStrategy::new(config);
         let mut request = strategy.initial_request();
@@ -281,9 +255,7 @@ impl RunExecutor {
                 stop,
                 sink,
                 operations,
-                batch_limit,
                 next_wire_phase_id,
-                next_operation_id,
                 request.rate,
                 ProgressContext {
                     phase_id: PhaseId(measured_phases as u64 + 1),
@@ -430,242 +402,136 @@ impl RunExecutor {
         stop: &Arc<AtomicBool>,
         sink: &mut impl ExecutionSink,
         operations: &[WeightedOperation],
-        batch_limit: usize,
         next_wire_phase_id: &mut u64,
-        next_operation_id: &mut u64,
         rate: f64,
         progress: ProgressContext,
     ) -> Result<Option<PhaseReport>, ExecutorError> {
         if stop.load(Ordering::Acquire) {
             return Ok(None);
         }
-        if config.phases.warmup_ms > 0 {
-            self.run_interval(
-                cohort,
-                stop,
-                sink,
-                next_wire_phase_id,
-                next_operation_id,
-                rate,
-                Duration::from_millis(config.phases.warmup_ms),
-                operations,
-                batch_limit,
-                false,
-                progress,
-                PhaseSegment::Warmup,
-            )?;
-            if stop.load(Ordering::Acquire) {
-                return Ok(None);
-            }
-        }
-        let measured = self.run_interval(
+        let plan = aggregation_plan(config, operations, &self.options)?;
+        self.measure_managed_phase(
+            config,
             cohort,
             stop,
             sink,
-            next_wire_phase_id,
-            next_operation_id,
-            rate,
-            Duration::from_millis(config.phases.measurement_ms),
             operations,
-            batch_limit,
-            true,
+            next_wire_phase_id,
+            rate,
             progress,
-            PhaseSegment::Measurement,
-        )?;
-        if measured.elapsed_ns == 0 {
-            return Ok(None);
-        }
-        let quality = phase_quality(&measured, &self.options);
-        Ok(Some(PhaseReport {
-            offered_rate: rate,
-            goodput_rate: measured.successful_in_window as f64 * NANOS_PER_SECOND
-                / measured.elapsed_ns as f64,
-            elapsed_ns: measured.elapsed_ns,
-            in_flight_high_water: maximum_in_flight(&measured.results, measured.elapsed_ns),
-            stats: summarize_results(&measured.results)?,
-            quality,
-        }))
+            plan,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run_interval(
+    fn measure_managed_phase(
         &self,
+        config: &RunConfig,
         cohort: &mut AgentCohort,
         stop: &Arc<AtomicBool>,
         sink: &mut impl ExecutionSink,
-        next_wire_phase_id: &mut u64,
-        next_operation_id: &mut u64,
-        offered_rate: f64,
-        duration: Duration,
         operations: &[WeightedOperation],
-        batch_limit: usize,
-        retain_results: bool,
+        next_wire_phase_id: &mut u64,
+        rate: f64,
         progress: ProgressContext,
-        segment: PhaseSegment,
-    ) -> Result<MeasuredInterval, ExecutorError> {
-        let interval_ns = duration.as_nanos().min(u64::MAX as u128) as u64;
-        let mut remaining_ns = interval_ns;
-        let mut scheduled_through_ns = 0_u64;
-        let mut elapsed_ns = 0_u64;
-        let mut operation_budget = 0.0_f64;
-        let mut successful_in_window = 0_u64;
-        let mut scheduled_count = 0_u64;
-        let mut reported = 0_u64;
-        let mut results = Vec::new();
-        let total_weight = operations.iter().map(|operation| operation.weight).sum();
-        let mut scheduler = SmoothWeightedScheduler::new(operations, total_weight);
-        let lead_time_ns = self
-            .options
-            .schedule_lead_time
-            .as_nanos()
-            .min(u64::MAX as u128) as u64;
-        let phase_start = unix_now_ns().saturating_add(lead_time_ns);
-        let phase_started_at = Instant::now() + self.options.schedule_lead_time;
-        let mut pending_batches = VecDeque::new();
+        plan: PhaseAggregationPlan,
+    ) -> Result<Option<PhaseReport>, ExecutorError> {
+        let warmup = Duration::from_millis(config.phases.warmup_ms);
+        let measurement = Duration::from_millis(config.phases.measurement_ms);
+        if !warmup.is_zero() {
+            publish_progress(sink, progress, PhaseSegment::Warmup, 0, warmup, 0, 0)?;
+        }
+        let phase_id = PhaseId(*next_wire_phase_id);
+        *next_wire_phase_id = next_wire_phase_id
+            .checked_add(1)
+            .ok_or(ExecutorError::PhaseIdExhausted)?;
+        let request = ManagedPhaseRequest {
+            warmup_ns: duration_ns(warmup),
+            measurement_ns: plan.measurement_ns,
+            operation_timeout_ns: plan.measurement_ns,
+            load: Load::OpenLoop {
+                requests_per_second: rate,
+            },
+            operations: operations
+                .iter()
+                .map(|operation| ManagedOperation {
+                    operation: operation.name.clone(),
+                    arguments: operation.arguments.clone(),
+                    weight: operation.weight,
+                    shard_index: 0,
+                    shard_count: 1,
+                })
+                .collect(),
+            bucket_count: plan.bucket_count,
+            histogram: plan.histogram,
+        };
+        let outcome = cohort.execute_managed_phase(
+            phase_id,
+            self.options.schedule_lead_time,
+            request,
+            stop,
+        )?;
 
+        if !warmup.is_zero() {
+            publish_progress(
+                sink,
+                progress,
+                PhaseSegment::Warmup,
+                duration_ns(warmup),
+                warmup,
+                0,
+                0,
+            )?;
+        }
+        let mut accumulator = PhaseAccumulator::new(plan)?;
+        let mut elapsed_ns = None;
+        for agent in outcome.agents {
+            if matches!(
+                agent.outcome.completion,
+                ScheduleCompletion::Cancelled { .. }
+            ) {
+                stop.store(true, Ordering::Release);
+            }
+            let Some(result) = agent.outcome.result else {
+                if stop.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                return Err(ExecutorError::InvalidManagedPhase(format!(
+                    "agent {} did not return a terminal aggregate",
+                    agent.agent.id
+                )));
+            };
+            if agent.outcome.completion == ScheduleCompletion::Completed
+                && result.started != result.completed
+            {
+                return Err(ExecutorError::InvalidManagedPhase(format!(
+                    "agent {} completed the phase with {} started calls but {} terminal observations",
+                    agent.agent.id, result.started, result.completed
+                )));
+            }
+            elapsed_ns.get_or_insert(result.elapsed_ns);
+            accumulator.merge_phase_result(&result)?;
+        }
+        let elapsed_ns = elapsed_ns.ok_or_else(|| {
+            ExecutorError::InvalidManagedPhase("cohort returned no agent aggregates".into())
+        })?;
+        let mut report = accumulator.finish_at(rate, elapsed_ns)?;
+        report.quality = phase_quality(
+            &report.quality.buckets,
+            report.stats.overall.attempts,
+            &self.options,
+        );
         publish_progress(
             sink,
             progress,
-            segment,
-            0,
-            duration,
-            scheduled_count,
-            reported,
-        )?;
-
-        while remaining_ns > 0 || !pending_batches.is_empty() {
-            while remaining_ns > 0
-                && pending_batches.len() < SCHEDULE_PIPELINE_DEPTH
-                && !stop.load(Ordering::Acquire)
-            {
-                let horizon_ns = self
-                    .options
-                    .schedule_horizon
-                    .as_nanos()
-                    .min(u64::MAX as u128) as u64;
-                let batch_limited_ns =
-                    ((batch_limit as f64 / offered_rate) * NANOS_PER_SECOND).floor() as u64;
-                let chunk_ns = remaining_ns
-                    .min(horizon_ns.max(1))
-                    .min(batch_limited_ns.max(1));
-                operation_budget += offered_rate * chunk_ns as f64 / NANOS_PER_SECOND;
-                let operation_count = (operation_budget.floor() as usize).min(batch_limit);
-                operation_budget -= operation_count as f64;
-                let mut scheduled = Vec::with_capacity(operation_count);
-                for index in 0..operation_count {
-                    let variant = scheduler.next();
-                    let id = OperationId(*next_operation_id);
-                    *next_operation_id = next_operation_id
-                        .checked_add(1)
-                        .ok_or(ExecutorError::OperationIdExhausted)?;
-                    scheduled.push(ScheduledOperation {
-                        id,
-                        operation: variant.name.clone(),
-                        start_offset_ns: scheduled_through_ns.saturating_add(
-                            (index as f64 * NANOS_PER_SECOND / offered_rate).round() as u64,
-                        ),
-                        arguments: variant.arguments.clone(),
-                    });
-                }
-                scheduled_through_ns = scheduled_through_ns.saturating_add(chunk_ns);
-                remaining_ns -= chunk_ns;
-                if !scheduled.is_empty() {
-                    let phase_id = PhaseId(*next_wire_phase_id);
-                    *next_wire_phase_id = next_wire_phase_id
-                        .checked_add(1)
-                        .ok_or(ExecutorError::PhaseIdExhausted)?;
-                    scheduled_count = scheduled_count.saturating_add(operation_count as u64);
-                    cohort.submit_schedule(phase_id, phase_start, scheduled)?;
-                    pending_batches.push_back(phase_id);
-                }
-                elapsed_ns = phase_elapsed_ns(phase_started_at, duration);
-                publish_progress(
-                    sink,
-                    progress,
-                    segment,
-                    elapsed_ns,
-                    duration,
-                    scheduled_count,
-                    reported,
-                )?;
-            }
-
-            let Some(phase_id) = pending_batches.pop_front() else {
-                break;
-            };
-            let batch = cohort.receive_schedule(phase_id, stop)?;
-            let interrupted = matches!(batch.completion, ScheduleCompletion::Cancelled { .. });
-            let batch_results = batch.into_operations();
-            reported = reported.saturating_add(batch_results.len() as u64);
-            let completed_offset_ns = batch_results
-                .iter()
-                .map(|result| {
-                    result
-                        .actual_start_offset_ns
-                        .saturating_add(result.client_latency_ns)
-                })
-                .max()
-                .unwrap_or(0);
-            if retain_results {
-                successful_in_window = successful_in_window.saturating_add(
-                    batch_results
-                        .iter()
-                        .filter(|result| successful_within(result, duration))
-                        .count() as u64,
-                );
-                results.extend(batch_results);
-            }
-            elapsed_ns = phase_elapsed_ns(phase_started_at, duration);
-            if interrupted {
-                elapsed_ns = elapsed_ns.max(completed_offset_ns.min(interval_ns));
-                break;
-            }
-            publish_progress(
-                sink,
-                progress,
-                segment,
-                elapsed_ns,
-                duration,
-                scheduled_count,
-                reported,
-            )?;
-        }
-
-        if !stop.load(Ordering::Acquire) && remaining_ns == 0 && pending_batches.is_empty() {
-            let phase_end = phase_started_at + duration;
-            let wait = phase_end.saturating_duration_since(Instant::now());
-            if sleep_until_or_stop(stop, wait) {
-                elapsed_ns = phase_elapsed_ns(phase_started_at, duration);
-            } else {
-                elapsed_ns = interval_ns;
-            }
-            publish_progress(
-                sink,
-                progress,
-                segment,
-                elapsed_ns,
-                duration,
-                scheduled_count,
-                reported,
-            )?;
-        } else if stop.load(Ordering::Acquire) {
-            elapsed_ns = phase_elapsed_ns(phase_started_at, duration).max(elapsed_ns);
-        }
-
-        Ok(MeasuredInterval {
+            PhaseSegment::Measurement,
             elapsed_ns,
-            successful_in_window,
-            results,
-        })
+            measurement,
+            report.offered_count,
+            report.completed_count,
+        )?;
+        Ok(Some(report))
     }
-}
-
-fn phase_elapsed_ns(phase_started_at: Instant, duration: Duration) -> u64 {
-    Instant::now()
-        .saturating_duration_since(phase_started_at)
-        .min(duration)
-        .as_nanos()
-        .min(u64::MAX as u128) as u64
 }
 
 impl Default for RunExecutor {
@@ -696,30 +562,72 @@ fn concrete_operations(config: &RunConfig) -> Result<&[WeightedOperation], Execu
 }
 
 fn validate_capabilities(catalog: &CohortReady) -> Result<(), ExecutorError> {
-    if !catalog.capabilities.scheduled_operations {
+    if !catalog.capabilities.adapter_managed_phases {
         return Err(ExecutorError::UnsupportedCapability(
-            "adapter does not support coordinator-scheduled operations".into(),
+            "adapter does not support managed phases".into(),
+        ));
+    }
+    if !catalog
+        .capabilities
+        .load_models
+        .contains(&LoadModel::OpenLoop)
+    {
+        return Err(ExecutorError::UnsupportedCapability(
+            "managed execution requires open-loop load support".into(),
+        ));
+    }
+    if !catalog
+        .capabilities
+        .histogram_encodings
+        .contains(&HistogramEncoding::HdrV2Base64)
+    {
+        return Err(ExecutorError::UnsupportedCapability(
+            "managed execution requires hdr_v2_base64 histograms".into(),
         ));
     }
     Ok(())
 }
 
-fn validate_operation_budget(
+fn aggregation_plan(
     config: &RunConfig,
-    rates: &[f64],
+    operations: &[WeightedOperation],
     options: &ExecutorOptions,
-) -> Result<(), ExecutorError> {
-    let duration_seconds = config.phases.measurement_ms as f64 / 1_000.0;
-    if rates
-        .iter()
-        .any(|rate| rate * duration_seconds > options.maximum_results_per_phase as f64)
-    {
-        return Err(ExecutorError::InvalidConfiguration(format!(
-            "a measurement phase exceeds the retained result limit of {} operations",
-            options.maximum_results_per_phase
-        )));
-    }
-    Ok(())
+) -> Result<PhaseAggregationPlan, ExecutorError> {
+    let measurement_ns = config
+        .phases
+        .measurement_ms
+        .checked_mul(1_000_000)
+        .ok_or_else(|| {
+            ExecutorError::InvalidConfiguration(
+                "measurement duration cannot be represented in nanoseconds".into(),
+            )
+        })?;
+    let bucket_count = u16::try_from(options.stationarity_buckets.max(1)).map_err(|_| {
+        ExecutorError::InvalidConfiguration(
+            "stationarity bucket count cannot be represented by the adapter protocol".into(),
+        )
+    })?;
+    let highest_trackable_ns = measurement_ns.checked_mul(2).ok_or_else(|| {
+        ExecutorError::InvalidConfiguration(
+            "measurement and operation-timeout range cannot be represented in nanoseconds".into(),
+        )
+    })?;
+    Ok(PhaseAggregationPlan {
+        measurement_ns,
+        bucket_count,
+        histogram: HistogramSpec {
+            lowest_discernible_ns: 1,
+            highest_trackable_ns,
+            significant_figures: 3,
+        },
+        variants: operations
+            .iter()
+            .map(|operation| OperationVariant {
+                operation: operation.name.clone(),
+                arguments: operation.arguments.clone(),
+            })
+            .collect(),
+    })
 }
 
 pub fn configured_rates(
@@ -825,6 +733,12 @@ fn dispatch_lag_invalid(
     measurement_ms: u64,
     options: &ExecutorOptions,
 ) -> bool {
+    if report.started_count < report.offered_count
+        || report.offered_count.saturating_add(1)
+            < expected_offer_count(report.offered_rate, report.elapsed_ns)
+    {
+        return true;
+    }
     let threshold = options
         .minimum_dispatch_lag
         .as_nanos()
@@ -839,55 +753,19 @@ fn dispatch_lag_invalid(
         .is_some_and(|lag| lag > threshold.max(fractional))
 }
 
-fn phase_quality(measured: &MeasuredInterval, options: &ExecutorOptions) -> PhaseQuality {
-    let bucket_count = options.stationarity_buckets.max(1);
-    let bucket_duration = measured.elapsed_ns.div_ceil(bucket_count as u64).max(1);
-    let mut buckets = (0..bucket_count)
-        .map(|index| MeasurementBucket {
-            start_offset_ns: index as u64 * bucket_duration,
-            duration_ns: bucket_duration.min(
-                measured
-                    .elapsed_ns
-                    .saturating_sub(index as u64 * bucket_duration),
-            ),
-            attempts: 0,
-            successful: 0,
-            failed: 0,
-            timed_out: 0,
-            goodput_rate: 0.0,
-        })
-        .filter(|bucket| bucket.duration_ns > 0)
-        .collect::<Vec<_>>();
+fn expected_offer_count(offered_rate: f64, elapsed_ns: u64) -> u64 {
+    (offered_rate * elapsed_ns as f64 / NANOS_PER_SECOND)
+        .ceil()
+        .clamp(0.0, u64::MAX as f64) as u64
+}
 
-    for result in &measured.results {
-        let last_bucket = buckets.len().saturating_sub(1);
-        let attempt_index = (result.intended_start_offset_ns / bucket_duration) as usize;
-        let Some(attempt_bucket) = buckets.get_mut(attempt_index.min(last_bucket)) else {
-            continue;
-        };
-        attempt_bucket.attempts += 1;
-        let completion_offset = result
-            .actual_start_offset_ns
-            .saturating_add(result.client_latency_ns);
-        if completion_offset > measured.elapsed_ns {
-            continue;
-        }
-        let completion_index = (completion_offset / bucket_duration) as usize;
-        let Some(completion_bucket) = buckets.get_mut(completion_index.min(last_bucket)) else {
-            continue;
-        };
-        match result.status {
-            OperationStatus::Ok => completion_bucket.successful += 1,
-            OperationStatus::Error { .. } => completion_bucket.failed += 1,
-            OperationStatus::Timeout => completion_bucket.timed_out += 1,
-        }
-    }
-    for bucket in &mut buckets {
-        bucket.goodput_rate =
-            bucket.successful as f64 * NANOS_PER_SECOND / bucket.duration_ns as f64;
-    }
-
-    if (measured.results.len() as u64) < options.minimum_stationarity_samples || buckets.len() < 2 {
+fn phase_quality(
+    buckets: &[MeasurementBucket],
+    attempts: u64,
+    options: &ExecutorOptions,
+) -> PhaseQuality {
+    let buckets = buckets.to_vec();
+    if attempts < options.minimum_stationarity_samples || buckets.len() < 2 {
         return PhaseQuality {
             stationary: true,
             reason: Some("too few samples for a stationarity rejection".into()),
@@ -960,7 +838,7 @@ fn recover_or_stop(
 ) -> Result<bool, ExecutorError> {
     let duration = Duration::from_millis(config.phases.recovery_ms);
     if duration.is_zero() {
-        return Ok(false);
+        return Ok(stop.load(Ordering::Acquire));
     }
     let started = std::time::Instant::now();
     publish_progress(sink, progress, PhaseSegment::Recovery, 0, duration, 0, 0)?;
@@ -1008,98 +886,8 @@ fn publish_progress(
     .map_err(ExecutorError::Sink)
 }
 
-fn successful_within(result: &OperationResult, interval_duration: Duration) -> bool {
-    let interval_ns = interval_duration.as_nanos().min(u64::MAX as u128) as u64;
-    matches!(result.status, OperationStatus::Ok)
-        && result
-            .actual_start_offset_ns
-            .saturating_add(result.client_latency_ns)
-            <= interval_ns
-}
-
-fn maximum_in_flight(results: &[OperationResult], elapsed_ns: u64) -> u64 {
-    let mut events = Vec::with_capacity(results.len() * 2);
-    for result in results {
-        if result.actual_start_offset_ns > elapsed_ns {
-            continue;
-        }
-        events.push((result.actual_start_offset_ns, 1_i8));
-        let completion = result
-            .actual_start_offset_ns
-            .saturating_add(result.client_latency_ns);
-        events.push((completion, -1_i8));
-    }
-    events.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    let mut current = 0_u64;
-    let mut maximum = 0_u64;
-    for (_, delta) in events {
-        if delta > 0 {
-            current += 1;
-            maximum = maximum.max(current);
-        } else {
-            current = current.saturating_sub(1);
-        }
-    }
-    maximum
-}
-
-fn sleep_until_or_stop(stop: &Arc<AtomicBool>, duration: Duration) -> bool {
-    let deadline = std::time::Instant::now() + duration;
-    loop {
-        if stop.load(Ordering::Acquire) {
-            return true;
-        }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-        thread::sleep(remaining.min(Duration::from_millis(25)));
-    }
-}
-
-fn unix_now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .min(u64::MAX as u128) as u64
-}
-
-struct MeasuredInterval {
-    elapsed_ns: u64,
-    successful_in_window: u64,
-    results: Vec<OperationResult>,
-}
-
-struct SmoothWeightedScheduler<'a> {
-    variants: &'a [WeightedOperation],
-    scores: Vec<f64>,
-    total_weight: f64,
-}
-
-impl<'a> SmoothWeightedScheduler<'a> {
-    fn new(variants: &'a [WeightedOperation], total_weight: f64) -> Self {
-        Self {
-            variants,
-            scores: vec![0.0; variants.len()],
-            total_weight,
-        }
-    }
-
-    fn next(&mut self) -> &'a WeightedOperation {
-        for (score, variant) in self.scores.iter_mut().zip(self.variants) {
-            *score += variant.weight;
-        }
-        let selected = self
-            .scores
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| left.total_cmp(right))
-            .map(|(index, _)| index)
-            .expect("prepared workloads contain at least one variant");
-        self.scores[selected] -= self.total_weight;
-        &self.variants[selected]
-    }
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1111,11 +899,11 @@ pub enum ExecutorCompletion {
 #[derive(Debug)]
 pub enum ExecutorError {
     InvalidConfiguration(String),
+    InvalidManagedPhase(String),
     UnsupportedCapability(String),
     Cohort(CohortError),
     Stats(StatsError),
     Sink(String),
-    OperationIdExhausted,
     PhaseIdExhausted,
 }
 
@@ -1137,11 +925,13 @@ impl fmt::Display for ExecutorError {
             Self::InvalidConfiguration(message) => {
                 write!(formatter, "invalid execution configuration: {message}")
             }
+            Self::InvalidManagedPhase(message) => {
+                write!(formatter, "invalid adapter-managed phase: {message}")
+            }
             Self::UnsupportedCapability(message) => formatter.write_str(message),
             Self::Cohort(error) => error.fmt(formatter),
             Self::Stats(error) => error.fmt(formatter),
             Self::Sink(message) => write!(formatter, "failed to publish executor event: {message}"),
-            Self::OperationIdExhausted => formatter.write_str("operation identifier exhausted"),
             Self::PhaseIdExhausted => formatter.write_str("phase identifier exhausted"),
         }
     }
@@ -1169,28 +959,28 @@ mod tests {
 
     use super::*;
     use crate::{
-        adapter_session::AdapterReady,
+        adapter_session::{AdapterReady, ManagedPhaseOutcome},
         agent::{
             AgentDescriptor, AgentError, AgentId, AgentInstanceId, AgentPlacement, AgentReady,
             WorkloadAgent,
         },
         config::{LoadConfig, PhaseConfig, Preset, Strategy, WorkloadConfig},
         protocol::{
-            AdapterIdentity, ArgumentValue, Capabilities, LoadModel, OperationDescriptor,
-            OperationKind,
+            AdapterIdentity, ArgumentValue, Capabilities, HistogramEncoding, Load, LoadModel,
+            ManagedPhaseRequest, OperationDescriptor, OperationId, OperationKind, OperationResult,
+            OperationStatus,
         },
-        stats::PhaseReport,
+        stats::{PhaseAccumulator, PhaseAggregationPlan, PhaseReport},
     };
 
-    struct FakeAgent {
+    struct FakeManagedAgent {
         descriptor: AgentDescriptor,
-        assignments: Arc<Mutex<Vec<Vec<ScheduledOperation>>>>,
-        pending: VecDeque<(PhaseId, Vec<ScheduledOperation>)>,
-        required_prefetch_on_first_receive: Option<usize>,
+        prepared: Arc<Mutex<Option<ManagedPhaseRequest>>>,
+        omit_terminal_observation: bool,
         interrupt_after_first: bool,
     }
 
-    impl WorkloadAgent for FakeAgent {
+    impl WorkloadAgent for FakeManagedAgent {
         fn descriptor(&self) -> &AgentDescriptor {
             &self.descriptor
         }
@@ -1200,65 +990,92 @@ mod tests {
             _run_id: crate::protocol::RunId,
             _config: Value,
         ) -> Result<AgentReady, AgentError> {
+            let mut adapter = ready();
+            adapter.capabilities.adapter_managed_phases = true;
+            adapter.capabilities.histogram_encodings = vec![HistogramEncoding::HdrV2Base64];
             Ok(AgentReady {
                 agent: self.descriptor.clone(),
-                adapter: ready(),
+                adapter,
             })
         }
 
-        fn submit_schedule(
+        fn prepare_managed_phase(
             &mut self,
-            phase_id: PhaseId,
-            _phase_start_unix_ns: u64,
-            operations: Vec<ScheduledOperation>,
+            _phase_id: PhaseId,
+            request: ManagedPhaseRequest,
         ) -> Result<(), AgentError> {
-            self.assignments.lock().unwrap().push(operations.clone());
-            self.pending.push_back((phase_id, operations));
+            *self.prepared.lock().unwrap() = Some(request);
             Ok(())
         }
 
-        fn receive_schedule(
+        fn start_managed_phase_interruptible(
             &mut self,
-            phase_id: PhaseId,
+            _phase_id: PhaseId,
+            _phase_start_unix_ns: u64,
             stop: &AtomicBool,
-        ) -> Result<crate::adapter_session::ScheduleOutcome, AgentError> {
-            if let Some(required) = self.required_prefetch_on_first_receive.take() {
-                assert!(
-                    self.pending.len() >= required,
-                    "executor waited for a batch before queueing the required lookahead"
-                );
-            }
-            let (actual_phase, operations) = self
-                .pending
-                .pop_front()
-                .expect("fake agent receives a submitted phase");
-            assert_eq!(actual_phase, phase_id);
-            let completion = if self.interrupt_after_first {
-                stop.store(true, Ordering::Release);
-                self.pending.clear();
-                ScheduleCompletion::Cancelled { forced: false }
-            } else {
-                ScheduleCompletion::Completed
+        ) -> Result<ManagedPhaseOutcome, AgentError> {
+            let request = self.prepared.lock().unwrap().clone().unwrap();
+            let variants = request
+                .operations
+                .iter()
+                .map(|operation| OperationVariant {
+                    operation: operation.operation.clone(),
+                    arguments: operation.arguments.clone(),
+                })
+                .collect::<Vec<_>>();
+            let mut accumulator = PhaseAccumulator::new(PhaseAggregationPlan {
+                measurement_ns: request.measurement_ns,
+                bucket_count: request.bucket_count,
+                histogram: request.histogram,
+                variants,
+            })
+            .unwrap();
+            let Load::OpenLoop {
+                requests_per_second,
+            } = request.load
+            else {
+                unreachable!()
             };
-            Ok(crate::adapter_session::ScheduleOutcome {
-                operations: operations
-                    .into_iter()
-                    .take(if self.interrupt_after_first {
-                        1
-                    } else {
-                        usize::MAX
-                    })
-                    .map(|operation| OperationResult {
-                        id: operation.id,
-                        operation: operation.operation,
-                        arguments: operation.arguments,
-                        intended_start_offset_ns: operation.start_offset_ns,
-                        actual_start_offset_ns: operation.start_offset_ns,
+            let count = (requests_per_second * request.measurement_ns as f64 / NANOS_PER_SECOND)
+                .floor() as u64;
+            let count = if self.interrupt_after_first {
+                count.min(1)
+            } else {
+                count
+            };
+            let operation = &request.operations[0];
+            for id in 0..count {
+                accumulator
+                    .record(&OperationResult {
+                        id: OperationId(id + 1),
+                        operation: operation.operation.clone(),
+                        arguments: operation.arguments.clone(),
+                        intended_start_offset_ns: (id as f64 * NANOS_PER_SECOND
+                            / requests_per_second)
+                            .round() as u64,
+                        actual_start_offset_ns: (id as f64 * NANOS_PER_SECOND / requests_per_second)
+                            .round() as u64,
                         client_latency_ns: 1,
                         status: OperationStatus::Ok,
                     })
-                    .collect(),
-                completion,
+                    .unwrap();
+            }
+            let mut result = if self.interrupt_after_first {
+                stop.store(true, Ordering::Release);
+                accumulator.to_phase_result_at(1).unwrap()
+            } else {
+                accumulator.to_phase_result().unwrap()
+            };
+            if self.omit_terminal_observation {
+                result.completed = result.completed.saturating_sub(1);
+            }
+            Ok(ManagedPhaseOutcome {
+                result: Some(result),
+                completion: if self.interrupt_after_first {
+                    ScheduleCompletion::Cancelled { forced: false }
+                } else {
+                    ScheduleCompletion::Completed
+                },
             })
         }
 
@@ -1320,10 +1137,9 @@ mod tests {
                 version: None,
             },
             capabilities: Capabilities {
-                scheduled_operations: true,
-                adapter_managed_phases: false,
+                adapter_managed_phases: true,
                 load_models: vec![LoadModel::OpenLoop],
-                max_batch_size: Some(4),
+                histogram_encodings: vec![HistogramEncoding::HdrV2Base64],
             },
             operations: vec![OperationDescriptor {
                 name: "read".into(),
@@ -1375,32 +1191,33 @@ mod tests {
         }
     }
 
-    fn cohort(assignments: Arc<Mutex<Vec<Vec<ScheduledOperation>>>>) -> (AgentCohort, CohortReady) {
-        cohort_with_interrupt(assignments, false)
-    }
-
-    fn cohort_with_interrupt(
-        assignments: Arc<Mutex<Vec<Vec<ScheduledOperation>>>>,
-        interrupt_after_first: bool,
+    fn managed_cohort(
+        prepared: Arc<Mutex<Option<ManagedPhaseRequest>>>,
     ) -> (AgentCohort, CohortReady) {
-        cohort_with_prefetch(assignments, interrupt_after_first, None)
+        managed_cohort_with_behavior(prepared, false, false)
     }
 
-    fn cohort_with_prefetch(
-        assignments: Arc<Mutex<Vec<Vec<ScheduledOperation>>>>,
+    fn managed_cohort_with_terminal_omission(
+        prepared: Arc<Mutex<Option<ManagedPhaseRequest>>>,
+        omit_terminal_observation: bool,
+    ) -> (AgentCohort, CohortReady) {
+        managed_cohort_with_behavior(prepared, omit_terminal_observation, false)
+    }
+
+    fn managed_cohort_with_behavior(
+        prepared: Arc<Mutex<Option<ManagedPhaseRequest>>>,
+        omit_terminal_observation: bool,
         interrupt_after_first: bool,
-        required_prefetch_on_first_receive: Option<usize>,
     ) -> (AgentCohort, CohortReady) {
         let descriptor = AgentDescriptor {
-            id: AgentId("fake-0".into()),
-            instance_id: AgentInstanceId("fake-0-instance".into()),
+            id: AgentId("managed-0".into()),
+            instance_id: AgentInstanceId("managed-0-instance".into()),
             placement: AgentPlacement::Colocated,
         };
-        let mut cohort = AgentCohort::new(vec![Box::new(FakeAgent {
+        let mut cohort = AgentCohort::new(vec![Box::new(FakeManagedAgent {
             descriptor,
-            assignments,
-            pending: VecDeque::new(),
-            required_prefetch_on_first_receive,
+            prepared,
+            omit_terminal_observation,
             interrupt_after_first,
         })])
         .unwrap();
@@ -1411,9 +1228,9 @@ mod tests {
     }
 
     #[test]
-    fn fixed_sweep_batches_work_and_reports_every_phase() {
-        let assignments = Arc::new(Mutex::new(Vec::new()));
-        let (mut cohort, catalog) = cohort(Arc::clone(&assignments));
+    fn fixed_sweep_reports_every_managed_phase() {
+        let prepared = Arc::new(Mutex::new(None));
+        let (mut cohort, catalog) = managed_cohort(Arc::clone(&prepared));
         let mut sink = RecordingSink::default();
         let completion = RunExecutor::default()
             .execute(
@@ -1426,13 +1243,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(sink.phases.len(), 2);
-        assert!(
-            assignments
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|batch| batch.len() <= 4)
-        );
+        assert!(prepared.lock().unwrap().is_some());
         assert!(matches!(sink.events.first(), Some(RunEvent::AdapterReady)));
         assert!(sink.progress.iter().any(|progress| {
             progress.phase_id == PhaseId(1)
@@ -1450,9 +1261,74 @@ mod tests {
     }
 
     #[test]
+    fn executor_uses_one_phase_request_and_shared_report_semantics() {
+        let prepared = Arc::new(Mutex::new(None));
+        let (mut cohort, catalog) = managed_cohort(Arc::clone(&prepared));
+        let mut config = config();
+        config.load.maximum_rate = 100.0;
+        config.load.explicit_levels = vec![100.0];
+        let mut sink = RecordingSink::default();
+
+        let completion = RunExecutor::default()
+            .execute(
+                &config,
+                &catalog,
+                &mut cohort,
+                &Arc::new(AtomicBool::new(false)),
+                &mut sink,
+            )
+            .unwrap();
+
+        let request = prepared.lock().unwrap().clone().unwrap();
+        assert_eq!(request.warmup_ns, 0);
+        assert_eq!(request.measurement_ns, 20_000_000);
+        assert_eq!(request.operations[0].shard_index, 0);
+        assert_eq!(request.operations[0].shard_count, 1);
+        assert_eq!(sink.phases.len(), 1);
+        assert_eq!(sink.phases[0].1.offered_count, 2);
+        assert_eq!(sink.phases[0].1.started_count, 2);
+        assert_eq!(sink.phases[0].1.completed_count, 2);
+        assert_eq!(sink.phases[0].1.goodput_rate, 100.0);
+        assert!(matches!(
+            completion,
+            ExecutorCompletion::Completed(RunOutcome {
+                classification: RunClassification::NoKneeObserved,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn completed_managed_phase_requires_a_terminal_observation_for_every_started_call() {
+        let prepared = Arc::new(Mutex::new(None));
+        let (mut cohort, catalog) =
+            managed_cohort_with_terminal_omission(Arc::clone(&prepared), true);
+        let mut config = config();
+        config.load.maximum_rate = 100.0;
+        config.load.explicit_levels = vec![100.0];
+        let mut sink = RecordingSink::default();
+
+        let error = RunExecutor::default()
+            .execute(
+                &config,
+                &catalog,
+                &mut cohort,
+                &Arc::new(AtomicBool::new(false)),
+                &mut sink,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ExecutorError::InvalidManagedPhase(message)
+                if message.contains("terminal observations")
+        ));
+    }
+
+    #[test]
     fn progress_reports_warmup_measurement_and_recovery_segments() {
-        let assignments = Arc::new(Mutex::new(Vec::new()));
-        let (mut cohort, catalog) = cohort(assignments);
+        let prepared = Arc::new(Mutex::new(None));
+        let (mut cohort, catalog) = managed_cohort(prepared);
         let mut config = config();
         config.phases.warmup_ms = 5;
         config.phases.recovery_ms = 5;
@@ -1501,74 +1377,17 @@ mod tests {
     }
 
     #[test]
-    fn batches_keep_offsets_relative_to_the_whole_measurement_phase() {
-        let assignments = Arc::new(Mutex::new(Vec::new()));
-        let (mut cohort, catalog) = cohort(Arc::clone(&assignments));
-        let mut config = config();
-        config.load.initial_rate = 500.0;
-        config.load.maximum_rate = 500.0;
-        config.load.explicit_levels = vec![500.0];
-        let mut sink = RecordingSink::default();
-
-        RunExecutor::default()
-            .execute(
-                &config,
-                &catalog,
-                &mut cohort,
-                &Arc::new(AtomicBool::new(false)),
-                &mut sink,
-            )
-            .unwrap();
-
-        let offsets = assignments
-            .lock()
-            .unwrap()
-            .iter()
-            .flatten()
-            .map(|operation| operation.start_offset_ns)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            offsets,
-            [
-                0, 2_000_000, 4_000_000, 6_000_000, 8_000_000, 10_000_000, 12_000_000, 14_000_000,
-                16_000_000, 18_000_000,
-            ]
-        );
-        assert_eq!(sink.phases[0].1.goodput_rate, 500.0);
-    }
-
-    #[test]
-    fn batches_are_queued_ahead_before_the_executor_waits_for_results() {
-        let assignments = Arc::new(Mutex::new(Vec::new()));
-        let (mut cohort, catalog) = cohort_with_prefetch(Arc::clone(&assignments), false, Some(2));
-        let mut config = config();
-        config.load.initial_rate = 500.0;
-        config.load.maximum_rate = 500.0;
-        config.load.explicit_levels = vec![500.0];
-        let mut sink = RecordingSink::default();
-
-        RunExecutor::default()
-            .execute(
-                &config,
-                &catalog,
-                &mut cohort,
-                &Arc::new(AtomicBool::new(false)),
-                &mut sink,
-            )
-            .unwrap();
-
-        assert_eq!(assignments.lock().unwrap().len(), 3);
-    }
-
-    #[test]
     fn interrupted_measurement_publishes_the_results_received_before_stop() {
-        let assignments = Arc::new(Mutex::new(Vec::new()));
-        let (mut cohort, catalog) = cohort_with_interrupt(Arc::clone(&assignments), true);
+        let prepared = Arc::new(Mutex::new(None));
+        let (mut cohort, catalog) = managed_cohort_with_behavior(prepared, false, true);
         let stop = Arc::new(AtomicBool::new(false));
         let mut sink = RecordingSink::default();
+        let mut config = config();
+        config.load.maximum_rate = 100.0;
+        config.load.explicit_levels = vec![100.0];
 
         let completion = RunExecutor::default()
-            .execute(&config(), &catalog, &mut cohort, &stop, &mut sink)
+            .execute(&config, &catalog, &mut cohort, &stop, &mut sink)
             .unwrap();
 
         assert_eq!(completion, ExecutorCompletion::Stopped);
@@ -1579,39 +1398,32 @@ mod tests {
 
     #[test]
     fn stop_before_start_disconnects_without_scheduling() {
-        let assignments = Arc::new(Mutex::new(Vec::new()));
-        let (mut cohort, catalog) = cohort(Arc::clone(&assignments));
+        let prepared = Arc::new(Mutex::new(None));
+        let (mut cohort, catalog) = managed_cohort(Arc::clone(&prepared));
         let stop = Arc::new(AtomicBool::new(true));
         let mut sink = RecordingSink::default();
         let completion = RunExecutor::default()
             .execute(&config(), &catalog, &mut cohort, &stop, &mut sink)
             .unwrap();
 
-        assert!(assignments.lock().unwrap().is_empty());
+        assert!(prepared.lock().unwrap().is_none());
         assert_eq!(completion, ExecutorCompletion::Stopped);
     }
 
     #[test]
     fn bucket_drift_marks_a_phase_non_stationary() {
-        let results = (0..20)
-            .map(|id| OperationResult {
-                id: OperationId(id + 1),
-                operation: "read".into(),
-                arguments: BTreeMap::new(),
-                intended_start_offset_ns: id,
-                actual_start_offset_ns: id,
-                client_latency_ns: 1,
-                status: OperationStatus::Ok,
+        let buckets = (0..5)
+            .map(|index| MeasurementBucket {
+                start_offset_ns: index * 200,
+                duration_ns: 200,
+                attempts: 4,
+                successful: if index == 0 { 20 } else { 0 },
+                failed: 0,
+                timed_out: 0,
+                goodput_rate: if index == 0 { 100_000_000.0 } else { 0.0 },
             })
-            .collect();
-        let quality = phase_quality(
-            &MeasuredInterval {
-                elapsed_ns: 1_000,
-                successful_in_window: 20,
-                results,
-            },
-            &ExecutorOptions::default(),
-        );
+            .collect::<Vec<_>>();
+        let quality = phase_quality(&buckets, 20, &ExecutorOptions::default());
 
         assert!(!quality.stationary);
         assert_eq!(quality.buckets.len(), 5);
@@ -1621,40 +1433,5 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("exceeded"))
         );
-    }
-
-    #[test]
-    fn in_flight_high_water_counts_overlapping_client_calls() {
-        let results = vec![
-            OperationResult {
-                id: OperationId(1),
-                operation: "read".into(),
-                arguments: BTreeMap::new(),
-                intended_start_offset_ns: 0,
-                actual_start_offset_ns: 0,
-                client_latency_ns: 30,
-                status: OperationStatus::Ok,
-            },
-            OperationResult {
-                id: OperationId(2),
-                operation: "read".into(),
-                arguments: BTreeMap::new(),
-                intended_start_offset_ns: 10,
-                actual_start_offset_ns: 10,
-                client_latency_ns: 30,
-                status: OperationStatus::Ok,
-            },
-            OperationResult {
-                id: OperationId(3),
-                operation: "read".into(),
-                arguments: BTreeMap::new(),
-                intended_start_offset_ns: 20,
-                actual_start_offset_ns: 20,
-                client_latency_ns: 30,
-                status: OperationStatus::Ok,
-            },
-        ];
-
-        assert_eq!(maximum_in_flight(&results, 100), 3);
     }
 }

@@ -8,6 +8,7 @@ pub mod config;
 pub mod engine;
 pub mod executor;
 pub mod frontends;
+pub mod histogram;
 pub mod measurement;
 pub mod protocol;
 pub mod stats;

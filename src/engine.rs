@@ -1133,10 +1133,9 @@ mod tests {
                     version: Some("1.0.0".into()),
                 },
                 capabilities: Capabilities {
-                    scheduled_operations: true,
                     adapter_managed_phases: false,
                     load_models: vec![LoadModel::OpenLoop],
-                    max_batch_size: None,
+                    histogram_encodings: Vec::new(),
                 },
                 operations: vec![
                     OperationDescriptor {
@@ -1350,6 +1349,10 @@ mod tests {
             offered_rate: 100.0,
             goodput_rate: 99.0,
             elapsed_ns: 1_000_000_000,
+            offered_count: 100,
+            started_count: 100,
+            completed_count: 100,
+            successful_in_window: 99,
             in_flight_high_water: 1,
             stats: summarize_results(&[]).unwrap(),
             quality: Default::default(),

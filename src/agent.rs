@@ -1,10 +1,11 @@
 //! Workload-agent abstraction and coordinator-owned colocated implementation.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     fmt,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -12,13 +13,13 @@ use serde_json::Value;
 
 use crate::{
     adapter_session::{
-        AdapterReady, AdapterSession, AdapterTransport, ScheduleCompletion, ScheduleOutcome,
-        SessionError, SessionOptions, SubprocessTransport, TcpTransport,
+        AdapterReady, AdapterSession, AdapterTransport, ManagedPhaseOutcome, SessionError,
+        SessionOptions, SubprocessTransport, TcpTransport,
     },
     config::{AdapterCommand, AgentEndpointConfig, AgentTransportConfig},
     protocol::{
-        AdapterIdentity, Capabilities, OperationDescriptor, OperationResult, PhaseId, RunId,
-        ScheduledOperation,
+        AdapterIdentity, Capabilities, Load, ManagedPhaseRequest, OperationDescriptor, PhaseId,
+        RunId,
     },
 };
 
@@ -31,6 +32,7 @@ pub struct AgentId(pub String);
 pub struct AgentInstanceId(pub String);
 
 static NEXT_AGENT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+const MANAGED_CANCELLATION_LEAD_NS: u64 = 50_000_000;
 
 impl AgentId {
     pub fn new(value: impl Into<String>) -> Result<Self, CohortError> {
@@ -81,31 +83,30 @@ pub trait WorkloadAgent: Send {
 
     fn initialize(&mut self, run_id: RunId, config: Value) -> Result<AgentReady, AgentError>;
 
-    /// Queues one batch without waiting for its results.
-    fn submit_schedule(
+    fn prepare_managed_phase(
         &mut self,
         phase_id: PhaseId,
-        phase_start_unix_ns: u64,
-        operations: Vec<ScheduledOperation>,
+        request: ManagedPhaseRequest,
     ) -> Result<(), AgentError>;
 
-    /// Waits for a queued batch. On cancellation, the outcome includes partial
-    /// results from every batch still queued on this agent.
-    fn receive_schedule(
-        &mut self,
-        phase_id: PhaseId,
-        stop: &AtomicBool,
-    ) -> Result<ScheduleOutcome, AgentError>;
-
-    fn execute_schedule(
+    fn start_managed_phase_interruptible(
         &mut self,
         phase_id: PhaseId,
         phase_start_unix_ns: u64,
-        operations: Vec<ScheduledOperation>,
         stop: &AtomicBool,
-    ) -> Result<ScheduleOutcome, AgentError> {
-        self.submit_schedule(phase_id, phase_start_unix_ns, operations)?;
-        self.receive_schedule(phase_id, stop)
+    ) -> Result<ManagedPhaseOutcome, AgentError>;
+
+    /// Start a managed phase with a cohort-shared absolute cancellation
+    /// cutoff. Implementations that do not need it retain the original entry
+    /// point.
+    fn start_managed_phase_interruptible_with_cutoff(
+        &mut self,
+        phase_id: PhaseId,
+        phase_start_unix_ns: u64,
+        stop: &AtomicBool,
+        _cancel_at_unix_ns: &AtomicU64,
+    ) -> Result<ManagedPhaseOutcome, AgentError> {
+        self.start_managed_phase_interruptible(phase_id, phase_start_unix_ns, stop)
     }
 
     fn cancel(&mut self, phase_id: PhaseId) -> Result<(), AgentError>;
@@ -183,24 +184,41 @@ impl<T: AdapterTransport> WorkloadAgent for SessionAgent<T> {
         })
     }
 
-    fn submit_schedule(
+    fn prepare_managed_phase(
         &mut self,
         phase_id: PhaseId,
-        phase_start_unix_ns: u64,
-        operations: Vec<ScheduledOperation>,
+        request: ManagedPhaseRequest,
     ) -> Result<(), AgentError> {
         self.session
-            .submit_schedule(phase_id, phase_start_unix_ns, operations)
+            .prepare_managed_phase(phase_id, request)
             .map_err(Into::into)
     }
 
-    fn receive_schedule(
+    fn start_managed_phase_interruptible(
         &mut self,
         phase_id: PhaseId,
+        phase_start_unix_ns: u64,
         stop: &AtomicBool,
-    ) -> Result<ScheduleOutcome, AgentError> {
+    ) -> Result<ManagedPhaseOutcome, AgentError> {
         self.session
-            .receive_schedule(phase_id, stop)
+            .start_managed_phase_interruptible(phase_id, phase_start_unix_ns, stop)
+            .map_err(Into::into)
+    }
+
+    fn start_managed_phase_interruptible_with_cutoff(
+        &mut self,
+        phase_id: PhaseId,
+        phase_start_unix_ns: u64,
+        stop: &AtomicBool,
+        cancel_at_unix_ns: &AtomicU64,
+    ) -> Result<ManagedPhaseOutcome, AgentError> {
+        self.session
+            .start_managed_phase_interruptible_with_cutoff(
+                phase_id,
+                phase_start_unix_ns,
+                stop,
+                cancel_at_unix_ns,
+            )
             .map_err(Into::into)
     }
 
@@ -229,25 +247,15 @@ pub struct CohortReady {
     pub operations: Vec<OperationDescriptor>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct AgentPhaseResult {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentManagedPhaseResult {
     pub agent: AgentDescriptor,
-    pub operations: Vec<OperationResult>,
+    pub outcome: ManagedPhaseOutcome,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct CohortPhaseResult {
-    pub agents: Vec<AgentPhaseResult>,
-    pub completion: ScheduleCompletion,
-}
-
-impl CohortPhaseResult {
-    pub fn into_operations(self) -> Vec<OperationResult> {
-        self.agents
-            .into_iter()
-            .flat_map(|agent| agent.operations)
-            .collect()
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CohortManagedPhaseResult {
+    pub agents: Vec<AgentManagedPhaseResult>,
 }
 
 /// A fixed agent cohort. Membership is frozen when constructed; a failed
@@ -365,114 +373,116 @@ impl AgentCohort {
         })
     }
 
-    pub fn execute_schedule(
+    pub fn execute_managed_phase(
         &mut self,
         phase_id: PhaseId,
-        phase_start_unix_ns: u64,
-        operations: Vec<ScheduledOperation>,
+        schedule_lead_time: Duration,
+        request: ManagedPhaseRequest,
         stop: &AtomicBool,
-    ) -> Result<CohortPhaseResult, CohortError> {
-        self.submit_schedule(phase_id, phase_start_unix_ns, operations)?;
-        self.receive_schedule(phase_id, stop)
-    }
-
-    pub fn submit_schedule(
-        &mut self,
-        phase_id: PhaseId,
-        phase_start_unix_ns: u64,
-        operations: Vec<ScheduledOperation>,
-    ) -> Result<(), CohortError> {
+    ) -> Result<CohortManagedPhaseResult, CohortError> {
         if !self.initialized {
             return Err(CohortError::NotInitialized);
         }
-
-        let mut operation_ids = HashSet::with_capacity(operations.len());
-        for operation in &operations {
-            if !operation_ids.insert(operation.id) {
-                return Err(CohortError::DuplicateOperation(operation.id.0));
-            }
+        if !matches!(&request.load, Load::OpenLoop { .. }) {
+            return Err(CohortError::ManagedPhaseRequiresOpenLoop);
         }
-        let mut assignments = vec![Vec::new(); self.agents.len()];
-        let mut next_agent_by_variant = BTreeMap::new();
-        for operation in operations {
-            let variant = (operation.operation.clone(), operation.arguments.clone());
-            let next_agent = next_agent_by_variant.entry(variant).or_insert(0_usize);
-            assignments[*next_agent].push(operation);
-            *next_agent = (*next_agent + 1) % self.agents.len();
-        }
+        let shard_count = u32::try_from(self.agents.len())
+            .map_err(|_| CohortError::ManagedPhaseCohortTooLarge)?;
 
-        thread::scope(|scope| {
-            let mut calls = Vec::with_capacity(self.agents.len());
-            for (agent, assignment) in self.agents.iter_mut().zip(assignments) {
-                let id = agent.descriptor().id.clone();
-                calls.push(scope.spawn(move || {
-                    agent
-                        .submit_schedule(phase_id, phase_start_unix_ns, assignment)
-                        .map_err(|source| CohortError::AgentFailed { id, source })
-                }));
+        for (index, agent) in self.agents.iter_mut().enumerate() {
+            let mut assigned = request.clone();
+            let shard_index = u32::try_from(index)
+                .expect("an agent index fits when the cohort length fits in u32");
+            for operation in &mut assigned.operations {
+                operation.shard_index = shard_index;
+                operation.shard_count = shard_count;
             }
-            calls
-                .into_iter()
-                .map(|call| call.join().map_err(|_| CohortError::AgentPanicked)?)
-                .collect::<Result<Vec<_>, CohortError>>()
-                .map(|_| ())
-        })
-    }
-
-    pub fn receive_schedule(
-        &mut self,
-        phase_id: PhaseId,
-        stop: &AtomicBool,
-    ) -> Result<CohortPhaseResult, CohortError> {
-        if !self.initialized {
-            return Err(CohortError::NotInitialized);
-        }
-
-        let results = thread::scope(|scope| {
-            let mut calls = Vec::with_capacity(self.agents.len());
-            for agent in &mut self.agents {
-                let descriptor = agent.descriptor().clone();
-                let call = scope.spawn(move || {
-                    agent
-                        .receive_schedule(phase_id, stop)
-                        .map(|outcome| {
-                            (
-                                AgentPhaseResult {
-                                    agent: descriptor.clone(),
-                                    operations: outcome.operations,
-                                },
-                                outcome.completion,
-                            )
-                        })
-                        .map_err(|source| CohortError::AgentFailed {
-                            id: descriptor.id,
-                            source,
-                        })
-                });
-                calls.push(call);
-            }
-            calls
-                .into_iter()
-                .map(|call| call.join().map_err(|_| CohortError::AgentPanicked)?)
-                .collect::<Result<Vec<_>, CohortError>>()
-        })?;
-
-        let completion = results.iter().fold(
-            ScheduleCompletion::Completed,
-            |aggregate, (_, completion)| match (aggregate, completion) {
-                (_, ScheduleCompletion::Cancelled { forced: true }) => {
-                    ScheduleCompletion::Cancelled { forced: true }
+            let id = agent.descriptor().id.clone();
+            if let Err(source) = agent.prepare_managed_phase(phase_id, assigned) {
+                for prepared_agent in &mut self.agents[..index] {
+                    let _ = prepared_agent.cancel(phase_id);
                 }
-                (
-                    ScheduleCompletion::Completed,
-                    ScheduleCompletion::Cancelled { forced: false },
-                ) => ScheduleCompletion::Cancelled { forced: false },
-                (aggregate, _) => aggregate,
-            },
-        );
-        Ok(CohortPhaseResult {
-            agents: results.into_iter().map(|(result, _)| result).collect(),
-            completion,
+                return Err(CohortError::AgentFailed { id, source });
+            }
+        }
+
+        let phase_start_unix_ns = unix_now_ns()
+            .saturating_add(schedule_lead_time.as_nanos().min(u64::MAX as u128) as u64);
+
+        let initially_stopped = stop.load(Ordering::Acquire);
+        let cancel_at_unix_ns = AtomicU64::new(if initially_stopped {
+            managed_cancellation_cutoff()
+        } else {
+            0
+        });
+        let cohort_stop = AtomicBool::new(initially_stopped);
+        let calls_finished = AtomicBool::new(false);
+        thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                while !calls_finished.load(Ordering::Acquire) {
+                    if stop.load(Ordering::Acquire) {
+                        request_managed_cancellation(&cohort_stop, &cancel_at_unix_ns);
+                        break;
+                    }
+                    thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+            let calls = self
+                .agents
+                .iter_mut()
+                .map(|agent| {
+                    let descriptor = agent.descriptor().clone();
+                    let cohort_stop = &cohort_stop;
+                    let cancel_at_unix_ns = &cancel_at_unix_ns;
+                    scope.spawn(move || {
+                        let result = agent
+                            .start_managed_phase_interruptible_with_cutoff(
+                                phase_id,
+                                phase_start_unix_ns,
+                                cohort_stop,
+                                cancel_at_unix_ns,
+                            )
+                            .map(|outcome| AgentManagedPhaseResult {
+                                agent: descriptor.clone(),
+                                outcome,
+                            })
+                            .map_err(|source| CohortError::AgentFailed {
+                                id: descriptor.id,
+                                source,
+                            });
+                        if result.is_err() {
+                            request_managed_cancellation(cohort_stop, cancel_at_unix_ns);
+                        }
+                        result
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let mut results = Vec::with_capacity(calls.len());
+            let mut first_error = None;
+            for call in calls {
+                match call.join() {
+                    Ok(Ok(result)) => results.push(result),
+                    Ok(Err(error)) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                    Err(_) => {
+                        request_managed_cancellation(&cohort_stop, &cancel_at_unix_ns);
+                        if first_error.is_none() {
+                            first_error = Some(CohortError::AgentPanicked);
+                        }
+                    }
+                }
+            }
+            calls_finished.store(true, Ordering::Release);
+            watcher.join().map_err(|_| CohortError::AgentPanicked)?;
+            if let Some(error) = first_error {
+                Err(error)
+            } else {
+                Ok(CohortManagedPhaseResult { agents: results })
+            }
         })
     }
 
@@ -523,6 +533,24 @@ impl AgentCohort {
             first_error.map_or(Ok(()), Err)
         })
     }
+}
+
+fn request_managed_cancellation(stop: &AtomicBool, cancel_at_unix_ns: &AtomicU64) {
+    let cutoff = managed_cancellation_cutoff();
+    let _ = cancel_at_unix_ns.compare_exchange(0, cutoff, Ordering::AcqRel, Ordering::Acquire);
+    stop.store(true, Ordering::Release);
+}
+
+fn managed_cancellation_cutoff() -> u64 {
+    unix_now_ns().saturating_add(MANAGED_CANCELLATION_LEAD_NS)
+}
+
+fn unix_now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
 }
 
 fn operation_schema(operations: &[OperationDescriptor]) -> BTreeMap<String, OperationDescriptor> {
@@ -581,7 +609,8 @@ pub enum CohortError {
     AdapterIdentityMismatch { expected: AgentId, actual: AgentId },
     CapabilitiesMismatch { expected: AgentId, actual: AgentId },
     OperationSchemaMismatch { expected: AgentId, actual: AgentId },
-    DuplicateOperation(u64),
+    ManagedPhaseRequiresOpenLoop,
+    ManagedPhaseCohortTooLarge,
 }
 
 impl fmt::Display for CohortError {
@@ -606,12 +635,11 @@ impl fmt::Display for CohortError {
                 formatter,
                 "agent {actual} operation schema differs from cohort reference agent {expected}"
             ),
-            Self::DuplicateOperation(id) => {
-                write!(
-                    formatter,
-                    "operation {id} appears more than once in the global schedule"
-                )
+            Self::ManagedPhaseRequiresOpenLoop => {
+                formatter.write_str("adapter-managed phases require an open-loop load")
             }
+            Self::ManagedPhaseCohortTooLarge => formatter
+                .write_str("agent cohort is too large to represent managed-phase shard indices"),
         }
     }
 }
@@ -628,27 +656,27 @@ impl std::error::Error for CohortError {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
         io::{BufRead, BufReader, BufWriter, Write},
         net::TcpListener,
         sync::{Arc, Mutex},
     };
 
     use super::*;
+    use crate::adapter_session::ScheduleCompletion;
     use crate::protocol::{
-        AdapterMessage, ControllerMessage, LoadModel, OperationId, OperationKind, OperationStatus,
-        PROTOCOL_VERSION,
+        AdapterMessage, ControllerMessage, HistogramEncoding, HistogramSpec, LoadModel,
+        ManagedOperation, OperationKind, PROTOCOL_VERSION,
     };
 
-    struct FakeAgent {
+    struct FakeManagedAgent {
         descriptor: AgentDescriptor,
         ready: AdapterReady,
-        assignments: Arc<Mutex<Vec<Vec<u64>>>>,
-        pending: HashMap<PhaseId, Vec<ScheduledOperation>>,
-        fail_phase: bool,
+        events: Arc<Mutex<Vec<String>>>,
+        requests: Arc<Mutex<Vec<(String, ManagedPhaseRequest)>>>,
+        fail_prepare: bool,
     }
 
-    impl WorkloadAgent for FakeAgent {
+    impl WorkloadAgent for FakeManagedAgent {
         fn descriptor(&self) -> &AgentDescriptor {
             &self.descriptor
         }
@@ -660,50 +688,64 @@ mod tests {
             })
         }
 
-        fn submit_schedule(
+        fn prepare_managed_phase(
             &mut self,
-            phase_id: PhaseId,
-            _phase_start_unix_ns: u64,
-            operations: Vec<ScheduledOperation>,
+            _phase_id: PhaseId,
+            request: ManagedPhaseRequest,
         ) -> Result<(), AgentError> {
-            self.assignments
+            self.events
                 .lock()
                 .unwrap()
-                .push(operations.iter().map(|operation| operation.id.0).collect());
-            if self.fail_phase {
-                return Err(AgentError::Unavailable("lost worker".into()));
+                .push(format!("prepare:{}", self.descriptor.id));
+            self.requests
+                .lock()
+                .unwrap()
+                .push((self.descriptor.id.0.clone(), request));
+            if self.fail_prepare {
+                Err(AgentError::Unavailable("prepare failed".into()))
+            } else {
+                Ok(())
             }
-            self.pending.insert(phase_id, operations);
-            Ok(())
         }
 
-        fn receive_schedule(
+        fn start_managed_phase_interruptible(
             &mut self,
-            phase_id: PhaseId,
+            _phase_id: PhaseId,
+            phase_start_unix_ns: u64,
             _stop: &AtomicBool,
-        ) -> Result<ScheduleOutcome, AgentError> {
-            let operations = self
-                .pending
-                .remove(&phase_id)
-                .expect("fake agent receives a submitted phase");
-            Ok(ScheduleOutcome {
-                operations: operations
-                    .into_iter()
-                    .map(|operation| OperationResult {
-                        id: operation.id,
-                        operation: operation.operation,
-                        arguments: operation.arguments,
-                        intended_start_offset_ns: operation.start_offset_ns,
-                        actual_start_offset_ns: operation.start_offset_ns,
-                        client_latency_ns: 1,
-                        status: OperationStatus::Ok,
-                    })
-                    .collect(),
+        ) -> Result<ManagedPhaseOutcome, AgentError> {
+            self.events.lock().unwrap().push(format!(
+                "start:{}:{phase_start_unix_ns}",
+                self.descriptor.id
+            ));
+            Ok(ManagedPhaseOutcome {
+                result: None,
                 completion: ScheduleCompletion::Completed,
             })
         }
 
+        fn start_managed_phase_interruptible_with_cutoff(
+            &mut self,
+            phase_id: PhaseId,
+            phase_start_unix_ns: u64,
+            stop: &AtomicBool,
+            cancel_at_unix_ns: &AtomicU64,
+        ) -> Result<ManagedPhaseOutcome, AgentError> {
+            if stop.load(Ordering::Acquire) {
+                self.events.lock().unwrap().push(format!(
+                    "cutoff:{}:{}",
+                    self.descriptor.id,
+                    cancel_at_unix_ns.load(Ordering::Acquire)
+                ));
+            }
+            self.start_managed_phase_interruptible(phase_id, phase_start_unix_ns, stop)
+        }
+
         fn cancel(&mut self, _phase_id: PhaseId) -> Result<(), AgentError> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("cancel:{}", self.descriptor.id));
             Ok(())
         }
 
@@ -727,10 +769,9 @@ mod tests {
                 version: Some("1.0.0".into()),
             },
             capabilities: Capabilities {
-                scheduled_operations: true,
-                adapter_managed_phases: false,
+                adapter_managed_phases: true,
                 load_models: vec![LoadModel::OpenLoop],
-                max_batch_size: None,
+                histogram_encodings: vec![HistogramEncoding::HdrV2Base64],
             },
             operations: vec![OperationDescriptor {
                 name: operation.into(),
@@ -743,94 +784,178 @@ mod tests {
         }
     }
 
-    fn fake_agent(
-        id: &str,
-        operation: &str,
-        assignments: Arc<Mutex<Vec<Vec<u64>>>>,
-    ) -> Box<dyn WorkloadAgent> {
-        Box::new(FakeAgent {
+    fn fake_agent(id: &str, operation: &str) -> Box<dyn WorkloadAgent> {
+        Box::new(FakeManagedAgent {
             descriptor: AgentDescriptor {
                 id: AgentId(id.into()),
                 instance_id: AgentInstanceId(format!("{id}-instance")),
                 placement: AgentPlacement::Colocated,
             },
             ready: ready(operation),
-            assignments,
-            pending: HashMap::new(),
-            fail_phase: false,
+            events: Arc::new(Mutex::new(Vec::new())),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            fail_prepare: false,
         })
     }
 
-    fn scheduled(id: u64) -> ScheduledOperation {
-        ScheduledOperation {
-            id: OperationId(id),
-            operation: "read".into(),
-            start_offset_ns: id * 100,
-            arguments: Default::default(),
+    fn fake_managed_agent(
+        id: &str,
+        events: Arc<Mutex<Vec<String>>>,
+        requests: Arc<Mutex<Vec<(String, ManagedPhaseRequest)>>>,
+        fail_prepare: bool,
+    ) -> Box<dyn WorkloadAgent> {
+        let ready = ready("read");
+        Box::new(FakeManagedAgent {
+            descriptor: AgentDescriptor {
+                id: AgentId(id.into()),
+                instance_id: AgentInstanceId(format!("{id}-instance")),
+                placement: AgentPlacement::Colocated,
+            },
+            ready,
+            events,
+            requests,
+            fail_prepare,
+        })
+    }
+
+    fn managed_request() -> ManagedPhaseRequest {
+        ManagedPhaseRequest {
+            warmup_ns: 10,
+            measurement_ns: 100,
+            operation_timeout_ns: 20,
+            load: Load::OpenLoop {
+                requests_per_second: 2_000.0,
+            },
+            operations: vec![ManagedOperation {
+                operation: "read".into(),
+                arguments: Default::default(),
+                weight: 1.0,
+                shard_index: 99,
+                shard_count: 99,
+            }],
+            bucket_count: 2,
+            histogram: HistogramSpec {
+                lowest_discernible_ns: 1,
+                highest_trackable_ns: 1_000_000,
+                significant_figures: 3,
+            },
         }
     }
 
     #[test]
-    fn cohort_distributes_a_global_schedule_deterministically() {
-        let first = Arc::new(Mutex::new(Vec::new()));
-        let second = Arc::new(Mutex::new(Vec::new()));
+    fn managed_phase_prepares_every_agent_before_start_and_assigns_fixed_shards() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let mut cohort = AgentCohort::new(vec![
-            fake_agent("local-0", "read", Arc::clone(&first)),
-            fake_agent("local-1", "read", Arc::clone(&second)),
+            fake_managed_agent("local-0", Arc::clone(&events), Arc::clone(&requests), false),
+            fake_managed_agent("local-1", Arc::clone(&events), Arc::clone(&requests), false),
         ])
         .unwrap();
         cohort.initialize(RunId(1), Value::Null).unwrap();
+        let before_start = unix_now_ns();
 
         let result = cohort
-            .execute_schedule(
-                PhaseId(1),
-                100,
-                (0..6).map(scheduled).collect::<Vec<_>>(),
+            .execute_managed_phase(
+                PhaseId(3),
+                Duration::from_nanos(1),
+                managed_request(),
                 &AtomicBool::new(false),
             )
             .unwrap();
 
-        assert_eq!(first.lock().unwrap().as_slice(), &[vec![0, 2, 4]]);
-        assert_eq!(second.lock().unwrap().as_slice(), &[vec![1, 3, 5]]);
         assert_eq!(result.agents.len(), 2);
-        assert_eq!(result.into_operations().len(), 6);
+        let events = events.lock().unwrap();
+        assert_eq!(&events[..2], ["prepare:local-0", "prepare:local-1"]);
+        assert!(events[2..].iter().all(|event| event.starts_with("start:")));
+        let starts = events[2..]
+            .iter()
+            .map(|event| event.rsplit_once(':').unwrap().1.parse::<u64>().unwrap())
+            .collect::<Vec<_>>();
+        assert!(starts.iter().all(|start| *start == starts[0]));
+        assert!(starts[0] >= before_start);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].1.operations[0].shard_index, 0);
+        assert_eq!(requests[1].1.operations[0].shard_index, 1);
+        assert!(
+            requests
+                .iter()
+                .all(|(_, request)| request.operations[0].shard_count == 2)
+        );
+        assert!(requests.iter().all(|(_, request)| matches!(
+            request.load,
+            Load::OpenLoop {
+                requests_per_second: 2_000.0
+            }
+        )));
     }
 
     #[test]
-    fn cohort_balances_each_bound_variant_across_agents() {
-        let first = Arc::new(Mutex::new(Vec::new()));
-        let second = Arc::new(Mutex::new(Vec::new()));
+    fn managed_prepare_failure_cancels_prepared_peers_without_starting() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let mut cohort = AgentCohort::new(vec![
-            fake_agent("local-0", "read", Arc::clone(&first)),
-            fake_agent("local-1", "read", Arc::clone(&second)),
+            fake_managed_agent("local-0", Arc::clone(&events), Arc::clone(&requests), false),
+            fake_managed_agent("local-1", Arc::clone(&events), Arc::clone(&requests), true),
         ])
         .unwrap();
         cohort.initialize(RunId(1), Value::Null).unwrap();
-        let operations = ["read", "write", "read", "write"]
-            .into_iter()
-            .enumerate()
-            .map(|(id, operation)| ScheduledOperation {
-                id: OperationId(id as u64),
-                operation: operation.into(),
-                start_offset_ns: id as u64 * 100,
-                arguments: Default::default(),
-            })
-            .collect();
+
+        assert!(matches!(
+            cohort.execute_managed_phase(
+                PhaseId(3),
+                Duration::from_nanos(1),
+                managed_request(),
+                &AtomicBool::new(false),
+            ),
+            Err(CohortError::AgentFailed {
+                id: AgentId(id),
+                ..
+            }) if id == "local-1"
+        ));
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["prepare:local-0", "prepare:local-1", "cancel:local-0"]
+        );
+    }
+
+    #[test]
+    fn managed_cancellation_uses_one_future_cutoff_for_every_agent() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut cohort = AgentCohort::new(vec![
+            fake_managed_agent("local-0", Arc::clone(&events), Arc::clone(&requests), false),
+            fake_managed_agent("local-1", Arc::clone(&events), requests, false),
+        ])
+        .unwrap();
+        cohort.initialize(RunId(1), Value::Null).unwrap();
+        let before = unix_now_ns();
 
         cohort
-            .execute_schedule(PhaseId(1), 100, operations, &AtomicBool::new(false))
+            .execute_managed_phase(
+                PhaseId(3),
+                Duration::from_nanos(1),
+                managed_request(),
+                &AtomicBool::new(true),
+            )
             .unwrap();
 
-        assert_eq!(first.lock().unwrap().as_slice(), &[vec![0, 1]]);
-        assert_eq!(second.lock().unwrap().as_slice(), &[vec![2, 3]]);
+        let cutoffs = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| event.strip_prefix("cutoff:"))
+            .map(|event| event.rsplit_once(':').unwrap().1.parse::<u64>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(cutoffs.len(), 2);
+        assert_eq!(cutoffs[0], cutoffs[1]);
+        assert!(cutoffs[0] > before);
     }
 
     #[test]
     fn mismatched_operation_schemas_are_rejected_before_a_phase() {
-        let assignments = Arc::new(Mutex::new(Vec::new()));
         let mut cohort = AgentCohort::new(vec![
-            fake_agent("local-0", "read", Arc::clone(&assignments)),
-            fake_agent("local-1", "write", assignments),
+            fake_agent("local-0", "read"),
+            fake_agent("local-1", "write"),
         ])
         .unwrap();
 
@@ -842,25 +967,21 @@ mod tests {
 
     #[test]
     fn mismatched_adapter_identities_are_rejected_before_a_phase() {
-        let assignments = Arc::new(Mutex::new(Vec::new()));
         let mut different = ready("read");
         different.identity.name = "different-adapter".into();
-        let second = FakeAgent {
+        let second = FakeManagedAgent {
             descriptor: AgentDescriptor {
                 id: AgentId("local-1".into()),
                 instance_id: AgentInstanceId("local-1-instance".into()),
                 placement: AgentPlacement::Colocated,
             },
             ready: different,
-            assignments: Arc::clone(&assignments),
-            pending: HashMap::new(),
-            fail_phase: false,
+            events: Arc::new(Mutex::new(Vec::new())),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            fail_prepare: false,
         };
-        let mut cohort = AgentCohort::new(vec![
-            fake_agent("local-0", "read", Arc::clone(&assignments)),
-            Box::new(second),
-        ])
-        .unwrap();
+        let mut cohort =
+            AgentCohort::new(vec![fake_agent("local-0", "read"), Box::new(second)]).unwrap();
 
         assert!(matches!(
             cohort.initialize(RunId(1), Value::Null),
@@ -920,77 +1041,12 @@ mod tests {
 
     #[test]
     fn duplicate_agent_identity_is_rejected() {
-        let assignments = Arc::new(Mutex::new(Vec::new()));
         assert!(matches!(
             AgentCohort::new(vec![
-                fake_agent("worker", "read", Arc::clone(&assignments)),
-                fake_agent("worker", "read", assignments),
+                fake_agent("worker", "read"),
+                fake_agent("worker", "read"),
             ]),
             Err(CohortError::DuplicateAgent(AgentId(id))) if id == "worker"
         ));
-    }
-
-    #[test]
-    fn duplicate_global_operation_ids_are_rejected_before_fanout() {
-        let assignments = Arc::new(Mutex::new(Vec::new()));
-        let mut cohort = AgentCohort::new(vec![fake_agent(
-            "local-0",
-            "read",
-            Arc::clone(&assignments),
-        )])
-        .unwrap();
-        cohort.initialize(RunId(1), Value::Null).unwrap();
-
-        assert!(matches!(
-            cohort.execute_schedule(
-                PhaseId(1),
-                100,
-                vec![scheduled(7), scheduled(7)],
-                &AtomicBool::new(false),
-            ),
-            Err(CohortError::DuplicateOperation(7))
-        ));
-        assert!(assignments.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn failed_agent_invalidates_the_phase_without_redistribution() {
-        let healthy_assignments = Arc::new(Mutex::new(Vec::new()));
-        let failed_assignments = Arc::new(Mutex::new(Vec::new()));
-        let failed = FakeAgent {
-            descriptor: AgentDescriptor {
-                id: AgentId("local-1".into()),
-                instance_id: AgentInstanceId("local-1-instance".into()),
-                placement: AgentPlacement::Colocated,
-            },
-            ready: ready("read"),
-            assignments: Arc::clone(&failed_assignments),
-            pending: HashMap::new(),
-            fail_phase: true,
-        };
-        let mut cohort = AgentCohort::new(vec![
-            fake_agent("local-0", "read", Arc::clone(&healthy_assignments)),
-            Box::new(failed),
-        ])
-        .unwrap();
-        cohort.initialize(RunId(1), Value::Null).unwrap();
-
-        assert!(matches!(
-            cohort.execute_schedule(
-                PhaseId(1),
-                100,
-                (0..4).map(scheduled).collect::<Vec<_>>(),
-                &AtomicBool::new(false),
-            ),
-            Err(CohortError::AgentFailed {
-                id: AgentId(id),
-                ..
-            }) if id == "local-1"
-        ));
-        assert_eq!(
-            healthy_assignments.lock().unwrap().as_slice(),
-            &[vec![0, 2]]
-        );
-        assert_eq!(failed_assignments.lock().unwrap().as_slice(), &[vec![1, 3]]);
     }
 }

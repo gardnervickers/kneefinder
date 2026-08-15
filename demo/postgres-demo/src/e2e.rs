@@ -6,7 +6,6 @@ use std::{
     path::PathBuf,
     process::{Child, ChildStdout, Command, Stdio},
     time::Duration,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(feature = "web")]
@@ -24,8 +23,10 @@ use kneefinder::{
     },
     engine::{Engine, EngineCommand, EngineEvent},
     measurement::{MeasurementStage, RunClassification, RunState},
-    protocol::{ArgumentValue, OperationId, PhaseId, RunId, ScheduledOperation},
-    stats::{OperationVariant, StatsReport, summarize_results},
+    protocol::{
+        ArgumentValue, HistogramSpec, Load, ManagedOperation, ManagedPhaseRequest, PhaseId, RunId,
+    },
+    stats::{OperationVariant, PhaseAccumulator, PhaseAggregationPlan, StatsReport},
     strategy::{StrategyAction, StrategyDecision},
 };
 
@@ -231,59 +232,71 @@ pub fn run_tcp_multi_client() -> Result<(), Box<dyn Error>> {
     cohort.initialize(RunId(2), 2)?;
 
     let offered_per_second = 150.0;
-    let operations = (0..100)
-        .map(|index| {
-            let (operation, arguments) = variant_for_index(index);
-            ScheduledOperation {
-                id: OperationId(index),
-                operation: operation.into(),
-                start_offset_ns: (index as f64 * 1e9 / offered_per_second).round() as u64,
-                arguments,
-            }
-        })
-        .collect();
-    let phase = cohort.agents.execute_schedule(
-        PhaseId(1),
-        unix_now_ns().saturating_add(150_000_000),
+    let measurement_ns = 666_666_667;
+    let histogram = HistogramSpec {
+        lowest_discernible_ns: 1,
+        highest_trackable_ns: 2_000_000_000,
+        significant_figures: 3,
+    };
+    let operations = managed_operations();
+    let request = ManagedPhaseRequest {
+        warmup_ns: 0,
+        measurement_ns,
+        operation_timeout_ns: 1_000_000_000,
+        load: Load::OpenLoop {
+            requests_per_second: offered_per_second,
+        },
         operations,
+        bucket_count: 10,
+        histogram,
+    };
+    let phase = cohort.agents.execute_managed_phase(
+        PhaseId(1),
+        Duration::from_millis(150),
+        request.clone(),
         &std::sync::atomic::AtomicBool::new(false),
     )?;
     if phase.agents.len() != 2 {
         return Err(format!("expected two per-agent results, got {}", phase.agents.len()).into());
     }
-    for result in &phase.agents {
-        if result.operations.len() != 50 {
-            return Err(format!(
-                "agent {} executed {} operations instead of 50",
-                result.agent.id,
-                result.operations.len()
-            )
-            .into());
-        }
-        let agent_stats = summarize_results(&result.operations)?;
-        let attempts = agent_stats
-            .variants
+    let plan = PhaseAggregationPlan {
+        measurement_ns,
+        bucket_count: request.bucket_count,
+        histogram,
+        variants: request
+            .operations
             .iter()
-            .map(|variant| variant.stats.attempts)
-            .collect::<Vec<_>>();
-        if attempts != [32, 8, 2, 8] {
+            .map(|operation| OperationVariant {
+                operation: operation.operation.clone(),
+                arguments: operation.arguments.clone(),
+            })
+            .collect(),
+    };
+    let mut accumulator = PhaseAccumulator::new(plan)?;
+    for agent in &phase.agents {
+        let result = agent
+            .outcome
+            .result
+            .as_ref()
+            .ok_or_else(|| format!("agent {} returned no managed result", agent.agent.id))?;
+        if result.offered != 50 || result.started != 50 || result.completed != 50 {
             return Err(format!(
-                "agent {} received an imbalanced variant mix: {attempts:?}",
-                result.agent.id,
+                "agent {} reported offered/started/completed {}/{}/{} instead of 50/50/50",
+                agent.agent.id, result.offered, result.started, result.completed
             )
             .into());
         }
+        accumulator.merge_phase_result(result)?;
     }
-    let operations = phase.into_operations();
-    let stats = summarize_results(&operations)?;
-    if stats.overall.attempts != 100
-        || stats.overall.successful != 100
-        || stats.overall.failed != 0
-        || stats.overall.timed_out != 0
+    let report = accumulator.finish(offered_per_second)?;
+    if report.stats.overall.attempts != 100
+        || report.stats.overall.successful != 100
+        || report.stats.overall.failed != 0
+        || report.stats.overall.timed_out != 0
     {
         return Err(format!(
             "unexpected aggregate multi-client stats: {:?}",
-            stats.overall
+            report.stats.overall
         )
         .into());
     }
@@ -291,6 +304,40 @@ pub fn run_tcp_multi_client() -> Result<(), Box<dyn Error>> {
     cohort.shutdown()?;
     println!("multi-client TCP E2E passed: 2 clients, 50 operations each, 100 successful total");
     Ok(())
+}
+
+fn managed_operations() -> Vec<ManagedOperation> {
+    vec![
+        managed_operation("lookup", "account", ArgumentValue::Integer(1), 32.0),
+        managed_operation("lookup", "account", ArgumentValue::Integer(2), 8.0),
+        managed_operation(
+            "transfer",
+            "route",
+            ArgumentValue::String("hot".into()),
+            8.0,
+        ),
+        managed_operation(
+            "transfer",
+            "route",
+            ArgumentValue::String("cold".into()),
+            2.0,
+        ),
+    ]
+}
+
+fn managed_operation(
+    operation: &str,
+    argument: &str,
+    value: ArgumentValue,
+    weight: f64,
+) -> ManagedOperation {
+    ManagedOperation {
+        operation: operation.into(),
+        arguments: BTreeMap::from([(argument.into(), value)]),
+        weight,
+        shard_index: 0,
+        shard_count: 1,
+    }
 }
 
 fn connect_tcp_cohort() -> Result<TcpDemoCohort, Box<dyn Error>> {
@@ -560,27 +607,6 @@ impl Drop for TcpAdapterProcess {
 
 /// One interleaved 50-operation cycle: lookup(1)=32, lookup(2)=8,
 /// transfer(hot)=8, transfer(cold)=2.
-fn variant_for_index(index: u64) -> (&'static str, BTreeMap<String, ArgumentValue>) {
-    match index % 50 {
-        24 | 49 => (
-            "transfer",
-            BTreeMap::from([("route".into(), ArgumentValue::String("cold".into()))]),
-        ),
-        5 | 11 | 17 | 23 | 30 | 36 | 42 | 48 => (
-            "transfer",
-            BTreeMap::from([("route".into(), ArgumentValue::String("hot".into()))]),
-        ),
-        3 | 9 | 15 | 21 | 28 | 34 | 40 | 46 => (
-            "lookup",
-            BTreeMap::from([("account".into(), ArgumentValue::Integer(2))]),
-        ),
-        _ => (
-            "lookup",
-            BTreeMap::from([("account".into(), ArgumentValue::Integer(1))]),
-        ),
-    }
-}
-
 fn print_rows(rows: &[DemoRow], expected_knee: f64) {
     let maximum_p95 = rows.iter().map(|row| row.p95_ms).fold(0.0_f64, f64::max);
     println!("\nexpected knee: {expected_knee:.0} req/s");
@@ -672,12 +698,4 @@ fn format_variant(variant: &OperationVariant) -> String {
 
 fn ns_to_ms(value: Option<u64>) -> f64 {
     value.unwrap_or_default() as f64 / 1e6
-}
-
-fn unix_now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .min(u64::MAX as u128) as u64
 }
