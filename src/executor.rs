@@ -1,17 +1,18 @@
 //! Frontend-neutral execution of prepared workload cohorts.
 
 use std::{
+    collections::VecDeque,
     fmt,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
-    adapter_session::ScheduleCompletion,
+    adapter_session::{SCHEDULE_PIPELINE_DEPTH, ScheduleCompletion},
     agent::{AgentCohort, CohortError, CohortReady},
     analysis::{AnalysisTermination, analyze},
     config::{OperationSelection, RunConfig, Strategy, WeightedOperation},
@@ -112,7 +113,6 @@ impl RunExecutor {
                 "adapter maximum batch size must be greater than zero".into(),
             ));
         }
-
         sink.record_run_event(RunEvent::AdapterReady)
             .map_err(ExecutorError::Sink)?;
         let mut next_wire_phase_id = 1_u64;
@@ -503,7 +503,9 @@ impl RunExecutor {
         progress: ProgressContext,
         segment: PhaseSegment,
     ) -> Result<MeasuredInterval, ExecutorError> {
-        let mut remaining_ns = duration.as_nanos().min(u64::MAX as u128) as u64;
+        let interval_ns = duration.as_nanos().min(u64::MAX as u128) as u64;
+        let mut remaining_ns = interval_ns;
+        let mut scheduled_through_ns = 0_u64;
         let mut elapsed_ns = 0_u64;
         let mut operation_budget = 0.0_f64;
         let mut successful_in_window = 0_u64;
@@ -512,12 +514,14 @@ impl RunExecutor {
         let mut results = Vec::new();
         let total_weight = operations.iter().map(|operation| operation.weight).sum();
         let mut scheduler = SmoothWeightedScheduler::new(operations, total_weight);
-        let phase_start = unix_now_ns().saturating_add(
-            self.options
-                .schedule_lead_time
-                .as_nanos()
-                .min(u64::MAX as u128) as u64,
-        );
+        let lead_time_ns = self
+            .options
+            .schedule_lead_time
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+        let phase_start = unix_now_ns().saturating_add(lead_time_ns);
+        let phase_started_at = Instant::now() + self.options.schedule_lead_time;
+        let mut pending_batches = VecDeque::new();
 
         publish_progress(
             sink,
@@ -529,26 +533,24 @@ impl RunExecutor {
             reported,
         )?;
 
-        while remaining_ns > 0 && !stop.load(Ordering::Acquire) {
-            let horizon_ns = self
-                .options
-                .schedule_horizon
-                .as_nanos()
-                .min(u64::MAX as u128) as u64;
-            let batch_limited_ns =
-                ((batch_limit as f64 / offered_rate) * NANOS_PER_SECOND).floor() as u64;
-            let chunk_ns = remaining_ns
-                .min(horizon_ns.max(1))
-                .min(batch_limited_ns.max(1));
-            operation_budget += offered_rate * chunk_ns as f64 / NANOS_PER_SECOND;
-            let operation_count = (operation_budget.floor() as usize).min(batch_limit);
-            operation_budget -= operation_count as f64;
-
-            if operation_count == 0 {
-                if sleep_until_or_stop(stop, Duration::from_nanos(chunk_ns)) {
-                    break;
-                }
-            } else {
+        while remaining_ns > 0 || !pending_batches.is_empty() {
+            while remaining_ns > 0
+                && pending_batches.len() < SCHEDULE_PIPELINE_DEPTH
+                && !stop.load(Ordering::Acquire)
+            {
+                let horizon_ns = self
+                    .options
+                    .schedule_horizon
+                    .as_nanos()
+                    .min(u64::MAX as u128) as u64;
+                let batch_limited_ns =
+                    ((batch_limit as f64 / offered_rate) * NANOS_PER_SECOND).floor() as u64;
+                let chunk_ns = remaining_ns
+                    .min(horizon_ns.max(1))
+                    .min(batch_limited_ns.max(1));
+                operation_budget += offered_rate * chunk_ns as f64 / NANOS_PER_SECOND;
+                let operation_count = (operation_budget.floor() as usize).min(batch_limit);
+                operation_budget -= operation_count as f64;
                 let mut scheduled = Vec::with_capacity(operation_count);
                 for index in 0..operation_count {
                     let variant = scheduler.next();
@@ -559,13 +561,24 @@ impl RunExecutor {
                     scheduled.push(ScheduledOperation {
                         id,
                         operation: variant.name.clone(),
-                        start_offset_ns: elapsed_ns.saturating_add(
+                        start_offset_ns: scheduled_through_ns.saturating_add(
                             (index as f64 * NANOS_PER_SECOND / offered_rate).round() as u64,
                         ),
                         arguments: variant.arguments.clone(),
                     });
                 }
-                scheduled_count = scheduled_count.saturating_add(operation_count as u64);
+                scheduled_through_ns = scheduled_through_ns.saturating_add(chunk_ns);
+                remaining_ns -= chunk_ns;
+                if !scheduled.is_empty() {
+                    let phase_id = PhaseId(*next_wire_phase_id);
+                    *next_wire_phase_id = next_wire_phase_id
+                        .checked_add(1)
+                        .ok_or(ExecutorError::PhaseIdExhausted)?;
+                    scheduled_count = scheduled_count.saturating_add(operation_count as u64);
+                    cohort.submit_schedule(phase_id, phase_start, scheduled)?;
+                    pending_batches.push_back(phase_id);
+                }
+                elapsed_ns = phase_elapsed_ns(phase_started_at, duration);
                 publish_progress(
                     sink,
                     progress,
@@ -575,44 +588,38 @@ impl RunExecutor {
                     scheduled_count,
                     reported,
                 )?;
-                let phase_id = PhaseId(*next_wire_phase_id);
-                *next_wire_phase_id = next_wire_phase_id
-                    .checked_add(1)
-                    .ok_or(ExecutorError::PhaseIdExhausted)?;
-                let batch = cohort.execute_schedule(phase_id, phase_start, scheduled, stop)?;
-                let interrupted = matches!(batch.completion, ScheduleCompletion::Cancelled { .. });
-                let batch_results = batch.into_operations();
-                reported = reported.saturating_add(batch_results.len() as u64);
-                let completed_offset_ns = batch_results
-                    .iter()
-                    .map(|result| {
-                        result
-                            .actual_start_offset_ns
-                            .saturating_add(result.client_latency_ns)
-                    })
-                    .max()
-                    .unwrap_or(0);
-                if retain_results {
-                    successful_in_window = successful_in_window.saturating_add(
-                        batch_results
-                            .iter()
-                            .filter(|result| successful_within(result, duration))
-                            .count() as u64,
-                    );
-                    results.extend(batch_results);
-                }
-                if interrupted {
-                    elapsed_ns = elapsed_ns.max(
-                        unix_now_ns()
-                            .saturating_sub(phase_start)
-                            .max(completed_offset_ns)
-                            .min(duration.as_nanos().min(u64::MAX as u128) as u64),
-                    );
-                    break;
-                }
             }
-            elapsed_ns = elapsed_ns.saturating_add(chunk_ns);
-            remaining_ns -= chunk_ns;
+
+            let Some(phase_id) = pending_batches.pop_front() else {
+                break;
+            };
+            let batch = cohort.receive_schedule(phase_id, stop)?;
+            let interrupted = matches!(batch.completion, ScheduleCompletion::Cancelled { .. });
+            let batch_results = batch.into_operations();
+            reported = reported.saturating_add(batch_results.len() as u64);
+            let completed_offset_ns = batch_results
+                .iter()
+                .map(|result| {
+                    result
+                        .actual_start_offset_ns
+                        .saturating_add(result.client_latency_ns)
+                })
+                .max()
+                .unwrap_or(0);
+            if retain_results {
+                successful_in_window = successful_in_window.saturating_add(
+                    batch_results
+                        .iter()
+                        .filter(|result| successful_within(result, duration))
+                        .count() as u64,
+                );
+                results.extend(batch_results);
+            }
+            elapsed_ns = phase_elapsed_ns(phase_started_at, duration);
+            if interrupted {
+                elapsed_ns = elapsed_ns.max(completed_offset_ns.min(interval_ns));
+                break;
+            }
             publish_progress(
                 sink,
                 progress,
@@ -624,12 +631,41 @@ impl RunExecutor {
             )?;
         }
 
+        if !stop.load(Ordering::Acquire) && remaining_ns == 0 && pending_batches.is_empty() {
+            let phase_end = phase_started_at + duration;
+            let wait = phase_end.saturating_duration_since(Instant::now());
+            if sleep_until_or_stop(stop, wait) {
+                elapsed_ns = phase_elapsed_ns(phase_started_at, duration);
+            } else {
+                elapsed_ns = interval_ns;
+            }
+            publish_progress(
+                sink,
+                progress,
+                segment,
+                elapsed_ns,
+                duration,
+                scheduled_count,
+                reported,
+            )?;
+        } else if stop.load(Ordering::Acquire) {
+            elapsed_ns = phase_elapsed_ns(phase_started_at, duration).max(elapsed_ns);
+        }
+
         Ok(MeasuredInterval {
             elapsed_ns,
             successful_in_window,
             results,
         })
     }
+}
+
+fn phase_elapsed_ns(phase_started_at: Instant, duration: Duration) -> u64 {
+    Instant::now()
+        .saturating_duration_since(phase_started_at)
+        .min(duration)
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
 }
 
 impl Default for RunExecutor {
@@ -1149,6 +1185,8 @@ mod tests {
     struct FakeAgent {
         descriptor: AgentDescriptor,
         assignments: Arc<Mutex<Vec<Vec<ScheduledOperation>>>>,
+        pending: VecDeque<(PhaseId, Vec<ScheduledOperation>)>,
+        required_prefetch_on_first_receive: Option<usize>,
         interrupt_after_first: bool,
     }
 
@@ -1168,16 +1206,36 @@ mod tests {
             })
         }
 
-        fn execute_schedule(
+        fn submit_schedule(
             &mut self,
-            _phase_id: PhaseId,
+            phase_id: PhaseId,
             _phase_start_unix_ns: u64,
             operations: Vec<ScheduledOperation>,
+        ) -> Result<(), AgentError> {
+            self.assignments.lock().unwrap().push(operations.clone());
+            self.pending.push_back((phase_id, operations));
+            Ok(())
+        }
+
+        fn receive_schedule(
+            &mut self,
+            phase_id: PhaseId,
             stop: &AtomicBool,
         ) -> Result<crate::adapter_session::ScheduleOutcome, AgentError> {
-            self.assignments.lock().unwrap().push(operations.clone());
+            if let Some(required) = self.required_prefetch_on_first_receive.take() {
+                assert!(
+                    self.pending.len() >= required,
+                    "executor waited for a batch before queueing the required lookahead"
+                );
+            }
+            let (actual_phase, operations) = self
+                .pending
+                .pop_front()
+                .expect("fake agent receives a submitted phase");
+            assert_eq!(actual_phase, phase_id);
             let completion = if self.interrupt_after_first {
                 stop.store(true, Ordering::Release);
+                self.pending.clear();
                 ScheduleCompletion::Cancelled { forced: false }
             } else {
                 ScheduleCompletion::Completed
@@ -1325,6 +1383,14 @@ mod tests {
         assignments: Arc<Mutex<Vec<Vec<ScheduledOperation>>>>,
         interrupt_after_first: bool,
     ) -> (AgentCohort, CohortReady) {
+        cohort_with_prefetch(assignments, interrupt_after_first, None)
+    }
+
+    fn cohort_with_prefetch(
+        assignments: Arc<Mutex<Vec<Vec<ScheduledOperation>>>>,
+        interrupt_after_first: bool,
+        required_prefetch_on_first_receive: Option<usize>,
+    ) -> (AgentCohort, CohortReady) {
         let descriptor = AgentDescriptor {
             id: AgentId("fake-0".into()),
             instance_id: AgentInstanceId("fake-0-instance".into()),
@@ -1333,6 +1399,8 @@ mod tests {
         let mut cohort = AgentCohort::new(vec![Box::new(FakeAgent {
             descriptor,
             assignments,
+            pending: VecDeque::new(),
+            required_prefetch_on_first_receive,
             interrupt_after_first,
         })])
         .unwrap();
@@ -1467,6 +1535,29 @@ mod tests {
             ]
         );
         assert_eq!(sink.phases[0].1.goodput_rate, 500.0);
+    }
+
+    #[test]
+    fn batches_are_queued_ahead_before_the_executor_waits_for_results() {
+        let assignments = Arc::new(Mutex::new(Vec::new()));
+        let (mut cohort, catalog) = cohort_with_prefetch(Arc::clone(&assignments), false, Some(2));
+        let mut config = config();
+        config.load.initial_rate = 500.0;
+        config.load.maximum_rate = 500.0;
+        config.load.explicit_levels = vec![500.0];
+        let mut sink = RecordingSink::default();
+
+        RunExecutor::default()
+            .execute(
+                &config,
+                &catalog,
+                &mut cohort,
+                &Arc::new(AtomicBool::new(false)),
+                &mut sink,
+            )
+            .unwrap();
+
+        assert_eq!(assignments.lock().unwrap().len(), 3);
     }
 
     #[test]

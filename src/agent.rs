@@ -81,13 +81,32 @@ pub trait WorkloadAgent: Send {
 
     fn initialize(&mut self, run_id: RunId, config: Value) -> Result<AgentReady, AgentError>;
 
+    /// Queues one batch without waiting for its results.
+    fn submit_schedule(
+        &mut self,
+        phase_id: PhaseId,
+        phase_start_unix_ns: u64,
+        operations: Vec<ScheduledOperation>,
+    ) -> Result<(), AgentError>;
+
+    /// Waits for a queued batch. On cancellation, the outcome includes partial
+    /// results from every batch still queued on this agent.
+    fn receive_schedule(
+        &mut self,
+        phase_id: PhaseId,
+        stop: &AtomicBool,
+    ) -> Result<ScheduleOutcome, AgentError>;
+
     fn execute_schedule(
         &mut self,
         phase_id: PhaseId,
         phase_start_unix_ns: u64,
         operations: Vec<ScheduledOperation>,
         stop: &AtomicBool,
-    ) -> Result<ScheduleOutcome, AgentError>;
+    ) -> Result<ScheduleOutcome, AgentError> {
+        self.submit_schedule(phase_id, phase_start_unix_ns, operations)?;
+        self.receive_schedule(phase_id, stop)
+    }
 
     fn cancel(&mut self, phase_id: PhaseId) -> Result<(), AgentError>;
 
@@ -164,15 +183,24 @@ impl<T: AdapterTransport> WorkloadAgent for SessionAgent<T> {
         })
     }
 
-    fn execute_schedule(
+    fn submit_schedule(
         &mut self,
         phase_id: PhaseId,
         phase_start_unix_ns: u64,
         operations: Vec<ScheduledOperation>,
+    ) -> Result<(), AgentError> {
+        self.session
+            .submit_schedule(phase_id, phase_start_unix_ns, operations)
+            .map_err(Into::into)
+    }
+
+    fn receive_schedule(
+        &mut self,
+        phase_id: PhaseId,
         stop: &AtomicBool,
     ) -> Result<ScheduleOutcome, AgentError> {
         self.session
-            .schedule_interruptible(phase_id, phase_start_unix_ns, operations, stop)
+            .receive_schedule(phase_id, stop)
             .map_err(Into::into)
     }
 
@@ -344,6 +372,16 @@ impl AgentCohort {
         operations: Vec<ScheduledOperation>,
         stop: &AtomicBool,
     ) -> Result<CohortPhaseResult, CohortError> {
+        self.submit_schedule(phase_id, phase_start_unix_ns, operations)?;
+        self.receive_schedule(phase_id, stop)
+    }
+
+    pub fn submit_schedule(
+        &mut self,
+        phase_id: PhaseId,
+        phase_start_unix_ns: u64,
+        operations: Vec<ScheduledOperation>,
+    ) -> Result<(), CohortError> {
         if !self.initialized {
             return Err(CohortError::NotInitialized);
         }
@@ -363,13 +401,40 @@ impl AgentCohort {
             *next_agent = (*next_agent + 1) % self.agents.len();
         }
 
-        let results = thread::scope(|scope| {
+        thread::scope(|scope| {
             let mut calls = Vec::with_capacity(self.agents.len());
             for (agent, assignment) in self.agents.iter_mut().zip(assignments) {
+                let id = agent.descriptor().id.clone();
+                calls.push(scope.spawn(move || {
+                    agent
+                        .submit_schedule(phase_id, phase_start_unix_ns, assignment)
+                        .map_err(|source| CohortError::AgentFailed { id, source })
+                }));
+            }
+            calls
+                .into_iter()
+                .map(|call| call.join().map_err(|_| CohortError::AgentPanicked)?)
+                .collect::<Result<Vec<_>, CohortError>>()
+                .map(|_| ())
+        })
+    }
+
+    pub fn receive_schedule(
+        &mut self,
+        phase_id: PhaseId,
+        stop: &AtomicBool,
+    ) -> Result<CohortPhaseResult, CohortError> {
+        if !self.initialized {
+            return Err(CohortError::NotInitialized);
+        }
+
+        let results = thread::scope(|scope| {
+            let mut calls = Vec::with_capacity(self.agents.len());
+            for agent in &mut self.agents {
                 let descriptor = agent.descriptor().clone();
                 let call = scope.spawn(move || {
                     agent
-                        .execute_schedule(phase_id, phase_start_unix_ns, assignment, stop)
+                        .receive_schedule(phase_id, stop)
                         .map(|outcome| {
                             (
                                 AgentPhaseResult {
@@ -563,6 +628,7 @@ impl std::error::Error for CohortError {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         io::{BufRead, BufReader, BufWriter, Write},
         net::TcpListener,
         sync::{Arc, Mutex},
@@ -578,6 +644,7 @@ mod tests {
         descriptor: AgentDescriptor,
         ready: AdapterReady,
         assignments: Arc<Mutex<Vec<Vec<u64>>>>,
+        pending: HashMap<PhaseId, Vec<ScheduledOperation>>,
         fail_phase: bool,
     }
 
@@ -593,13 +660,12 @@ mod tests {
             })
         }
 
-        fn execute_schedule(
+        fn submit_schedule(
             &mut self,
-            _phase_id: PhaseId,
+            phase_id: PhaseId,
             _phase_start_unix_ns: u64,
             operations: Vec<ScheduledOperation>,
-            _stop: &AtomicBool,
-        ) -> Result<ScheduleOutcome, AgentError> {
+        ) -> Result<(), AgentError> {
             self.assignments
                 .lock()
                 .unwrap()
@@ -607,6 +673,19 @@ mod tests {
             if self.fail_phase {
                 return Err(AgentError::Unavailable("lost worker".into()));
             }
+            self.pending.insert(phase_id, operations);
+            Ok(())
+        }
+
+        fn receive_schedule(
+            &mut self,
+            phase_id: PhaseId,
+            _stop: &AtomicBool,
+        ) -> Result<ScheduleOutcome, AgentError> {
+            let operations = self
+                .pending
+                .remove(&phase_id)
+                .expect("fake agent receives a submitted phase");
             Ok(ScheduleOutcome {
                 operations: operations
                     .into_iter()
@@ -677,6 +756,7 @@ mod tests {
             },
             ready: ready(operation),
             assignments,
+            pending: HashMap::new(),
             fail_phase: false,
         })
     }
@@ -773,6 +853,7 @@ mod tests {
             },
             ready: different,
             assignments: Arc::clone(&assignments),
+            pending: HashMap::new(),
             fail_phase: false,
         };
         let mut cohort = AgentCohort::new(vec![
@@ -884,6 +965,7 @@ mod tests {
             },
             ready: ready("read"),
             assignments: Arc::clone(&failed_assignments),
+            pending: HashMap::new(),
             fail_phase: true,
         };
         let mut cohort = AgentCohort::new(vec![

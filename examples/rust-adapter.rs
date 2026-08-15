@@ -4,9 +4,13 @@
 //! surrounding code is the transport/runtime side of the adapter contract.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     error::Error,
     io::{self, BufRead, Write},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -14,89 +18,149 @@ use std::{
 use kneefinder::protocol::{
     AdapterIdentity, AdapterMessage, ArgumentKind, ArgumentValue, Capabilities, ControllerMessage,
     LoadModel, OperationArgument, OperationDescriptor, OperationKind, OperationResult,
-    OperationStatus, PROTOCOL_VERSION, ScheduledOperation,
+    OperationStatus, PROTOCOL_VERSION, PhaseId, ScheduledOperation,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut stdout = io::BufWriter::new(io::stdout().lock());
-    for line in io::stdin().lock().lines() {
-        let message = serde_json::from_str::<ControllerMessage>(&line?)?;
-        match message {
-            ControllerMessage::Initialize {
-                protocol_version, ..
-            } if protocol_version == PROTOCOL_VERSION => {
-                write_message(
-                    &mut stdout,
-                    &AdapterMessage::Ready {
-                        protocol_version: PROTOCOL_VERSION,
-                        identity: AdapterIdentity {
-                            name: "rust-adapter-example".into(),
-                            version: Some(env!("CARGO_PKG_VERSION").into()),
+    let stdout = Mutex::new(io::BufWriter::new(io::stdout()));
+    let cancellations = Mutex::new(HashMap::<PhaseId, Arc<AtomicBool>>::new());
+    thread::scope(|scope| -> Result<(), Box<dyn Error>> {
+        for line in io::stdin().lock().lines() {
+            let message = serde_json::from_str::<ControllerMessage>(&line?)?;
+            match message {
+                ControllerMessage::Initialize {
+                    protocol_version, ..
+                } if protocol_version == PROTOCOL_VERSION => {
+                    write_shared_message(
+                        &stdout,
+                        &AdapterMessage::Ready {
+                            protocol_version: PROTOCOL_VERSION,
+                            identity: AdapterIdentity {
+                                name: "rust-adapter-example".into(),
+                                version: Some(env!("CARGO_PKG_VERSION").into()),
+                            },
+                            capabilities: Capabilities {
+                                scheduled_operations: true,
+                                adapter_managed_phases: false,
+                                load_models: vec![LoadModel::OpenLoop],
+                                max_batch_size: None,
+                            },
+                            operations: operation_descriptors(),
                         },
-                        capabilities: Capabilities {
-                            scheduled_operations: true,
-                            adapter_managed_phases: false,
-                            load_models: vec![LoadModel::OpenLoop],
-                            max_batch_size: None,
+                    )?;
+                }
+                ControllerMessage::Initialize {
+                    protocol_version, ..
+                } => {
+                    write_shared_message(
+                        &stdout,
+                        &AdapterMessage::Error {
+                            phase_id: None,
+                            code: "unsupported_protocol".into(),
+                            message: format!(
+                                "adapter supports protocol {PROTOCOL_VERSION}, got {protocol_version}"
+                            ),
+                            retryable: false,
                         },
-                        operations: operation_descriptors(),
-                    },
-                )?;
-            }
-            ControllerMessage::Initialize {
-                protocol_version, ..
-            } => {
-                write_message(
-                    &mut stdout,
-                    &AdapterMessage::Error {
-                        phase_id: None,
-                        code: "unsupported_protocol".into(),
-                        message: format!(
-                            "adapter supports protocol {PROTOCOL_VERSION}, got {protocol_version}"
-                        ),
-                        retryable: false,
-                    },
-                )?;
-            }
-            ControllerMessage::Schedule {
-                phase_id,
-                phase_start_unix_ns,
-                operations,
-            } => {
-                let calls = operations
-                    .into_iter()
-                    .map(|operation| thread::spawn(move || execute(phase_start_unix_ns, operation)))
-                    .collect::<Vec<_>>();
-                let operations = calls
-                    .into_iter()
-                    .map(|call| call.join().expect("adapter call thread panicked"))
-                    .collect();
-                write_message(
-                    &mut stdout,
-                    &AdapterMessage::Results {
-                        phase_id,
-                        operations,
-                    },
-                )?;
-            }
-            ControllerMessage::Shutdown => break,
-            ControllerMessage::CancelPhase { .. } => {
-                // A production runtime should propagate cancellation to calls.
-            }
-            ControllerMessage::RunPhase { phase_id, .. } => {
-                write_message(
-                    &mut stdout,
-                    &AdapterMessage::Error {
-                        phase_id: Some(phase_id),
-                        code: "unsupported_mode".into(),
-                        message: "this example supports scheduled operations only".into(),
-                        retryable: false,
-                    },
-                )?;
+                    )?;
+                }
+                ControllerMessage::Schedule {
+                    phase_id,
+                    phase_start_unix_ns,
+                    mut operations,
+                } => {
+                    let cancellation = Arc::new(AtomicBool::new(false));
+                    cancellations
+                        .lock()
+                        .expect("cancellation mutex poisoned")
+                        .insert(phase_id, Arc::clone(&cancellation));
+                    let stdout = &stdout;
+                    let cancellations = &cancellations;
+                    scope.spawn(move || {
+                        operations.sort_by_key(|operation| operation.start_offset_ns);
+                        let expected = operations.len();
+                        let mut calls = Vec::with_capacity(expected);
+                        for operation in operations {
+                            if cancellation.load(Ordering::Acquire) {
+                                break;
+                            }
+                            sleep_until(
+                                phase_start_unix_ns.saturating_add(operation.start_offset_ns),
+                            );
+                            if cancellation.load(Ordering::Acquire) {
+                                break;
+                            }
+                            calls.push(thread::spawn(move || {
+                                execute(phase_start_unix_ns, operation)
+                            }));
+                        }
+                        let cancelled = calls.len() < expected;
+                        let results = calls
+                            .into_iter()
+                            .map(|call| call.join().expect("adapter call thread panicked"))
+                            .collect::<Vec<_>>();
+                        if !results.is_empty()
+                            && let Err(error) = write_shared_message(
+                                stdout,
+                                &AdapterMessage::Results {
+                                    phase_id,
+                                    operations: results,
+                                },
+                            )
+                        {
+                            eprintln!("failed to write adapter results: {error}");
+                        }
+                        if cancelled
+                            && let Err(error) = write_shared_message(
+                                stdout,
+                                &AdapterMessage::Error {
+                                    phase_id: Some(phase_id),
+                                    code: "cancelled".into(),
+                                    message: "scheduled phase was cancelled".into(),
+                                    retryable: false,
+                                },
+                            )
+                        {
+                            eprintln!("failed to write cancellation result: {error}");
+                        }
+                        cancellations
+                            .lock()
+                            .expect("cancellation mutex poisoned")
+                            .remove(&phase_id);
+                    });
+                }
+                ControllerMessage::Shutdown => break,
+                ControllerMessage::CancelPhase { phase_id } => {
+                    if let Some(cancellation) = cancellations
+                        .lock()
+                        .expect("cancellation mutex poisoned")
+                        .get(&phase_id)
+                    {
+                        cancellation.store(true, Ordering::Release);
+                    }
+                }
+                ControllerMessage::RunPhase { phase_id, .. } => {
+                    write_shared_message(
+                        &stdout,
+                        &AdapterMessage::Error {
+                            phase_id: Some(phase_id),
+                            code: "unsupported_mode".into(),
+                            message: "this example supports scheduled operations only".into(),
+                            retryable: false,
+                        },
+                    )?;
+                }
             }
         }
-    }
-    Ok(())
+        for cancellation in cancellations
+            .lock()
+            .expect("cancellation mutex poisoned")
+            .values()
+        {
+            cancellation.store(true, Ordering::Release);
+        }
+        Ok(())
+    })
 }
 
 fn operation_descriptors() -> Vec<OperationDescriptor> {
@@ -191,6 +255,16 @@ fn write_message(output: &mut impl Write, message: &AdapterMessage) -> Result<()
     output.write_all(b"\n")?;
     output.flush()?;
     Ok(())
+}
+
+fn write_shared_message(
+    output: &Mutex<impl Write>,
+    message: &AdapterMessage,
+) -> Result<(), Box<dyn Error>> {
+    write_message(
+        &mut *output.lock().expect("adapter output mutex poisoned"),
+        message,
+    )
 }
 
 fn sleep_until(unix_ns: u64) {

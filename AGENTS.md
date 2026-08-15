@@ -216,9 +216,10 @@ At the time this handoff was written, these pieces exist:
 - schema-versioned incremental artifacts, redacted configuration, recovery,
   inspect/render commands, and stable batch exit statuses
 
-The generic executor now turns a prepared cohort and `RunConfig` into bounded,
-deterministic scheduled-operation batches for CLI and browser runs. It supports
-warmup, measured intervals, recovery, repetitions, fixed sweep/up-down plans,
+The generic executor now turns a prepared cohort and `RunConfig` into a bounded,
+two-batch lookahead pipeline of deterministic scheduled operations for CLI and
+browser runs. It supports warmup, measured intervals, recovery, repetitions,
+fixed sweep/up-down plans,
 adaptive baseline/discovery/geometric refinement, fixed-bucket stationarity
 checks with bounded repeats, strategy-decision provenance, per-phase statistics,
 generator-saturation invalidation, statistical knee fitting, deterministic
