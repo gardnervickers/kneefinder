@@ -270,7 +270,9 @@ Its lifecycle is:
 1. Receive `initialize` and reply with `ready`, including adapter identity,
    capabilities, and operation descriptors.
 2. Receive batches of scheduled operations with absolute phase time and relative
-   per-operation deadlines.
+   per-operation deadlines. Keep reading control messages while batches execute:
+   Kneefinder queues bounded lookahead, and results may complete out of phase-ID
+   order.
 3. Call the target's native client and return measured operation results.
 4. Echo the operation name and concrete arguments in every result.
 5. Return stable, low-cardinality error codes and represent timeouts explicitly.
@@ -337,9 +339,9 @@ coordinator and one shared PostgreSQL instance. Its real MVCC lookup and hot-row
 transaction workload can execute repeated browser-configured runs and
 gracefully stop an active run while retaining its agents. The production engine now turns
 prepared cohorts and `RunConfig` values into bounded, deterministic scheduled
-operation batches for CLI and browser runs, including warmup, measurement,
-recovery, repetitions, sweep/up-down traversal, per-phase statistics, and
-bounded interruptible stop. Adaptive runs now establish a stable baseline,
+operation batches with two-batch lookahead for CLI and browser runs, including
+warmup, measurement, recovery, repetitions, sweep/up-down traversal, per-phase
+statistics, and bounded interruptible stop. Adaptive runs now establish a stable baseline,
 discover a healthy/saturated bracket geometrically, and refine it with
 geometric midpoints. Fixed time buckets can reject non-stationary phases;
 adaptive runs repeat them within the configured repetition budget. Every load

@@ -1,9 +1,13 @@
 use std::{
+    collections::HashMap,
     env,
     error::Error,
     io::{self, BufRead, BufReader, BufWriter, Write},
     net::TcpListener,
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -11,7 +15,7 @@ use std::{
 use kneefinder::protocol::{
     AdapterIdentity, AdapterMessage, ArgumentKind, ArgumentValue, Capabilities, ControllerMessage,
     LoadModel, OperationArgument, OperationDescriptor, OperationKind, OperationResult,
-    OperationStatus, PROTOCOL_VERSION, ScheduledOperation,
+    OperationStatus, PROTOCOL_VERSION, PhaseId, ScheduledOperation,
 };
 use postgres::{Client, NoTls};
 use serde::Deserialize;
@@ -58,13 +62,13 @@ enum SessionExit {
 pub fn run() -> Result<(), Box<dyn Error>> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    run_session(stdin.lock(), BufWriter::new(stdout.lock())).map(|_| ())
+    run_session(stdin.lock(), BufWriter::new(stdout)).map(|_| ())
 }
 
 pub fn run_hanging() -> Result<(), Box<dyn Error>> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    run_session_mode(stdin.lock(), BufWriter::new(stdout.lock()), true).map(|_| ())
+    run_session_mode(stdin.lock(), BufWriter::new(stdout), true).map(|_| ())
 }
 
 pub fn run_tcp(address: &str) -> Result<(), Box<dyn Error>> {
@@ -93,174 +97,241 @@ pub fn run_tcp(address: &str) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn run_session(input: impl BufRead, mut output: impl Write) -> Result<SessionExit, Box<dyn Error>> {
-    run_session_mode(input, &mut output, false)
+fn run_session(
+    input: impl BufRead,
+    output: impl Write + Send,
+) -> Result<SessionExit, Box<dyn Error>> {
+    run_session_mode(input, output, false)
 }
 
 fn run_session_mode(
     input: impl BufRead,
-    mut output: impl Write,
+    output: impl Write + Send,
     hang_on_schedule: bool,
 ) -> Result<SessionExit, Box<dyn Error>> {
-    let mut service: Option<PostgresService> = None;
+    let output = Mutex::new(output);
+    let cancellations = Mutex::new(HashMap::<PhaseId, Arc<AtomicBool>>::new());
+    thread::scope(|scope| -> Result<SessionExit, Box<dyn Error>> {
+        let mut service: Option<PostgresService> = None;
+        let mut exit = SessionExit::EndOfStream;
 
-    for line in input.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
+        for line in input.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
 
-        let message = serde_json::from_str::<ControllerMessage>(&line)?;
-        match message {
-            ControllerMessage::Initialize {
-                protocol_version,
-                config: supplied_config,
-                ..
-            } => {
-                if protocol_version != PROTOCOL_VERSION {
-                    write_message(
-                        &mut output,
+            let message = serde_json::from_str::<ControllerMessage>(&line)?;
+            match message {
+                ControllerMessage::Initialize {
+                    protocol_version,
+                    config: supplied_config,
+                    ..
+                } => {
+                    if protocol_version != PROTOCOL_VERSION {
+                        write_shared_message(
+                            &output,
+                            &AdapterMessage::Error {
+                                phase_id: None,
+                                code: "unsupported_protocol".into(),
+                                message: format!(
+                                    "adapter supports protocol {PROTOCOL_VERSION}, got {protocol_version}"
+                                ),
+                                retryable: false,
+                            },
+                        )?;
+                        continue;
+                    }
+
+                    let config: AdapterConfig = serde_json::from_value(supplied_config)?;
+                    service = if hang_on_schedule {
+                        None
+                    } else {
+                        Some(PostgresService::new(config)?)
+                    };
+                    write_shared_message(
+                        &output,
+                        &AdapterMessage::Ready {
+                            protocol_version: PROTOCOL_VERSION,
+                            identity: AdapterIdentity {
+                                name: "kneefinder-postgres-demo".into(),
+                                version: Some(env!("CARGO_PKG_VERSION").into()),
+                            },
+                            capabilities: Capabilities {
+                                scheduled_operations: true,
+                                adapter_managed_phases: false,
+                                load_models: vec![LoadModel::OpenLoop],
+                                max_batch_size: None,
+                            },
+                            operations: vec![
+                                OperationDescriptor {
+                                    name: "lookup".into(),
+                                    description: Some(
+                                        "read an account balance through PostgreSQL MVCC".into(),
+                                    ),
+                                    kind: OperationKind::Read,
+                                    enabled_by_default: true,
+                                    default_weight: 4.0,
+                                    arguments: vec![OperationArgument {
+                                        name: "account".into(),
+                                        description: Some("account id to read".into()),
+                                        kind: ArgumentKind::Integer,
+                                        values: Vec::new(),
+                                        required: true,
+                                        default: Some(ArgumentValue::Integer(1)),
+                                    }],
+                                },
+                                OperationDescriptor {
+                                    name: "transfer".into(),
+                                    description: Some(
+                                        "update a pair of accounts in a PostgreSQL transaction"
+                                            .into(),
+                                    ),
+                                    kind: OperationKind::Write,
+                                    enabled_by_default: false,
+                                    default_weight: 1.0,
+                                    arguments: vec![OperationArgument {
+                                        name: "route".into(),
+                                        description: Some(
+                                            "account pair updated by the transaction".into(),
+                                        ),
+                                        kind: ArgumentKind::Enum,
+                                        values: vec!["hot".into(), "cold".into()],
+                                        required: true,
+                                        default: Some(ArgumentValue::String("hot".into())),
+                                    }],
+                                },
+                            ],
+                        },
+                    )?;
+                }
+                ControllerMessage::Schedule {
+                    phase_id,
+                    phase_start_unix_ns,
+                    mut operations,
+                } => {
+                    if hang_on_schedule {
+                        scope.spawn(|| {
+                            loop {
+                                thread::park();
+                            }
+                        });
+                        continue;
+                    }
+                    let Some(service) = service.clone() else {
+                        write_shared_message(
+                            &output,
+                            &AdapterMessage::Error {
+                                phase_id: Some(phase_id),
+                                code: "not_initialized".into(),
+                                message: "initialize the adapter before scheduling work".into(),
+                                retryable: true,
+                            },
+                        )?;
+                        continue;
+                    };
+
+                    let cancellation = Arc::new(AtomicBool::new(false));
+                    cancellations
+                        .lock()
+                        .expect("cancellation mutex poisoned")
+                        .insert(phase_id, Arc::clone(&cancellation));
+                    let output = &output;
+                    let cancellations = &cancellations;
+                    scope.spawn(move || {
+                        operations.sort_by_key(|operation| operation.start_offset_ns);
+                        let expected = operations.len();
+                        let mut calls = Vec::with_capacity(expected);
+                        for operation in operations {
+                            if sleep_until_or_cancel(
+                                phase_start_unix_ns.saturating_add(operation.start_offset_ns),
+                                &cancellation,
+                            ) {
+                                break;
+                            }
+                            let actual_start_unix_ns = unix_now_ns();
+                            let service = service.clone();
+                            calls.push(thread::spawn(move || {
+                                execute_operation(
+                                    service,
+                                    phase_start_unix_ns,
+                                    actual_start_unix_ns,
+                                    operation,
+                                )
+                            }));
+                        }
+
+                        let cancelled = calls.len() < expected;
+                        let results = calls
+                            .into_iter()
+                            .map(|call| call.join().expect("client call thread panicked"))
+                            .collect::<Vec<_>>();
+                        if !results.is_empty()
+                            && let Err(error) = write_shared_message(
+                                output,
+                                &AdapterMessage::Results {
+                                    phase_id,
+                                    operations: results,
+                                },
+                            )
+                        {
+                            eprintln!("failed to write PostgreSQL adapter results: {error}");
+                        }
+                        if cancelled
+                            && let Err(error) = write_shared_message(
+                                output,
+                                &AdapterMessage::Error {
+                                    phase_id: Some(phase_id),
+                                    code: "cancelled".into(),
+                                    message: "scheduled phase was cancelled".into(),
+                                    retryable: false,
+                                },
+                            )
+                        {
+                            eprintln!("failed to write PostgreSQL cancellation result: {error}");
+                        }
+                        cancellations
+                            .lock()
+                            .expect("cancellation mutex poisoned")
+                            .remove(&phase_id);
+                    });
+                }
+                ControllerMessage::CancelPhase { phase_id } => {
+                    if let Some(cancellation) = cancellations
+                        .lock()
+                        .expect("cancellation mutex poisoned")
+                        .get(&phase_id)
+                    {
+                        cancellation.store(true, Ordering::Release);
+                    }
+                }
+                ControllerMessage::Shutdown => {
+                    exit = SessionExit::Shutdown;
+                    break;
+                }
+                ControllerMessage::RunPhase { phase_id, .. } => {
+                    write_shared_message(
+                        &output,
                         &AdapterMessage::Error {
-                            phase_id: None,
-                            code: "unsupported_protocol".into(),
-                            message: format!(
-                                "adapter supports protocol {PROTOCOL_VERSION}, got {protocol_version}"
-                            ),
+                            phase_id: Some(phase_id),
+                            code: "unsupported_mode".into(),
+                            message: "demo adapter supports scheduled operations only".into(),
                             retryable: false,
                         },
                     )?;
-                    continue;
                 }
-
-                let config: AdapterConfig = serde_json::from_value(supplied_config)?;
-                service = if hang_on_schedule {
-                    None
-                } else {
-                    Some(PostgresService::new(config)?)
-                };
-                write_message(
-                    &mut output,
-                    &AdapterMessage::Ready {
-                        protocol_version: PROTOCOL_VERSION,
-                        identity: AdapterIdentity {
-                            name: "kneefinder-postgres-demo".into(),
-                            version: Some(env!("CARGO_PKG_VERSION").into()),
-                        },
-                        capabilities: Capabilities {
-                            scheduled_operations: true,
-                            adapter_managed_phases: false,
-                            load_models: vec![LoadModel::OpenLoop],
-                            max_batch_size: None,
-                        },
-                        operations: vec![
-                            OperationDescriptor {
-                                name: "lookup".into(),
-                                description: Some(
-                                    "read an account balance through PostgreSQL MVCC".into(),
-                                ),
-                                kind: OperationKind::Read,
-                                enabled_by_default: true,
-                                default_weight: 4.0,
-                                arguments: vec![OperationArgument {
-                                    name: "account".into(),
-                                    description: Some("account id to read".into()),
-                                    kind: ArgumentKind::Integer,
-                                    values: Vec::new(),
-                                    required: true,
-                                    default: Some(ArgumentValue::Integer(1)),
-                                }],
-                            },
-                            OperationDescriptor {
-                                name: "transfer".into(),
-                                description: Some(
-                                    "update a pair of accounts in a PostgreSQL transaction".into(),
-                                ),
-                                kind: OperationKind::Write,
-                                enabled_by_default: false,
-                                default_weight: 1.0,
-                                arguments: vec![OperationArgument {
-                                    name: "route".into(),
-                                    description: Some(
-                                        "account pair updated by the transaction".into(),
-                                    ),
-                                    kind: ArgumentKind::Enum,
-                                    values: vec!["hot".into(), "cold".into()],
-                                    required: true,
-                                    default: Some(ArgumentValue::String("hot".into())),
-                                }],
-                            },
-                        ],
-                    },
-                )?;
-            }
-            ControllerMessage::Schedule {
-                phase_id,
-                phase_start_unix_ns,
-                mut operations,
-            } => {
-                if hang_on_schedule {
-                    loop {
-                        thread::park();
-                    }
-                }
-                let Some(service) = &service else {
-                    write_message(
-                        &mut output,
-                        &AdapterMessage::Error {
-                            phase_id: Some(phase_id),
-                            code: "not_initialized".into(),
-                            message: "initialize the adapter before scheduling work".into(),
-                            retryable: true,
-                        },
-                    )?;
-                    continue;
-                };
-
-                operations.sort_by_key(|operation| operation.start_offset_ns);
-                let mut calls = Vec::with_capacity(operations.len());
-                for operation in operations {
-                    sleep_until(phase_start_unix_ns.saturating_add(operation.start_offset_ns));
-                    let actual_start_unix_ns = unix_now_ns();
-                    let service = service.clone();
-                    calls.push(thread::spawn(move || {
-                        execute_operation(
-                            service,
-                            phase_start_unix_ns,
-                            actual_start_unix_ns,
-                            operation,
-                        )
-                    }));
-                }
-
-                let results = calls
-                    .into_iter()
-                    .map(|call| call.join().expect("client call thread panicked"))
-                    .collect();
-                write_message(
-                    &mut output,
-                    &AdapterMessage::Results {
-                        phase_id,
-                        operations: results,
-                    },
-                )?;
-            }
-            ControllerMessage::CancelPhase { .. } => {}
-            ControllerMessage::Shutdown => return Ok(SessionExit::Shutdown),
-            ControllerMessage::RunPhase { phase_id, .. } => {
-                write_message(
-                    &mut output,
-                    &AdapterMessage::Error {
-                        phase_id: Some(phase_id),
-                        code: "unsupported_mode".into(),
-                        message: "demo adapter supports scheduled operations only".into(),
-                        retryable: false,
-                    },
-                )?;
             }
         }
-    }
 
-    Ok(SessionExit::EndOfStream)
+        for cancellation in cancellations
+            .lock()
+            .expect("cancellation mutex poisoned")
+            .values()
+        {
+            cancellation.store(true, Ordering::Release);
+        }
+        Ok(exit)
+    })
 }
 
 fn execute_operation(
@@ -462,13 +533,16 @@ fn theoretical_knee(lock_hold_ms: u64) -> f64 {
     1_000.0 / lock_hold_ms as f64 / 0.16
 }
 
-fn sleep_until(deadline_unix_ns: u64) {
+fn sleep_until_or_cancel(deadline_unix_ns: u64, cancellation: &AtomicBool) -> bool {
     loop {
+        if cancellation.load(Ordering::Acquire) {
+            return true;
+        }
         let remaining = deadline_unix_ns.saturating_sub(unix_now_ns());
         if remaining == 0 {
-            return;
+            return false;
         }
-        thread::sleep(Duration::from_nanos(remaining));
+        thread::sleep(Duration::from_nanos(remaining).min(Duration::from_millis(25)));
     }
 }
 
@@ -485,6 +559,18 @@ fn write_message(writer: &mut impl Write, message: &AdapterMessage) -> Result<()
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
+}
+
+fn write_shared_message(
+    output: &Mutex<impl Write>,
+    message: &AdapterMessage,
+) -> Result<(), Box<dyn Error>> {
+    write_message(
+        &mut *output
+            .lock()
+            .expect("PostgreSQL adapter output mutex poisoned"),
+        message,
+    )
 }
 
 #[cfg(test)]

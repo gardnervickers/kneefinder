@@ -294,6 +294,12 @@ batches. A reusable language runtime dispatches the supplied user callback at
 those deadlines, measures the native client call, and returns batched results.
 Adapter authors do not implement the ramp algorithm or choose rates.
 
+The coordinator keeps a bounded number of batches queued ahead. Adapter
+runtimes continue reading control messages while earlier batches execute and
+correlate possibly out-of-order results by phase and operation identifier. This
+keeps control-plane round trips outside the open-loop deadline path without
+making queued work unbounded.
+
 Each result carries:
 
 - operation identifier
